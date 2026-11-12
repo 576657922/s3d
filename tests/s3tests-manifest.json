@@ -1,0 +1,6278 @@
+{
+  "commit": "5b39871",
+  "total_functions": 808,
+  "excluded_total": 263,
+  "exclusions": {
+    "fails_on_aws": 200,
+    "tenant": 9,
+    "transition": 3,
+    "kms": 27,
+    "iam": 2,
+    "torrent": 1,
+    "auth_aws2": 21
+  },
+  "target_total": 545,
+  "domains": {
+    "auth": 41,
+    "list_v2": 40,
+    "list_v1": 37,
+    "object_core": 33,
+    "multipart": 32,
+    "bucket": 22,
+    "copy": 17,
+    "conditional": 13,
+    "checksum": 10,
+    "delete_multi": 4,
+    "policy": 53,
+    "acl": 44,
+    "post_object": 36,
+    "versioning": 31,
+    "tagging": 17,
+    "cors": 9,
+    "encryption": 41,
+    "object_lock": 39,
+    "lifecycle": 20,
+    "logging": 6
+  },
+  "tests": [
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_empty",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_distinct",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_distinct",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_many",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_many",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_many",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_many",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_basic_key_count",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_basic_key_count",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_basic",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_basic",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_encoding_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_encoding_basic",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_encoding_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_encoding_basic",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_prefix",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_prefix",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_prefix",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix_ends_with_delimiter",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_prefix_ends_with_delimiter",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_prefix_ends_with_delimiter",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_prefix_ends_with_delimiter",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_alt",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_alt",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_alt",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_alt",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_prefix_underscore",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_prefix_underscore",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix_underscore",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_prefix_underscore",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_percentage",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_percentage",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_percentage",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_percentage",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_whitespace",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_whitespace",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_whitespace",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_whitespace",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_dot",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_dot",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_dot",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_dot",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_unreadable",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_unreadable",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_unreadable",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_unreadable",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_empty",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_empty",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_none",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_none",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_none",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_none",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_notempty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_fetchowner_notempty",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_defaultempty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_fetchowner_defaultempty",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_fetchowner_empty",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_not_exist",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_delimiter_not_exist",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_delimiter_not_skip_special",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_delimiter_not_skip_special",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_basic",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_basic",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_alt",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_alt",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_alt",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_alt",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_empty",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_empty",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_none",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_none",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_none",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_none",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_not_exist",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_not_exist",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_unreadable",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_unreadable",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_unreadable",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_unreadable",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_delimiter_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_delimiter_basic",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_delimiter_basic",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_delimiter_basic",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_delimiter_alt",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_delimiter_alt",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_delimiter_alt",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_delimiter_alt",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_delimiter_prefix_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_delimiter_prefix_not_exist",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_delimiter_prefix_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_delimiter_prefix_not_exist",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_delimiter_delimiter_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_delimiter_delimiter_not_exist",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_delimiter_delimiter_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_delimiter_delimiter_not_exist",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_prefix_delimiter_prefix_delimiter_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_prefix_delimiter_prefix_delimiter_not_exist",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_prefix_delimiter_prefix_delimiter_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_prefix_delimiter_prefix_delimiter_not_exist",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_maxkeys_one",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_maxkeys_one",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_one",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_maxkeys_one",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_maxkeys_zero",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_maxkeys_zero",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_zero",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_maxkeys_zero",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_maxkeys_none",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_maxkeys_none",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_maxkeys_none",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_maxkeys_none",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_maxkeys_invalid",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_maxkeys_invalid",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_marker_none",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_marker_none",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_marker_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_marker_empty",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_continuationtoken_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_continuationtoken_empty",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_continuationtoken",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_continuationtoken",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_both_continuationtoken_startafter",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_both_continuationtoken_startafter",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_marker_unreadable",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_marker_unreadable",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_startafter_unreadable",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_startafter_unreadable",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_marker_not_in_list",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_marker_not_in_list",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_startafter_not_in_list",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_startafter_not_in_list",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_marker_after_list",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_marker_after_list",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_startafter_after_list",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_startafter_after_list",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_return_data",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_return_data",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_return_data_versioning",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_return_data_versioning",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_objects_anonymous",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_objects_anonymous",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_objects_anonymous",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_objects_anonymous",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_objects_anonymous_fail",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_objects_anonymous_fail",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_listv2_objects_anonymous_fail",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_listv2_objects_anonymous_fail",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_notexist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_notexist",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucketv2_notexist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucketv2_notexist",
+      "domain": "list_v2",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_delete_notexist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_delete_notexist",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_delete_nonempty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_delete_nonempty",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_concurrent_set_canned_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_concurrent_set_canned_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_write_to_nonexist_bucket",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_write_with_chunked_transfer_encoding",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_delete",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_delete",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_read_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_read_not_exist",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_requestid_matches_header_on_error",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_requestid_matches_header_on_error",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_concurrent_multi_object_delete",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_concurrent_multi_object_delete",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multi_object_delete",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multi_object_delete",
+      "domain": "delete_multi",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_expected_bucket_owner",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_expected_bucket_owner",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multi_objectv2_delete",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multi_objectv2_delete",
+      "domain": "delete_multi",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multi_object_delete_key_limit",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multi_object_delete_key_limit",
+      "domain": "delete_multi",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multi_objectv2_delete_key_limit",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multi_objectv2_delete_key_limit",
+      "domain": "delete_multi",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_head_zero_bytes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_head_zero_bytes",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_write_check_etag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_write_check_etag",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_write_cache_control",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_write_cache_control",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_write_expires",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_write_expires",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_write_read_update_read_delete",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_write_read_update_read_delete",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_set_get_metadata_none_to_good",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_set_get_metadata_none_to_good",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_set_get_metadata_none_to_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_set_get_metadata_none_to_empty",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_set_get_metadata_overwrite_to_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_set_get_metadata_overwrite_to_empty",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_set_get_unicode_metadata",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_metadata_replaced_on_put",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_metadata_replaced_on_put",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_write_file",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_write_file",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_anonymous_request",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_anonymous_request",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_authenticated_request",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_authenticated_request",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_authenticated_no_content_type",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_authenticated_no_content_type",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_authenticated_request_bad_access_key",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_authenticated_request_bad_access_key",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_set_success_code",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_set_success_code",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_set_invalid_success_code",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_set_invalid_success_code",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_upload_larger_than_chunk",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_upload_larger_than_chunk",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_set_key_from_filename",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_set_key_from_filename",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_ignored_header",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_ignored_header",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_case_insensitive_condition_fields",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_case_insensitive_condition_fields",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_escaped_field_values",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_escaped_field_values",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_success_redirect_action",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_success_redirect_action",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_invalid_signature",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_invalid_signature",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_invalid_access_key",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_invalid_access_key",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_invalid_date_format",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_invalid_date_format",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_no_key_specified",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_no_key_specified",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_missing_signature",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_missing_signature",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_missing_policy_condition",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_missing_policy_condition",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_user_specified_header",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_user_specified_header",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_request_missing_policy_specified_field",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_request_missing_policy_specified_field",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_condition_is_case_sensitive",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_condition_is_case_sensitive",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_expires_is_case_sensitive",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_expires_is_case_sensitive",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_expired_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_expired_policy",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_wrong_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_wrong_bucket",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_invalid_request_field_value",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_invalid_request_field_value",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_missing_expires_condition",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_missing_expires_condition",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_missing_conditions_list",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_missing_conditions_list",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_upload_size_limit_exceeded",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_upload_size_limit_exceeded",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_missing_content_length_argument",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_missing_content_length_argument",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_invalid_content_length_argument",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_invalid_content_length_argument",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_upload_size_below_minimum",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_upload_size_below_minimum",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_upload_size_rgw_chunk_size_bug",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_upload_size_rgw_chunk_size_bug",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_empty_conditions",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_empty_conditions",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifmatch_good",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifmatch_good",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifmatch_failed",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifmatch_failed",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifnonematch_good",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifnonematch_good",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifnonematch_failed",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifnonematch_failed",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifmodifiedsince_good",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifmodifiedsince_good",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifmodifiedsince_failed",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifmodifiedsince_failed",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_good",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifunmodifiedsince_good",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_failed",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_ifunmodifiedsince_failed",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_object_ifmatch_failed",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_object_ifmatch_failed",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_bucket_gone",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_bucket_gone",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_delete_key_bucket_gone",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_object_gone",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_object_gone",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_head",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_head",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_head_notexist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_head_notexist",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_bucket_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_bucket_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_object_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_object_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_put_acl_mtime",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_put_acl_mtime",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_authenticated",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_authenticated",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_response_headers",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_response_headers",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_authenticated_bucket_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_authenticated_bucket_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_authenticated_object_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_authenticated_object_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_authenticated_bucket_gone",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_authenticated_bucket_gone",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_authenticated_object_gone",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_authenticated_object_gone",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_not_expired",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_x_amz_expires_not_expired",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_range_zero",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_x_amz_expires_out_range_zero",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_x_amz_expires_out_max_range",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_get_x_amz_expires_out_positive_range",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_content_encoding_aws_chunked",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_content_encoding_aws_chunked",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_anon_put",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_anon_put",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_anon_put_write_access",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_anon_put_write_access",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_put_authenticated",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_put_authenticated",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_presigned_put_object_with_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_presigned_put_object_with_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_raw_put_authenticated_expired",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_naming_bad_short_one",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_naming_bad_short_one",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_naming_bad_short_two",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_naming_bad_short_two",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_naming_good_long_63",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_naming_good_long_63",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_exists",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_exists",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_get_location",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_get_location",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_exists_nonowner",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_exists_nonowner",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_recreate_overwrite_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_recreate_overwrite_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_recreate_new_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_recreate_new_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_default",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_default",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_canned",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_canned",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_canned_publicreadwrite",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_canned_publicreadwrite",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_canned_authenticatedread",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_canned_authenticatedread",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_acl_grant_group_read",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_acl_grant_group_read",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_default",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_default",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_canned_during_create",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_canned_during_create",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_canned",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_canned",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_canned_publicreadwrite",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_canned_publicreadwrite",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_canned_authenticatedread",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_canned_authenticatedread",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_canned_bucketownerread",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_canned_bucketownerread",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_canned_bucketownerfullcontrol",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_canned_bucketownerfullcontrol",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_acl_full_control_verify_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_acl_full_control_verify_attributes",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_canned_private_to_private",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_canned_private_to_private",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_grant_nonexist_user",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_grant_nonexist_user",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_grant_email_not_exist",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_grant_email_not_exist",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_acl_revoke_all",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_acl_revoke_all",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_private_object_private",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_private_object_private",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_private",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_private_objectv2_private",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_private_object_publicread",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_private_object_publicread",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_publicread",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_private_objectv2_publicread",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_private_object_publicreadwrite",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_private_object_publicreadwrite",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_publicreadwrite",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_private_objectv2_publicreadwrite",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_publicread_object_private",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_publicread_object_private",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_publicread_object_publicread",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_publicread_object_publicread",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_publicread_object_publicreadwrite",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_publicread_object_publicreadwrite",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_private",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_publicreadwrite_object_private",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_publicread",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_publicreadwrite_object_publicread",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_publicreadwrite",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_access_bucket_publicreadwrite_object_publicreadwrite",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_buckets_create_then_list",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_buckets_create_then_list",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_buckets_list_ctime",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_buckets_list_ctime",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_list_buckets_invalid_auth",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_list_buckets_invalid_auth",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_list_buckets_bad_auth",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_list_buckets_bad_auth",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_list_buckets_paginated",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_list_buckets_paginated",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_naming_good_starts_alpha",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_naming_good_starts_alpha",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_naming_good_starts_digit",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_naming_good_starts_digit",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_naming_good_contains_period",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_naming_good_contains_period",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_naming_good_contains_hyphen",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_naming_good_contains_hyphen",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_recreate_not_overriding",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_recreate_not_overriding",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_special_key_names",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_special_key_names",
+      "domain": "bucket",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_list_special_prefix",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_list_special_prefix",
+      "domain": "list_v1",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_zero_size",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_zero_size",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_16m",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_16m",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_same_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_same_bucket",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_verify_contenttype",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_verify_contenttype",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_to_itself",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_to_itself",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_to_itself_with_metadata",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_to_itself_with_metadata",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_diff_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_diff_bucket",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_not_owned_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_not_owned_bucket",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_not_owned_object_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_not_owned_object_bucket",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_canned_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_canned_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_retaining_metadata",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_retaining_metadata",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_replacing_metadata",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_replacing_metadata",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_bucket_not_found",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_bucket_not_found",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_key_not_found",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_key_not_found",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_versioned_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_versioned_bucket",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_versioned_url_encoding",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_versioned_url_encoding",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_copy_versioning_multipart_upload",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_copy_versioning_multipart_upload",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_empty",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_empty",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_complete_without_create",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_complete_without_create",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_small",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_small",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_copy_small",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_copy_small",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_copy_invalid_range",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_copy_invalid_range",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_copy_improper_range",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_copy_improper_range",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_copy_without_range",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_copy_without_range",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_copy_special_names",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_copy_special_names",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_copy_versioned",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_copy_versioned",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_resend_part",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_resend_part",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_multiple_sizes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_multiple_sizes",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_copy_multiple_sizes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_copy_multiple_sizes",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_size_too_small",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_size_too_small",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_contents",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_contents",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_overwrite_existing_object",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_overwrite_existing_object",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_abort_multipart_upload",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_abort_multipart_upload",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_abort_multipart_upload_not_found",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_abort_multipart_upload_not_found",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_list_multipart_upload",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_list_multipart_upload",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_list_multipart_upload_owner",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_list_multipart_upload_owner",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_missing_part",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_missing_part",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_incorrect_etag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_incorrect_etag",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_get_part",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_get_part",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_sse_c_get_part",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_sse_c_get_part",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_single_get_part",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_single_get_part",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_non_multipart_get_part",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_non_multipart_get_part",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_non_multipart_sse_c_get_part",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_non_multipart_sse_c_get_part",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_100_continue",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_100_continue",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_100_continue_error_retry",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_100_continue_error_retry",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_set_cors",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_set_cors",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_origin_response",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_origin_response",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_origin_wildcard",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_origin_wildcard",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_header_option",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_header_option",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_presigned_get_object",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_presigned_get_object",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_presigned_get_object_v2",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_presigned_get_object_v2",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_presigned_put_object",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_presigned_put_object",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_presigned_put_object_with_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_presigned_put_object_with_acl",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_cors_presigned_put_object_v2",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_cors_presigned_put_object_v2",
+      "domain": "cors",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_set_bucket_tagging",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_set_bucket_tagging",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_read_1mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_read_1mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_read_4mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_read_4mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_read_8mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_read_8mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_write_1mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_write_1mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_write_4mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_write_4mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_write_8mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_write_8mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_dual_write_1mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_dual_write_1mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_dual_write_4mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_dual_write_4mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_dual_write_8mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_dual_write_8mb",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_atomic_multipart_upload_write",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_atomic_multipart_upload_write",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_resend_first_finishes_last",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_ranged_request_response_code",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_ranged_request_response_code",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_ranged_big_request_response_code",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_ranged_big_request_response_code",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_ranged_request_skip_leading_bytes_response_code",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_ranged_request_skip_leading_bytes_response_code",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_ranged_request_return_trailing_bytes_response_code",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_ranged_request_return_trailing_bytes_response_code",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_ranged_request_invalid_range",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_ranged_request_invalid_range",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_ranged_request_empty_object",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_ranged_request_empty_object",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_bucket_create_suspend",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_bucket_create_suspend",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_create_read_remove",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_create_read_remove",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_create_read_remove_head",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_create_read_remove_head",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_stack_delete_merkers",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_stack_delete_merkers",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_removal",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_plain_null_version_removal",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_overwrite",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_plain_null_version_overwrite",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_overwrite_suspended",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_plain_null_version_overwrite_suspended",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_suspend_versions",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_suspend_versions",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_suspended_copy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_suspended_copy",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_all",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_create_versions_remove_all",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_special_names",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_create_versions_remove_special_names",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_create_overwrite_multipart",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_create_overwrite_multipart",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_obj_list_marker",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_obj_list_marker",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_copy_obj_version",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_copy_obj_version",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_multi_object_delete",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_multi_object_delete",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_multi_object_delete_with_marker",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker_create",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_multi_object_delete_with_marker_create",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioned_object_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioned_object_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioned_object_acl_no_version_specified",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioned_object_acl_no_version_specified",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioned_concurrent_object_create_concurrent_remove",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioned_concurrent_object_create_concurrent_remove",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioned_concurrent_object_create_and_remove",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioned_concurrent_object_create_and_remove",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_get",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_get",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_delete",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_delete",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_get_no_id",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_get_no_id",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_id_too_long",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_id_too_long",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_same_id",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_same_id",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_invalid_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_invalid_status",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set_date",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set_date",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set_invalid_date",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set_invalid_date",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_expiration_days0",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_expiration_days0",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle",
+        "lifecycle_expiration"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_expiration_header_put",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_expiration_header_put",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle",
+        "lifecycle_expiration"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_expiration_header_head",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_expiration_header_head",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "lifecycle",
+        "lifecycle_expiration"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_expiration_header_tags_head",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_expiration_header_tags_head",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "lifecycle",
+        "lifecycle_expiration"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_expiration_header_and_tags_head",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_expiration_header_and_tags_head",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "lifecycle",
+        "lifecycle_expiration"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set_noncurrent",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set_noncurrent",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set_deletemarker",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set_deletemarker",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set_filter",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set_filter",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set_empty_filter",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set_empty_filter",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_lifecycle_set_multipart",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_lifecycle_set_multipart",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "lifecycle"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encrypted_transfer_1b",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encrypted_transfer_1b",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encrypted_transfer_1kb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encrypted_transfer_1kb",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encrypted_transfer_1MB",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encrypted_transfer_1MB",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encrypted_transfer_13b",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encrypted_transfer_13b",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_method_head",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_method_head",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_present",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_present",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_other_key",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_other_key",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_invalid_md5",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_invalid_md5",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_no_md5",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_no_md5",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_no_key",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_no_key",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_key_no_sse_c",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_key_no_sse_c",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_upload",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_multipart_upload",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_unaligned_multipart_upload",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_unaligned_multipart_upload",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_invalid_chunks_1",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_multipart_invalid_chunks_1",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_invalid_chunks_2",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_multipart_invalid_chunks_2",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_bad_download",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_multipart_bad_download",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_post_object_authenticated_request",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_post_object_authenticated_request",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_enforced_with_bucket_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_enforced_with_bucket_policy",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_encryption_sse_c_deny_algo_with_bucket_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_encryption_sse_c_deny_algo_with_bucket_policy",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucketv2_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucketv2_policy",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_acl",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucketv2_policy_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucketv2_policy_acl",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_multipart",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_multipart",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_another_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_another_bucket",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucketv2_policy_another_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucketv2_policy_another_bucket",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "list_objects_v2"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_set_condition_operator_end_with_IfExists",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_set_condition_operator_end_with_IfExists",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_set_get_del_bucket_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_set_get_del_bucket_policy",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_set_multipart_tagging",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_set_multipart_tagging",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_obj_tagging",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_obj_tagging",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_obj_head_tagging",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_obj_head_tagging",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_max_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_max_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_excess_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_excess_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_max_kvsize_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_max_kvsize_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_excess_key_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_excess_key_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_excess_val_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_excess_val_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_modify_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_modify_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_delete_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_delete_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_tags_anonymous_request",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_tags_anonymous_request",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_tags_authenticated_request",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_tags_authenticated_request",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_obj_with_tags",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_obj_with_tags",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_tags_acl_public",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_tags_acl_public",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_tags_acl_public",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_tags_acl_public",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_delete_tags_obj_public",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_delete_tags_obj_public",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_bucket_atomic_upload_return_version_id",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_bucket_atomic_upload_return_version_id",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_versioning_bucket_multipart_upload_return_version_id",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_versioning_bucket_multipart_upload_return_version_id",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_get_obj_existing_tag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_get_obj_existing_tag",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_get_obj_tagging_existing_tag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_get_obj_tagging_existing_tag",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_tagging_existing_tag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_tagging_existing_tag",
+      "domain": "tagging",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_upload_part_copy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_upload_part_copy",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_copy_source",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_copy_source",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "copy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_copy_source_meta",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_copy_source_meta",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "copy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_acl",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_acl",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_grant",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_grant",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_obj_enc_conflict_c_s3",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_obj_enc_conflict_c_s3",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_s3_noenc",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_s3_noenc",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_s3_incorrect_algo_sse_s3",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_s3_incorrect_algo_sse_s3",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_put_obj_request_obj_tag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_put_obj_request_obj_tag",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_rgw",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_get_obj_acl_existing_tag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_get_obj_acl_existing_tag",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "bucket_policy",
+        "fails_on_dbstore",
+        "tagging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock_invalid_bucket",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_enable_after_create",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock_enable_after_create",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_with_days_and_years",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock_with_days_and_years",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_days",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock_invalid_days",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_years",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock_invalid_years",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_mode",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock_invalid_mode",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_lock_invalid_status",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_suspend_versioning",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_suspend_versioning",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_obj_lock",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_obj_lock",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_obj_lock_invalid_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_obj_lock_invalid_bucket",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention_invalid_bucket",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_mode",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention_invalid_mode",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_obj_retention",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_obj_retention",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_obj_retention_iso8601",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_obj_retention_iso8601",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_obj_retention_invalid_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_obj_retention_invalid_bucket",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_versionid",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention_versionid",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_override_default_retention",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention_override_default_retention",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_increase_period",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention_increase_period",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_shorten_period",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention_shorten_period",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_shorten_period_bypass",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_obj_retention_shorten_period_bypass",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_delete_object_with_retention",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_delete_object_with_retention",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_delete_multipart_object_with_retention",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_delete_multipart_object_with_retention",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_delete_object_with_retention_and_marker",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_delete_object_with_retention_and_marker",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_multi_delete_object_with_retention",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_multi_delete_object_with_retention",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_legal_hold",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_legal_hold",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_legal_hold_invalid_bucket",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_put_legal_hold_invalid_status",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_legal_hold",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_legal_hold",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_legal_hold_invalid_bucket",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_legal_hold_invalid_bucket",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_delete_object_with_legal_hold_on",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_delete_object_with_legal_hold_on",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_delete_multipart_object_with_legal_hold_on",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_delete_multipart_object_with_legal_hold_on",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_delete_object_with_legal_hold_off",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_delete_object_with_legal_hold_off",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_get_obj_metadata",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_get_obj_metadata",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_uploading_obj",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_uploading_obj",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_governance_with_bypass",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_changing_mode_from_governance_with_bypass",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_governance_without_bypass",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_changing_mode_from_governance_without_bypass",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_compliance",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_lock_changing_mode_from_compliance",
+      "domain": "object_lock",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_copy_object_ifmatch_good",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_copy_object_ifmatch_good",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_copy_object_ifmatch_failed",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_copy_object_ifmatch_failed",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_copy_object_ifnonematch_good",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_copy_object_ifnonematch_good",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_copy_object_ifnonematch_failed",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_copy_object_ifnonematch_failed",
+      "domain": "copy",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "copy",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_read_unreadable",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_read_unreadable",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_bucket_policy_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_bucket_policy_status",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_public_acl_bucket_policy_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_public_acl_bucket_policy_status",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_authpublic_acl_bucket_policy_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_authpublic_acl_bucket_policy_status",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_publicpolicy_acl_bucket_policy_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_publicpolicy_acl_bucket_policy_status",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_nonpublicpolicy_acl_bucket_policy_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_nonpublicpolicy_acl_bucket_policy_status",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_nonpublicpolicy_principal_bucket_policy_status",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_nonpublicpolicy_principal_bucket_policy_status",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_policy_allow_notprincipal",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_policy_allow_notprincipal",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_undefined_public_block",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_undefined_public_block",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_public_block_deny_bucket_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_public_block_deny_bucket_policy",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_public_block",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_public_block",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_block_public_put_bucket_acls",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_block_public_put_bucket_acls",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_block_public_object_canned_acls",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_block_public_object_canned_acls",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_block_public_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_block_public_policy",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_block_public_policy_with_principal",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_block_public_policy_with_principal",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_block_public_restrict_public_buckets",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_block_public_restrict_public_buckets",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_ignore_public_acls",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_ignore_public_acls",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_get_delete_public_block",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_get_delete_public_block",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_upload_on_a_bucket_with_policy",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_upload_on_a_bucket_with_policy",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_encryption_s3",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_encryption_s3",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_bucket_encryption_s3",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_bucket_encryption_s3",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_delete_bucket_encryption_s3",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_delete_bucket_encryption_s3",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_default_upload_1b",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_default_upload_1b",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_encryption",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_default_upload_1kb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_default_upload_1kb",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_encryption",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_default_upload_1mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_default_upload_1mb",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_encryption",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_default_upload_8mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_default_upload_8mb",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_encryption",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_default_method_head",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_default_method_head",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_encryption",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_default_multipart_upload",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_default_multipart_upload",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_encryption",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_default_post_object_authenticated_request",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_default_post_object_authenticated_request",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_encryption",
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1b",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_encrypted_upload_1b",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1kb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_encrypted_upload_1kb",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_encrypted_upload_1mb",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_8mb",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_sse_s3_encrypted_upload_8mb",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore",
+        "sse_s3"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_checksum_sha256",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_checksum_sha256",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_object_checksum_crc64nvme",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_object_checksum_crc64nvme",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_checksum_sha256",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_checksum_sha256",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_reupload_checksum_and_etag",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_reupload_checksum_and_etag",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha256",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_use_cksum_helper_sha256",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc64nvme",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_use_cksum_helper_crc64nvme",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_use_cksum_helper_crc32",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32c",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_use_cksum_helper_crc32c",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha1",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_use_cksum_helper_sha1",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_post_object_upload_checksum",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_post_object_upload_checksum",
+      "domain": "post_object",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "checksum"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_logging",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_logging",
+      "domain": "logging",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_logging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_logging_errors",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_logging_errors",
+      "domain": "logging",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_logging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_logging_owner",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_logging_owner",
+      "domain": "logging",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_logging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_logging_permissions",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_logging_permissions",
+      "domain": "logging",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_logging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_logging_policy_wildcard",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_logging_policy_wildcard",
+      "domain": "logging",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_logging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_rm_bucket_logging",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_rm_bucket_logging",
+      "domain": "logging",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "bucket_logging"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_multipart_checksum_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_multipart_checksum_object_attributes",
+      "domain": "checksum",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "checksum",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_multipart_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_multipart_object_attributes",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_paginated_multipart_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_paginated_multipart_object_attributes",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_single_multipart_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_single_multipart_object_attributes",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_checksum_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_checksum_object_attributes",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_versioned_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_versioned_object_attributes",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_sse_c_encrypted_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_sse_c_encrypted_object_attributes",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_get_object_attributes",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_get_object_attributes",
+      "domain": "object_core",
+      "tier": "P0",
+      "milestone": "M0",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_upload_part_copy_percent_encoded_key",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_upload_part_copy_percent_encoded_key",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_delete_marker_nonversioned",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_delete_marker_nonversioned",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "delete_marker",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_delete_marker_versioned",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_delete_marker_versioned",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "delete_marker",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_delete_marker_suspended",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_delete_marker_suspended",
+      "domain": "versioning",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "delete_marker",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_delete_marker_expiration",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_delete_marker_expiration",
+      "domain": "lifecycle",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": false,
+      "markers": [
+        "delete_marker",
+        "fails_on_dbstore",
+        "lifecycle",
+        "lifecycle_expiration"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_object_if_match",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_object_if_match",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "conditional_write",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_put_object_if_match",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_put_object_if_match",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "conditional_write",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_current_object_if_none_match",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_current_object_if_none_match",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "conditional_write",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_put_current_object_if_none_match",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_put_current_object_if_none_match",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "conditional_write",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_current_object_if_match",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_current_object_if_match",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "conditional_write",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_multipart_put_current_object_if_match",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_multipart_put_current_object_if_match",
+      "domain": "multipart",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "conditional_write",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_object_current_if_match",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_object_current_if_match",
+      "domain": "conditional",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "conditional_write",
+        "fails_on_dbstore"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_create_bucket_bucket_owner_enforced",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_create_bucket_bucket_owner_enforced",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "object_ownership"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_create_bucket_bucket_owner_preferred",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_create_bucket_bucket_owner_preferred",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "object_ownership"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_create_bucket_object_writer",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_create_bucket_object_writer",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "object_ownership"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_ownership_bucket_owner_enforced",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_ownership_bucket_owner_enforced",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "object_ownership"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_ownership_bucket_owner_preferred",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_ownership_bucket_owner_preferred",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "object_ownership"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_put_bucket_ownership_object_writer",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_put_bucket_ownership_object_writer",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "fails_on_dbstore",
+        "object_ownership"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_bucket_create_delete_bucket_ownership",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_bucket_create_delete_bucket_ownership",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "object_ownership"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_head_object_404_with_policy_prefix",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_head_object_404_with_policy_prefix",
+      "domain": "policy",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": []
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_copy_part_enc",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_copy_part_enc",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": true,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore",
+        "parametrize"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_s3.py::test_copy_enc",
+      "file": "s3tests/functional/test_s3.py",
+      "name": "test_copy_enc",
+      "domain": "encryption",
+      "tier": "P2",
+      "milestone": "M4",
+      "parametrized": true,
+      "markers": [
+        "encryption",
+        "fails_on_dbstore",
+        "parametrize"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_md5_invalid_short",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_md5_invalid_short",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_md5_bad",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_md5_bad",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_md5_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_md5_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_md5_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_md5_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_expect_mismatch",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_expect_mismatch",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_expect_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_expect_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_expect_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_expect_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_contentlength_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_contentlength_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_contentlength_negative",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_contentlength_negative",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_mod_proxy_fcgi"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_contentlength_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_contentlength_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_contenttype_invalid",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_contenttype_invalid",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_contenttype_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_contenttype_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_contenttype_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_contenttype_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_authorization_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_authorization_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_date_and_amz_date",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_date_and_amz_date",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_amz_date_and_no_date",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_amz_date_and_no_date",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_create_bad_authorization_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_create_bad_authorization_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_contentlength_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_contentlength_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_object_acl_create_contentlength_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_object_acl_create_contentlength_none",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_put_bad_canned_acl",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_put_bad_canned_acl",
+      "domain": "acl",
+      "tier": "P1",
+      "milestone": "M2",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_bad_expect_mismatch",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_bad_expect_mismatch",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_bad_expect_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_bad_expect_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_bad_contentlength_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_negative",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_bad_contentlength_negative",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_mod_proxy_fcgi"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_bad_contentlength_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_empty",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_bad_authorization_empty",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    },
+    {
+      "nodeid": "s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_none",
+      "file": "s3tests/functional/test_headers.py",
+      "name": "test_bucket_create_bad_authorization_none",
+      "domain": "auth",
+      "tier": "P0",
+      "milestone": "M1",
+      "parametrized": false,
+      "markers": [
+        "auth_common",
+        "fails_on_rgw"
+      ]
+    }
+  ]
+}

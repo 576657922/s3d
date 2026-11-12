@@ -1,0 +1,33 @@
+[package]
+name = "s3d-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+crc32fast.workspace = true
+crc64fast-nvme.workspace = true
+hex.workspace = true
+httpdate.workspace = true
+md-5.workspace = true
+rand.workspace = true
+s3d-disk.workspace = true
+s3d-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+s3d-model.workspace = true
+tempfile.workspace = true

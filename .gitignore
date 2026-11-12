@@ -1,0 +1,7 @@
+/target/
+/.venv/
+/.cache/
+/data/
+/*.conf
+/credentials.toml
+/.DS_Store

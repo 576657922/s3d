@@ -1,0 +1,13 @@
+listen = "127.0.0.1:28080"
+admin_listen = "127.0.0.1:29090"
+data_dir = "./data"
+region = "us-east-1"
+credentials_file = "./credentials.toml"
+base_domain = ""
+max_buckets_per_account = 10000
+default_object_ownership = "ObjectWriter"
+group_commit_window_ms = 1
+group_commit_max_batch = 64
+gc_live_ratio = 0.5
+max_connections = 1024
+log_format = "json"

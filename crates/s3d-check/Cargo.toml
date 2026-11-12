@@ -1,0 +1,11 @@
+[package]
+name = "s3d-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+s3d-types.workspace = true
