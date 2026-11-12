@@ -28,6 +28,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+loom.workspace = true
 proptest.workspace = true
 s3d-model.workspace = true
+shuttle.workspace = true
 tempfile.workspace = true

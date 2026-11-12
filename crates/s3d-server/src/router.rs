@@ -80,6 +80,14 @@ pub async fn handle_s3_request<S: ObjectStore>(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let req_bytes_est: u64 = req
+        .headers()
+        .get("x-amz-decoded-content-length")
+        .or_else(|| req.headers().get("content-length"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
     let mut op_name: &'static str = "Unknown";
     let mut bucket_log: Option<String> = None;
     let mut key_log: Option<String> = None;
@@ -96,17 +104,20 @@ pub async fn handle_s3_request<S: ObjectStore>(
     )
     .await;
 
-    let mut resp = match result {
+    let (mut resp, error_code): (_, &'static str) = match result {
         Ok(mut r) => {
             inject_common_headers(r.headers_mut(), &request_id, &host_id);
-            r
+            (r, "")
         }
-        Err(err) => build_error_response(err, is_head, &request_id, &host_id),
+        Err(err) => {
+            let code_str = err.code.as_str();
+            (build_error_response(err, is_head, &request_id, &host_id), code_str)
+        }
     };
 
-    if method != Method::OPTIONS {
-        if let (Some(origin), Some(bkt)) = (&origin_hdr, &bucket_log) {
-            if let Ok(Some(cors)) = state.store.lookup_bucket_cors_unauth(bkt).await {
+    if method != Method::OPTIONS
+        && let (Some(origin), Some(bkt)) = (&origin_hdr, &bucket_log)
+            && let Ok(Some(cors)) = state.store.lookup_bucket_cors_unauth(bkt).await {
                 let eff_method = ac_req_method_hdr
                     .as_deref()
                     .unwrap_or_else(|| method.as_str());
@@ -114,7 +125,38 @@ pub async fn handle_s3_request<S: ObjectStore>(
                     apply_cors_headers(resp.headers_mut(), &cors_hdrs);
                 }
             }
+
+    let resp_bytes: u64 = if is_head {
+        0
+    } else {
+        match resp.body() {
+            S3ResponseBody::Fixed(Some(b)) => b.len() as u64,
+            S3ResponseBody::Fixed(None) => 0,
+            S3ResponseBody::Stream(_) => resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0),
         }
+    };
+    let logged_bytes = if req_bytes_est > 0 && error_code.is_empty() {
+        req_bytes_est
+    } else {
+        resp_bytes
+    };
+
+    if req_bytes_est > 0 && error_code.is_empty() {
+        state
+            .metrics
+            .bytes_in_total
+            .fetch_add(req_bytes_est, std::sync::atomic::Ordering::Relaxed);
+    }
+    if resp_bytes > 0 {
+        state
+            .metrics
+            .bytes_out_total
+            .fetch_add(resp_bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     let status = resp.status().as_u16();
@@ -130,6 +172,8 @@ pub async fn handle_s3_request<S: ObjectStore>(
         key = key_log.as_deref().unwrap_or(""),
         caller = caller_log.as_deref().unwrap_or("anonymous"),
         status,
+        error_code,
+        bytes = logged_bytes,
         latency_us = elapsed_us,
         "s3_request"
     );
@@ -259,8 +303,8 @@ async fn dispatch_inner<S: ObjectStore>(
     let now_ms = now_epoch_ms();
 
     // 4b. HTML Form `PostObject` (`POST /{bucket}` without subresource query) (`FR-48` / P1)
-    if let S3Target::Bucket { bucket } = &parsed_uri.target {
-        if *method == Method::POST && parsed_uri.query.is_empty() {
+    if let S3Target::Bucket { bucket } = &parsed_uri.target
+        && *method == Method::POST && parsed_uri.query.is_empty() {
             *op_name = "PostObject";
             return handle_post_object(
                 state,
@@ -274,7 +318,6 @@ async fn dispatch_inner<S: ObjectStore>(
             )
             .await;
         }
-    }
 
     // 5. SigV4 / Presigned / Anonymous authentication (`PR-6` ~ `PR-12`)
     let auth_out = state
@@ -366,8 +409,8 @@ async fn handle_list_buckets<S: ObjectStore>(
     };
     let prefix = get_query_param(query, "prefix").map(str::to_string);
     let continuation_token = get_query_param(query, "continuation-token").map(str::to_string);
-    if let Some(region_filter) = get_query_param(query, "bucket-region") {
-        if !region_filter.is_empty() && region_filter != state.cfg.region {
+    if let Some(region_filter) = get_query_param(query, "bucket-region")
+        && !region_filter.is_empty() && region_filter != state.cfg.region {
             // Return empty list if filtering for another region
             let owner = ctx
                 .caller
@@ -379,7 +422,6 @@ async fn handle_list_buckets<S: ObjectStore>(
             });
             return Ok(xml_response(StatusCode::OK, xml));
         }
-    }
 
     let resp = state
         .store
@@ -1410,11 +1452,10 @@ async fn handle_object_target<S: ObjectStore>(
             .header("Content-Type", "application/xml")
             .header("Content-Length", xml.len().to_string())
             .header("Last-Modified", last_modified_http);
-        if let Some(vid) = &resp.version_id {
-            if vid != "null" {
+        if let Some(vid) = &resp.version_id
+            && vid != "null" {
                 builder = builder.header("x-amz-version-id", vid);
             }
-        }
         return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
     }
 
@@ -1566,11 +1607,10 @@ async fn handle_object_target<S: ObjectStore>(
                         .status(StatusCode::OK)
                         .header("Content-Type", "application/xml")
                         .header("Content-Length", xml.len().to_string());
-                    if let Some(sv) = &resp.src_version_id {
-                        if sv != "null" {
+                    if let Some(sv) = &resp.src_version_id
+                        && sv != "null" {
                             builder = builder.header("x-amz-copy-source-version-id", sv);
                         }
-                    }
                     Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap())
                 } else {
                     *op_name = "UploadPart";
@@ -1704,11 +1744,10 @@ async fn handle_object_target<S: ObjectStore>(
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/xml")
                     .header("Content-Length", xml.len().to_string());
-                if let Some(vid) = &resp.version_id {
-                    if vid != "null" {
+                if let Some(vid) = &resp.version_id
+                    && vid != "null" {
                         builder = builder.header("x-amz-version-id", vid);
                     }
-                }
                 if let Some(csum) = &resp.checksum {
                     builder = builder
                         .header(csum.algorithm.header_name(), &csum.value_b64)
@@ -1840,11 +1879,10 @@ async fn handle_object_target<S: ObjectStore>(
                 if let Some(sv) = &resp.src_version_id {
                     builder = builder.header("x-amz-copy-source-version-id", sv);
                 }
-                if let Some(dv) = &resp.dst_version_id {
-                    if dv != "null" {
+                if let Some(dv) = &resp.dst_version_id
+                    && dv != "null" {
                         builder = builder.header("x-amz-version-id", dv);
                     }
-                }
                 return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
             }
 
@@ -1920,11 +1958,10 @@ async fn handle_object_target<S: ObjectStore>(
                     &resp.checksum.value_b64,
                 )
                 .header("x-amz-checksum-type", resp.checksum.checksum_type.as_str());
-            if let Some(vid) = &resp.version_id {
-                if vid != "null" {
+            if let Some(vid) = &resp.version_id
+                && vid != "null" {
                     builder = builder.header("x-amz-version-id", vid);
                 }
-            }
             Ok(builder.body(S3ResponseBody::empty()).unwrap())
         }
         Method::GET | Method::HEAD => {
@@ -2114,11 +2151,10 @@ fn build_object_read_response<R>(
             &format!("bytes {start}-{end}/{total}"),
         );
     }
-    if let Some(vid) = &meta.version_id {
-        if vid != "null" {
+    if let Some(vid) = &meta.version_id
+        && vid != "null" {
             insert_header_latin1_safe(hdrs, "x-amz-version-id", vid);
         }
-    }
     if let Some(pc) = meta.parts_count {
         insert_header_latin1_safe(hdrs, "x-amz-mp-parts-count", &pc.to_string());
     }
@@ -2320,7 +2356,7 @@ fn parse_bounded_limit_param(
     }
 }
 
-fn parse_copy_source_range(raw: &str) -> StoreResult<(u64, u64)> {
+pub fn parse_copy_source_range(raw: &str) -> StoreResult<(u64, u64)> {
     let s = raw.trim();
     let Some(rest) = s.strip_prefix("bytes=") else {
         return Err(S3Error::new(
@@ -2559,8 +2595,8 @@ fn parse_header_checksum(
         return Ok(Some((alg, Some(b64))));
     }
 
-    if !headers.contains_key("x-amz-trailer") {
-        if let Some(sdk_alg) = headers.get("x-amz-sdk-checksum-algorithm") {
+    if !headers.contains_key("x-amz-trailer")
+        && let Some(sdk_alg) = headers.get("x-amz-sdk-checksum-algorithm") {
             let s = sdk_alg
                 .to_str()
                 .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid algorithm"))?
@@ -2580,7 +2616,6 @@ fn parse_header_checksum(
             };
             return Ok(Some((alg, None)));
         }
-    }
 
     Ok(None)
 }
@@ -2673,7 +2708,7 @@ fn extract_system_meta(headers: &HeaderMap) -> SystemMeta {
     let get_opt = |name: &str| -> Option<String> {
         headers
             .get(name)
-            .map(|v| decode_header_value_str(v))
+            .map(decode_header_value_str)
     };
     let content_type =
         get_opt("content-type").unwrap_or_else(|| "binary/octet-stream".to_string());
@@ -2794,11 +2829,10 @@ fn parse_copy_source(raw: &str) -> StoreResult<(String, String, Option<String>)>
     let mut src_vid = None;
     if let Some(q) = query_part {
         for pair in q.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "versionId" && !v.is_empty() {
+            if let Some((k, v)) = pair.split_once('=')
+                && k == "versionId" && !v.is_empty() {
                     src_vid = Some(percent_decode_once(v)?);
                 }
-            }
         }
     }
     Ok((src_bucket, src_key, src_vid))
@@ -2970,11 +3004,10 @@ async fn handle_post_object<S: ObjectStore>(
             .header("Location", redir_loc)
             .header("ETag", &put_resp.etag)
             .header("Content-Length", "0");
-        if let Some(vid) = &put_resp.version_id {
-            if vid != "null" {
+        if let Some(vid) = &put_resp.version_id
+            && vid != "null" {
                 builder = builder.header("x-amz-version-id", vid);
             }
-        }
         return Ok(builder.body(S3ResponseBody::empty()).unwrap());
     }
 
@@ -2986,11 +3019,10 @@ async fn handle_post_object<S: ObjectStore>(
             .header("Content-Length", xml.len().to_string())
             .header("Location", &location)
             .header("ETag", &put_resp.etag);
-        if let Some(vid) = &put_resp.version_id {
-            if vid != "null" {
+        if let Some(vid) = &put_resp.version_id
+            && vid != "null" {
                 builder = builder.header("x-amz-version-id", vid);
             }
-        }
         if put_resp.checksum.client_requested {
             builder = builder.header(
                 put_resp.checksum.algorithm.header_name(),
@@ -3006,11 +3038,10 @@ async fn handle_post_object<S: ObjectStore>(
         .header("Location", &location)
         .header("ETag", &put_resp.etag)
         .header("Content-Length", "0");
-    if let Some(vid) = &put_resp.version_id {
-        if vid != "null" {
+    if let Some(vid) = &put_resp.version_id
+        && vid != "null" {
             builder = builder.header("x-amz-version-id", vid);
         }
-    }
     if put_resp.checksum.client_requested {
         builder = builder.header(
             put_resp.checksum.algorithm.header_name(),

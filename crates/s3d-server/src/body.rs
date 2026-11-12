@@ -103,14 +103,13 @@ impl HyperVerifiedBodyStream {
             }
         };
 
-        if let Some(cl) = content_len_header {
-            if chunked_decoder.is_none() && cl > max_bytes_limit {
+        if let Some(cl) = content_len_header
+            && chunked_decoder.is_none() && cl > max_bytes_limit {
                 return Err(S3Error::new(
                     S3ErrorCode::EntityTooLarge,
                     "Your proposed upload exceeds the maximum allowed size",
                 ));
             }
-        }
 
         Ok(Self {
             incoming,
@@ -229,7 +228,7 @@ impl VerifiedBodyStream for HyperVerifiedBodyStream {
                         if self.emitted_bytes > self.max_bytes_limit {
                             return Poll::Ready(Err(BodyStreamError::EntityTooLarge));
                         }
-                        ver.update(&data);
+                        ver.update_bytes(&data);
                         return Poll::Ready(Ok(Some(data)));
                     }
                 }
@@ -353,15 +352,14 @@ impl VerifiedBodyStream for PreVerifiedBytesStream {
         &mut self,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Bytes>, BodyStreamError>> {
-        if let Some(chunk) = self.data.take() {
-            if !chunk.is_empty() {
+        if let Some(chunk) = self.data.take()
+            && !chunk.is_empty() {
                 self.verifier
                     .as_mut()
                     .expect("poll_next_chunk called after finish")
                     .update(&chunk);
                 return Poll::Ready(Ok(Some(chunk)));
             }
-        }
         Poll::Ready(Ok(None))
     }
 

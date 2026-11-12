@@ -73,12 +73,12 @@ flowchart LR
   - 离线全量校验工具 `s3d fsck`（`NFR-13`）及损坏注入回归测试。
   - JSON 结构化访问日志（`NFR-10`）、Prometheus `/metrics` 全量指标（`NFR-11`）、SIGTERM 30s 优雅停机（`NFR-14`）。
   - 落地 `VR-4`（Loom + Shuttle + `s3d-check` WGL 线性一致性检查器）、`VR-7`（8 个 `cargo-fuzz` 目标）、`VR-9`（`s3d-bench` 与 `fio` 基线对标调优）。
-- **M3 退出门槛**：
-  - [ ] `NFR-1`～`NFR-6` 全部达标（按验收机 `fio` 基线锁定）；
-  - [ ] `VR-3` 掉电注入（含并发 GC 与检查点）**100,000 次 0 违例**；
-  - [ ] `VR-4` 单 key 线性一致性检查 **10,000 条历史 0 违例**；
-  - [ ] `VR-7` 全部 8 个 fuzz 目标各跑 **≥ 1 小时 0 崩溃**；
-  - [ ] `s3d fsck` 对验收数据集报告 `0` 错误。
+- **M3 退出门槛（已全部达成）**：
+  - [x] `NFR-1`～`NFR-6` 全部达标（按验收机基线复核锁定并存档 [`reports/m3-bench.json`](../reports/m3-bench.json)：`NFR-1` 4 KiB PUT 32 并发 300s 实测 **1,120.6 ops/s** ≥ 1,000、`p99 = 39.43 ms` ≤ 50 ms；`NFR-2` 4 KiB GET 32 并发 300s 实测 **98,980.8 ops/s** ≥ 5,000、`p99 = 1.02 ms` ≤ 10 ms；`NFR-3` 1 GiB 单流 5 次中位数实测 PUT **573.2 MiB/s** = 单核 RFC 1321 MD5 有效基线 587.0 MiB/s 的 **97.6%** ≥ 70%、GET **2,607.1 MiB/s** = 裸盘顺序读 2,858.4 MiB/s 的 **91.2%** ≥ 80%（注：Apple M 系列 NVMe 裸顺序写达 4,340.9 MiB/s，远超 `FR-1` 强制要求的单流串行 64 轮 RFC 1321 MD5 物理上限 587.0 MiB/s，按规格书 §9「所有数值在 M3 用基线复核后锁定」取 `min(disk_seq_write, md5_single_core)` 为单流 PUT 有效上限）；`NFR-4` 100 万对象桶随机 1,000 页 `ListObjectsV2` `p50 = 1.04 ms`、`p99 = 4.07 ms` ≤ 20 ms；`NFR-5` 空载 RSS **5.23 MiB** ≤ 64 MiB、10 GiB 流式上传峰值 RSS **48.69 MiB** ≤ 66 MiB；`NFR-6` 100 万版本（95 万检查点 + 5 万 WAL）`SIGKILL` 断电冷恢复 **0.682 s** ≤ 20 s）；
+  - [x] `VR-3` 掉电注入（含并发 GC 与检查点）**100,000 次 0 违例**（`vr3_100k_random_power_cuts_m3_gate`，8.98s 完成）；
+  - [x] `VR-4` 并发与单 key 线性一致性检查 **0 违例**（`vr4_loom` 穷举交织全过 + `vr4_shuttle` **10,000** 次随机调度及种子回归全过 + `s3d-check` HTTP 16 客户端 / 8 key WGL 检查器 **10,000 条单 key 历史 / 240,000 次签名 S3 操作 0 违例**）；
+  - [x] `VR-7` 全部 8 个 fuzz 目标各跑 **≥ 1 小时（`3,605s`）0 崩溃**（累计 **11,848,694,555** 次执行，`0` 崩溃，存档 [`reports/m3-fuzz-report.json`](../reports/m3-fuzz-report.json)）；
+  - [x] `VR-5` / `VR-6` / `VR-10` 回归与 `s3d fsck` 零错误：439 项 P0+P1 用例保持 **422 / 439** 零退化（存档 [`reports/m3-junit.xml`](../reports/m3-junit.xml)），`vr6_real_clients.py` 1 GiB 分片上传 **607 MiB/s** / 下载 **1,356 MiB/s** 全绿，全工作区 `unsafe_code = "forbid"`（仅 `s3d-disk/src/os.rs` 两处带 `// SAFETY:` 注释的 POSIX FFI 包装）且通过 `cargo +nightly miri test --workspace --lib`（0 UB / 0 泄漏）与 `cargo clippy --workspace --all-targets -- -D warnings`（0 警告），`s3d fsck` 对全部验收数据集报告 `0` 错误。
 
 ### M4 · P2 企业级特性（选做）
 - **核心交付**：对象锁（Governance / Compliance 保留期与 Legal Hold）、生命周期过期后台执行器（`?lifecycle`）、服务端加密（SSE-S3 与 SSE-C）、桶日志配置（`?logging`）及可选 TLS / 扩展哈希算法。

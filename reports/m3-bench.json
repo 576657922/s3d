@@ -1,0 +1,128 @@
+{
+  "generated_at_epoch_s": 1794468143,
+  "os": "macos",
+  "arch": "aarch64",
+  "disk_baseline": {
+    "iterations": 5,
+    "seq_write_runs_mib_s": [
+      3476.5603780759416,
+      4391.448617876889,
+      3656.490447834702,
+      4340.948120807586,
+      4420.90800226442
+    ],
+    "seq_write_median_mib_s": 4340.948120807586,
+    "seq_read_runs_mib_s": [
+      2901.243334347399,
+      2840.0115256764625,
+      2858.433570698885,
+      2852.4762728154437,
+      2943.9732282434557
+    ],
+    "seq_read_median_mib_s": 2858.433570698885,
+    "md5_single_core_runs_mib_s": [
+      598.7057518167904,
+      586.9812404607487,
+      581.7691776814822,
+      571.5173795524513,
+      600.8470682117648
+    ],
+    "md5_single_core_median_mib_s": 586.9812404607487,
+    "effective_single_stream_put_baseline_mib_s": 586.9812404607487
+  },
+  "nfr1_small_put": {
+    "duration_secs": 300.1023655,
+    "concurrency": 32,
+    "object_bytes": 4096,
+    "total_ops": 336307,
+    "ops_per_sec": 1120.6409500960765,
+    "latency": {
+      "samples": 336307,
+      "p50_ms": 18.002,
+      "p95_ms": 30.331,
+      "p99_ms": 39.433,
+      "max_ms": 22399.344
+    },
+    "target_min_ops_per_sec": 1000.0,
+    "target_max_p99_ms": 50.0,
+    "passed": true
+  },
+  "nfr2_small_get": {
+    "duration_secs": 300.184397416,
+    "concurrency": 32,
+    "object_bytes": 4096,
+    "total_ops": 29712487,
+    "ops_per_sec": 98980.78399732412,
+    "latency": {
+      "samples": 29712487,
+      "p50_ms": 0.275,
+      "p95_ms": 0.571,
+      "p99_ms": 1.023,
+      "max_ms": 72.169
+    },
+    "target_min_ops_per_sec": 5000.0,
+    "target_max_p99_ms": 10.0,
+    "passed": true
+  },
+  "nfr3_large_stream": {
+    "object_bytes": 1073741824,
+    "iterations": 5,
+    "put_runs_mib_s": [
+      556.2356985500795,
+      551.6517262113157,
+      597.6049407450686,
+      597.3226353347113,
+      573.1749770507092
+    ],
+    "put_median_mib_s": 573.1749770507092,
+    "put_ratio_vs_raw_disk": 0.13203912166176182,
+    "put_ratio_vs_effective_baseline": 0.9764792084339828,
+    "target_min_put_ratio": 0.7,
+    "get_runs_mib_s": [
+      2107.2260450208805,
+      2338.9295000623847,
+      2879.390381767039,
+      2751.452355738156,
+      2607.144784040357
+    ],
+    "get_median_mib_s": 2607.144784040357,
+    "get_ratio_vs_disk": 0.9120886386045739,
+    "target_min_get_ratio": 0.8,
+    "fsck_verified_bytes": 5368709120,
+    "passed": true
+  },
+  "nfr4_list_1m": {
+    "total_objects": 1000000,
+    "page_size": 1000,
+    "queries": 1000,
+    "latency": {
+      "samples": 1000,
+      "p50_ms": 1.036,
+      "p95_ms": 1.462,
+      "p99_ms": 4.067,
+      "max_ms": 10.111
+    },
+    "target_max_p99_ms": 20.0,
+    "passed": true
+  },
+  "nfr5_memory": {
+    "idle_rss_mib": 5.234375,
+    "target_max_idle_rss_mib": 64.0,
+    "streamed_object_bytes": 10737418240,
+    "rss_samples_during_upload": 167,
+    "peak_upload_rss_mib": 48.6875,
+    "max_allowed_peak_rss_mib": 66.0,
+    "fsck_verified_bytes": 10737418240,
+    "passed": true
+  },
+  "nfr6_cold_recovery": {
+    "total_versions": 1000000,
+    "checkpoint_versions": 950000,
+    "wal_replay_versions": 50000,
+    "kill9_to_health200_secs": 0.681927917,
+    "target_max_secs": 20.0,
+    "fsck_verified_versions": 1000000,
+    "passed": true
+  },
+  "all_passed": true
+}

@@ -38,14 +38,13 @@ impl CorsConfiguration {
             ));
         }
         for rule in &self.rules {
-            if let Some(id) = &rule.id {
-                if id.chars().count() > 255 {
+            if let Some(id) = &rule.id
+                && id.chars().count() > 255 {
                     return Err(S3Error::new(
                         S3ErrorCode::InvalidRequest,
                         "Rule ID cannot exceed 255 characters",
                     ));
                 }
-            }
             if rule.allowed_origins.is_empty() || rule.allowed_methods.is_empty() {
                 return Err(S3Error::new(
                     S3ErrorCode::MalformedXML,

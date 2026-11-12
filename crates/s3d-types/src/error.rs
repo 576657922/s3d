@@ -182,7 +182,10 @@ impl S3ErrorCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S3Error {
+pub struct S3Error(Box<S3ErrorInner>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3ErrorInner {
     pub code: S3ErrorCode,
     pub message: String,
     pub resource: Option<String>,
@@ -192,9 +195,23 @@ pub struct S3Error {
     pub extra_headers: Vec<(String, String)>,
 }
 
+impl std::ops::Deref for S3Error {
+    type Target = S3ErrorInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for S3Error {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl S3Error {
     pub fn new(code: S3ErrorCode, message: impl Into<String>) -> Self {
-        Self {
+        Self(Box::new(S3ErrorInner {
             code,
             message: message.into(),
             resource: None,
@@ -202,7 +219,7 @@ impl S3Error {
             key: None,
             upload_id: None,
             extra_headers: Vec::new(),
-        }
+        }))
     }
 
     pub fn with_bucket(mut self, bucket: impl Into<String>) -> Self {

@@ -178,8 +178,8 @@ impl FaultDisk {
         all_dirty.shuffle(rng);
 
         for write in all_dirty {
-            if rng.gen_bool(0.5) {
-                if let Some(f) = crashed_files.get_mut(&write.inode_id) {
+            if rng.gen_bool(0.5)
+                && let Some(f) = crashed_files.get_mut(&write.inode_id) {
                     let take_len = if write.data.len() > 1 && rng.gen_bool(0.25) {
                         // Sector prefix tear!
                         rng.gen_range(1..write.data.len())
@@ -193,18 +193,15 @@ impl FaultDisk {
                     }
                     f.durable[start..end].copy_from_slice(&write.data[..take_len]);
                 }
-            }
         }
 
         // 3. Apply or drop pending un-fsynced set_len
         for (&id, orig) in &guard.files {
-            if let Some(new_len) = orig.pending_set_len {
-                if rng.gen_bool(0.5) {
-                    if let Some(cf) = crashed_files.get_mut(&id) {
+            if let Some(new_len) = orig.pending_set_len
+                && rng.gen_bool(0.5)
+                    && let Some(cf) = crashed_files.get_mut(&id) {
                         cf.durable.resize(new_len as usize, 0);
                     }
-                }
-            }
         }
 
         // Sync live = durable in recovered image, garbage-collect unreachable unlinked inodes
@@ -240,12 +237,11 @@ impl FaultDisk {
             return Err(DiskError::IoError);
         }
         guard.sync_calls += 1;
-        if let Some(limit) = guard.fail_sync_at {
-            if guard.sync_calls >= limit {
+        if let Some(limit) = guard.fail_sync_at
+            && guard.sync_calls >= limit {
                 guard.always_fail_sync = true;
                 return Err(DiskError::IoError);
             }
-        }
         Ok(())
     }
 }
@@ -535,11 +531,9 @@ impl Disk for FaultDisk {
                     from_name,
                     ..
                 } = op
-                {
-                    if let Some(src) = guard.durable_dirs.get_mut(&from_dir) {
+                    && let Some(src) = guard.durable_dirs.get_mut(&from_dir) {
                         src.remove(&from_name);
                     }
-                }
             }
         }
         let snapshot = guard.live_dirs.get(&dir).cloned().unwrap_or_default();

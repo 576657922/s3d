@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use s3d_types::{AccountRecord, ObjectOwnership, OwnerInfo, SecretKey, DEFAULT_MAX_OBJECT_SIZE};
 use serde::Deserialize;
@@ -27,6 +28,10 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub log_format: String,
     pub reserved_disk_bytes: u64,
+    #[serde(skip)]
+    pub header_read_timeout: Duration,
+    #[serde(skip)]
+    pub idle_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -52,6 +57,8 @@ impl Default for ServerConfig {
             max_connections: 1024,
             log_format: "json".to_string(),
             reserved_disk_bytes: 2 * 1024 * 1024 * 1024,
+            header_read_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 }

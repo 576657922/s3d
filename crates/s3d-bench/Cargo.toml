@@ -1,0 +1,30 @@
+[package]
+name = "s3d-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+hex.workspace = true
+hmac.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+md-5.workspace = true
+rand.workspace = true
+s3d-disk.workspace = true
+s3d-engine.workspace = true
+s3d-model.workspace = true
+s3d-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

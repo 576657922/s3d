@@ -82,6 +82,9 @@ pub trait DiskFile: Send + Sync + 'static {
     fn write_all_at(&self, offset: u64, buf: &[u8]) -> DiskResult<()>;
     fn set_len(&self, size: u64) -> DiskResult<()>;
     fn len(&self) -> DiskResult<u64>;
+    fn is_empty(&self) -> DiskResult<bool> {
+        Ok(self.len()? == 0)
+    }
     fn sync_data(&self) -> DiskResult<()>;
 }
 
@@ -148,10 +151,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls POSIX statvfs / F_NOCACHE FFI unsupported by Miri on macOS")]
     fn os_disk_contract() {
         let dir = tempfile::tempdir().unwrap();
         let disk = OsDisk::new(dir.path()).unwrap();
         run_disk_contract(&disk);
+
+        // Exercise VR-10 audited `open_uncached` (`F_NOCACHE` on macOS) + `available_bytes` (`statvfs`)
+        let uf = disk
+            .open_uncached("uncached.bin", OpenOpts::create_truncate_rw())
+            .unwrap();
+        let block = vec![0xCDu8; 65_536];
+        uf.write_all_at(0, &block).unwrap();
+        uf.sync_data().unwrap();
+        drop(uf);
+
+        let ur = disk
+            .open_uncached("uncached.bin", OpenOpts::read_only())
+            .unwrap();
+        let mut got = vec![0u8; 65_536];
+        ur.read_exact_at(0, &mut got).unwrap();
+        assert_eq!(got, block);
+        drop(ur);
+        disk.remove_file("uncached.bin").unwrap();
     }
 
     #[test]

@@ -163,12 +163,11 @@ fn lookup_bucket_checked<'a>(
             .with_bucket(bucket_name)
     })?;
     // [PR-29] Expected bucket owner header verification (applies to authenticated and anonymous callers)
-    if let Some(expected) = &ctx.expected_bucket_owner {
-        if expected != &bucket.owner.user_id {
+    if let Some(expected) = &ctx.expected_bucket_owner
+        && expected != &bucket.owner.user_id {
             return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                 .with_bucket(bucket_name));
         }
-    }
     Ok(bucket)
 }
 
@@ -206,8 +205,8 @@ fn check_bucket_write_object<'a>(
         ..Default::default()
     };
     // If tags are attached on Put/Post/Multipart/Copy, an explicit Deny on PutObjectTagging rejects it.
-    if req_tags.is_some_and(|t| !t.is_empty()) {
-        if let Some(pol) = view.policy {
+    if req_tags.is_some_and(|t| !t.is_empty())
+        && let Some(pol) = view.policy {
             let arn = format!("arn:aws:s3:::{bucket_name}/{key}");
             if pol.evaluate(ctx, &[S3Action::PutObjectTagging], &arn, &extra)
                 == PolicyDecision::ExplicitDeny
@@ -216,7 +215,6 @@ fn check_bucket_write_object<'a>(
                     .with_key(bucket_name, key));
             }
         }
-    }
     if !authorize_object_action(
         &view,
         ctx,
@@ -414,21 +412,19 @@ fn collect_visible_items<'a>(
         if head.is_delete_marker {
             continue;
         }
-        if let Some(after) = after_key {
-            if key.as_str() <= after {
+        if let Some(after) = after_key
+            && key.as_str() <= after {
                 continue;
             }
-        }
 
         let rest = &key[prefix.len()..];
-        if let Some(delim) = delimiter.filter(|d| !d.is_empty()) {
-            if let Some(pos) = rest.find(delim) {
+        if let Some(delim) = delimiter.filter(|d| !d.is_empty())
+            && let Some(pos) = rest.find(delim) {
                 let cp = format!("{}{}", prefix, &rest[..pos + delim.len()]);
-                if let Some(after) = after_key {
-                    if cp.as_str() <= after {
+                if let Some(after) = after_key
+                    && cp.as_str() <= after {
                         continue;
                     }
-                }
                 if last_cp.as_deref() == Some(cp.as_str()) {
                     continue;
                 }
@@ -440,7 +436,6 @@ fn collect_visible_items<'a>(
                 items.push(MergedItem::CommonPrefix(cp));
                 continue;
             }
-        }
 
         if items.len() == max_keys {
             is_truncated = true;
@@ -457,14 +452,13 @@ impl ObjectStore for ModelStore {
 
     async fn list_buckets(&self, req: ListBucketsReq) -> StoreResult<ListBucketsResp> {
         let caller = require_authenticated(&req.ctx)?.clone();
-        if let Some(max) = req.max_buckets {
-            if !(1..=10_000).contains(&max) {
+        if let Some(max) = req.max_buckets
+            && !(1..=10_000).contains(&max) {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidArgument,
                     "max-buckets must be between 1 and 10000",
                 ));
             }
-        }
         let after = match &req.continuation_token {
             Some(tok) if !tok.is_empty() => Some(decode_token("__buckets__", tok)?),
             _ => None,
@@ -477,16 +471,14 @@ impl ObjectStore for ModelStore {
             if b.owner.user_id != caller.user_id {
                 continue;
             }
-            if let Some(pfx) = &req.prefix {
-                if !b.name.starts_with(pfx) {
+            if let Some(pfx) = &req.prefix
+                && !b.name.starts_with(pfx) {
                     continue;
                 }
-            }
-            if let Some(after_name) = &after {
-                if &b.name <= after_name {
+            if let Some(after_name) = &after
+                && &b.name <= after_name {
                     continue;
                 }
-            }
             if buckets.len() == max {
                 if let Some(last) = buckets.last() {
                     let last_b: &BucketSummary = last;
@@ -512,15 +504,14 @@ impl ObjectStore for ModelStore {
         // [FR-48] Bucket naming rules
         validate_bucket_name(&req.bucket)?;
 
-        if let Some(loc) = &req.location_constraint {
-            if !loc.is_empty() && loc != &self.cfg.region {
+        if let Some(loc) = &req.location_constraint
+            && !loc.is_empty() && loc != &self.cfg.region {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidLocationConstraint,
                     "The specified location-constraint is not valid",
                 )
                 .with_bucket(&req.bucket));
             }
-        }
 
         let mut guard = self.state.lock().unwrap();
         if let Some(existing) = guard.buckets.get(&req.bucket) {
@@ -556,15 +547,14 @@ impl ObjectStore for ModelStore {
             .object_ownership
             .unwrap_or(self.cfg.default_object_ownership);
         let acl = if ownership == ObjectOwnership::BucketOwnerEnforced {
-            if let Some(spec) = &req.acl {
-                if !matches!(spec, AclSpec::Canned(CannedAcl::Private)) {
+            if let Some(spec) = &req.acl
+                && !matches!(spec, AclSpec::Canned(CannedAcl::Private)) {
                     return Err(S3Error::new(
                         S3ErrorCode::InvalidBucketAclWithObjectOwnership,
                         "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
                     )
                     .with_bucket(&req.bucket));
                 }
-            }
             AccessControlPolicy::new_private(caller.clone())
         } else {
             match &req.acl {
@@ -802,11 +792,10 @@ impl ObjectStore for ModelStore {
         .map_err(|e| e.with_key(&req.bucket, &req.key))?;
         let new_acl = resolve_target_acl(&ver_owner, Some(&b_ro.owner), &req.acl)?;
         let b = guard.buckets.get_mut(&req.bucket).unwrap();
-        if let Some(chain) = b.objects.get_mut(&req.key) {
-            if let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq) {
+        if let Some(chain) = b.objects.get_mut(&req.key)
+            && let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq) {
                 v.acl = new_acl;
             }
-        }
         Ok(vid_out)
     }
 
@@ -974,11 +963,10 @@ impl ObjectStore for ModelStore {
             (ver.seq, ver.version_id.clone().filter(|v| v != "null"))
         };
         let b = guard.buckets.get_mut(&req.bucket).unwrap();
-        if let Some(chain) = b.objects.get_mut(&req.key) {
-            if let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq) {
+        if let Some(chain) = b.objects.get_mut(&req.key)
+            && let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq) {
                 v.tags = req.tags;
             }
-        }
         Ok(vid_out)
     }
 
@@ -1008,11 +996,10 @@ impl ObjectStore for ModelStore {
             (ver.seq, ver.version_id.clone().filter(|v| v != "null"))
         };
         let b = guard.buckets.get_mut(&req.bucket).unwrap();
-        if let Some(chain) = b.objects.get_mut(&req.key) {
-            if let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq) {
+        if let Some(chain) = b.objects.get_mut(&req.key)
+            && let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq) {
                 v.tags.clear();
             }
-        }
         Ok(vid_out)
     }
 
@@ -1458,8 +1445,8 @@ impl ObjectStore for ModelStore {
 
         if let Some(vid) = &req.version_id {
             // [FR-36] Permanent version deletion
-            if let Some(chain) = bucket.objects.get_mut(&req.key) {
-                if let Some(pos) = chain
+            if let Some(chain) = bucket.objects.get_mut(&req.key)
+                && let Some(pos) = chain
                     .iter()
                     .position(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
                 {
@@ -1472,7 +1459,6 @@ impl ObjectStore for ModelStore {
                         is_delete_marker: removed.is_delete_marker,
                     });
                 }
-            }
             return Ok(DeleteObjectResp {
                 version_id: Some(vid.clone()),
                 is_delete_marker: false,
@@ -1572,7 +1558,7 @@ impl ObjectStore for ModelStore {
                         key: item.key,
                         version_id: item.version_id,
                         code: err.code.as_str().to_string(),
-                        message: err.message,
+                        message: err.message.clone(),
                     });
                 }
             }
@@ -1861,8 +1847,8 @@ impl ObjectStore for ModelStore {
         let digests = body.finish().map_err(map_body_err)?;
         let data = buf.freeze();
 
-        if let Some(up_alg) = upload_csum_info.0 {
-            if digests.checksum.client_requested && digests.checksum.algorithm != up_alg {
+        if let Some(up_alg) = upload_csum_info.0
+            && digests.checksum.client_requested && digests.checksum.algorithm != up_alg {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidRequest,
                     format!(
@@ -1871,7 +1857,6 @@ impl ObjectStore for ModelStore {
                     ),
                 ));
             }
-        }
 
         let part_csum = upload_csum_info
             .0
@@ -1892,8 +1877,8 @@ impl ObjectStore for ModelStore {
         let etag = format!("\"{}\"", hex::encode(digests.md5));
         let mut guard = self.state.lock().unwrap();
         let b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
-        if let Some(up_ro) = b_ro.uploads.get(&(req.key.clone(), req.upload_id.clone())) {
-            if !has_upload_perm(
+        if let Some(up_ro) = b_ro.uploads.get(&(req.key.clone(), req.upload_id.clone()))
+            && !has_upload_perm(
                 b_ro,
                 self.cfg.default_object_ownership,
                 &req.key,
@@ -1906,7 +1891,6 @@ impl ObjectStore for ModelStore {
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
                 );
             }
-        }
         let b = guard.buckets.get_mut(&req.bucket).unwrap();
         let up = b
             .uploads
@@ -2221,14 +2205,13 @@ impl ObjectStore for ModelStore {
                 "Your proposed upload exceeds the maximum allowed size",
             ));
         }
-        if let Some(exp_size) = req.expected_object_size {
-            if exp_size != total_size {
+        if let Some(exp_size) = req.expected_object_size
+            && exp_size != total_size {
                 return Err(S3Error::new(
                     S3ErrorCode::PreconditionFailed,
                     "Object size does not match x-amz-mp-object-size.",
                 ));
             }
-        }
 
         // [PR-25] Final object checksum (Model computes FULL_OBJECT directly over concatenated bytes!)
         let final_checksum = match (up.checksum_algorithm, up.checksum_type) {
@@ -2252,17 +2235,16 @@ impl ObjectStore for ModelStore {
             },
         };
 
-        if let Some((exp_alg, exp_val)) = &req.expected_checksum {
-            if !final_checksum.client_requested
+        if let Some((exp_alg, exp_val)) = &req.expected_checksum
+            && (!final_checksum.client_requested
                 || *exp_alg != final_checksum.algorithm
-                || exp_val.trim() != final_checksum.value_b64
+                || exp_val.trim() != final_checksum.value_b64)
             {
                 return Err(S3Error::new(
                     S3ErrorCode::BadDigest,
                     "The digest you specified did not match the calculated digest.",
                 ));
             }
-        }
 
         // [FR-15, FR-17] Evaluate destination preconditions at commit point
         guard.next_seq += 1;
@@ -2487,8 +2469,8 @@ impl ObjectStore for ModelStore {
                     }
                 }
                 let rest = &key[req.prefix.len()..];
-                if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty()) {
-                    if let Some(pos) = rest.find(delim) {
+                if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty())
+                    && let Some(pos) = rest.find(delim) {
                         let cp = format!("{}{}", req.prefix, &rest[..pos + delim.len()]);
                         if !km.is_empty() && cp.as_str() <= km.as_str() {
                             continue;
@@ -2506,7 +2488,6 @@ impl ObjectStore for ModelStore {
                         common_prefixes.push(cp);
                         continue;
                     }
-                }
                 if uploads.len() + common_prefixes.len() == max_u {
                     is_truncated = true;
                     break;
@@ -2754,8 +2735,8 @@ impl ObjectStore for ModelStore {
                 continue;
             }
             let rest = &key[req.prefix.len()..];
-            if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty()) {
-                if let Some(pos) = rest.find(delim) {
+            if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty())
+                && let Some(pos) = rest.find(delim) {
                     let cp = format!("{}{}", req.prefix, &rest[..pos + delim.len()]);
                     if !km.is_empty() && cp.as_str() <= km.as_str() {
                         continue;
@@ -2773,7 +2754,6 @@ impl ObjectStore for ModelStore {
                     common_prefixes.push(cp);
                     continue;
                 }
-            }
 
             let mut skip_until_marker = !km.is_empty() && key == &km;
             for (idx, v) in chain.iter().enumerate() {
@@ -3102,9 +3082,9 @@ impl ModelStore {
             (0, total_size - 1, false, None)
         };
 
-        let content_len = if req.part_number.is_some() {
+        let content_len = if let Some(pn) = req.part_number {
             if let Some(parts) = &ver.parts {
-                parts[req.part_number.unwrap() as usize - 1].size
+                parts[pn as usize - 1].size
             } else {
                 total_size
             }

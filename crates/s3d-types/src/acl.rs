@@ -188,25 +188,23 @@ impl AccessControlPolicy {
             }
             CannedAcl::BucketOwnerRead => {
                 grants.push(owner_grant);
-                if let Some(bo) = bucket_owner {
-                    if bo.user_id != resource_owner.user_id {
+                if let Some(bo) = bucket_owner
+                    && bo.user_id != resource_owner.user_id {
                         grants.push(AclGrant {
                             grantee: AclGrantee::CanonicalUser(bo.clone()),
                             permission: AclPermission::Read,
                         });
                     }
-                }
             }
             CannedAcl::BucketOwnerFullControl => {
                 grants.push(owner_grant);
-                if let Some(bo) = bucket_owner {
-                    if bo.user_id != resource_owner.user_id {
+                if let Some(bo) = bucket_owner
+                    && bo.user_id != resource_owner.user_id {
                         grants.push(AclGrant {
                             grantee: AclGrantee::CanonicalUser(bo.clone()),
                             permission: AclPermission::FullControl,
                         });
                     }
-                }
             }
             CannedAcl::LogDeliveryWrite => {
                 grants.push(AclGrant {

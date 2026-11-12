@@ -172,18 +172,16 @@ impl PrincipalEntry {
                     return true;
                 }
                 // Match IAM ARNs such as `arn:aws:iam::<account>:root` or `arn:aws:iam::<account>:user/<name>`
-                if let Some(rest) = spec.strip_prefix("arn:aws:iam::") {
-                    if let Some((acct, suffix)) = rest.split_once(':') {
+                if let Some(rest) = spec.strip_prefix("arn:aws:iam::")
+                    && let Some((acct, suffix)) = rest.split_once(':') {
                         if acct == c.user_id {
                             return true;
                         }
-                        if let Some(uname) = suffix.strip_prefix("user/") {
-                            if uname == c.user_id || uname == c.display_name {
+                        if let Some(uname) = suffix.strip_prefix("user/")
+                            && (uname == c.user_id || uname == c.display_name) {
                                 return true;
                             }
-                        }
                     }
-                }
                 false
             }
             Self::Service(_) => false,
@@ -734,11 +732,10 @@ fn lookup_condition_value(
 }
 
 fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s.is_char_boundary(prefix.len()) {
-        if s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    if s.len() >= prefix.len() && s.is_char_boundary(prefix.len())
+        && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
             return Some(&s[prefix.len()..]);
         }
-    }
     None
 }
 
@@ -762,7 +759,7 @@ fn eval_condition_clause(
     };
 
     match clause.op {
-        ConditionBaseOp::StringEquals => clause.expected_values.iter().any(|e| *e == actual),
+        ConditionBaseOp::StringEquals => clause.expected_values.contains(&actual),
         ConditionBaseOp::StringNotEquals => clause.expected_values.iter().all(|e| *e != actual),
         ConditionBaseOp::StringEqualsIgnoreCase => clause
             .expected_values
@@ -1057,6 +1054,7 @@ pub fn authorize_bucket_action(
 ///   bucket-scoped object writes (`PutObject`, `CreateMultipartUpload`, `DeleteObject` per `PR-31`).
 /// - `target_acl`: either `Some(&bucket.acl)` (for `PutObject`/`DeleteObject`) or `Some(&ver.acl)` (for `GetObject`/`GetObjectAcl`),
 ///   or `None` when ACLs never grant the operation (e.g. `?tagging`, `GetObjectAttributes`).
+#[allow(clippy::too_many_arguments)]
 pub fn authorize_object_action(
     bucket: &BucketAuthView<'_>,
     ctx: &CallerContext,

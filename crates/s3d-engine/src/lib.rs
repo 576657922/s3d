@@ -1,14 +1,17 @@
 //! Crash-safe log-structured object storage engine (`s3d-engine`).
 
 pub mod catalog;
+pub mod checkpoint;
 mod checksum_util;
 pub mod format;
+pub mod telemetry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use bytes::BytesMut;
@@ -18,18 +21,21 @@ use serde::Serialize;
 use s3d_disk::{Disk, DiskError, DiskFile, OpenOpts};
 use s3d_types::*;
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::catalog::{
-    BucketEntry, EngineByteReader, MemoryCatalog, MultipartUploadEntry, ObjectVersionEntry,
-    SegmentPin, SegmentSlot, UploadPartEntry, SEG_STATE_ACTIVE, SEG_STATE_PENDING_DELETE,
+    BucketEntry, EngineByteReader, InflightWriteGuard, MemoryCatalog, MultipartUploadEntry,
+    ObjectVersionEntry, SegmentPin, SegmentSlot, UploadPartEntry, SEG_STATE_ACTIVE,
     SEG_STATE_SEALED,
 };
+use crate::checkpoint::{read_checkpoint_from_file, write_checkpoint_to_file};
+pub use crate::checkpoint::{decode_checkpoint_bytes, LoadedCheckpoint};
 use crate::checksum_util::{
     combine_crc32, combine_crc32c, combine_crc64_nvme, compute_composite_checksum_b64,
     decode_u32_be_b64, encode_u32_be_b64, encode_u64_be_b64, ActiveHasher,
 };
 use crate::format::*;
+pub use crate::telemetry::{EngineMetricsSnapshot, EngineTelemetry, HistogramSnapshot};
 
 const KEY_LOCK_STRIPES: usize = 256;
 
@@ -38,6 +44,8 @@ pub struct EngineConfig {
     pub region: String,
     pub segment_size: u64,
     pub wal_file_size: u64,
+    pub checkpoint_wal_bytes: u64,
+    pub checkpoint_interval_ms: u64,
     pub max_block_payload: usize,
     pub reserved_disk_bytes: u64,
     pub max_buckets_per_account: usize,
@@ -55,6 +63,8 @@ impl Default for EngineConfig {
             region: "us-east-1".to_string(),
             segment_size: 1024 * 1024 * 1024, // 1 GiB
             wal_file_size: 256 * 1024 * 1024, // 256 MiB
+            checkpoint_wal_bytes: 256 * 1024 * 1024, // 256 MiB (8.7)
+            checkpoint_interval_ms: 10 * 60 * 1000, // 10 min (8.7)
             max_block_payload: DEFAULT_MAX_BLOCK_PAYLOAD,
             reserved_disk_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB (NFR-16)
             max_buckets_per_account: 10_000,
@@ -82,12 +92,27 @@ struct WalWriterState<D: Disk> {
     write_pos: u64,
     next_lsn: u64,
     synced_lsn: u64,
+    bytes_since_checkpoint: u64,
 }
 
-#[derive(Default)]
-struct GroupCommitQueue {
+struct PendingCommitItem<D: Disk> {
+    segs: BTreeMap<u32, Arc<SegmentSlot<D>>>,
+    op: WalOp,
+    tx: tokio::sync::oneshot::Sender<StoreResult<u64>>,
+}
+
+struct GroupCommitQueue<D: Disk> {
     leader_active: bool,
-    pending: Vec<(WalOp, tokio::sync::oneshot::Sender<StoreResult<u64>>)>,
+    pending: Vec<PendingCommitItem<D>>,
+}
+
+impl<D: Disk> Default for GroupCommitQueue<D> {
+    fn default() -> Self {
+        Self {
+            leader_active: false,
+            pending: Vec::new(),
+        }
+    }
 }
 
 struct SegmentManager<D: Disk> {
@@ -106,8 +131,19 @@ pub struct Engine<D: Disk> {
     catalog: RwLock<MemoryCatalog>,
     seg_mgr: Mutex<SegmentManager<D>>,
     wal: Mutex<WalWriterState<D>>,
-    group_commit_queue: Mutex<GroupCommitQueue>,
+    group_commit_queue: Mutex<GroupCommitQueue<D>>,
+    batch_full_notify: tokio::sync::Notify,
+    ckpt_gate: tokio::sync::RwLock<()>,
     key_locks: Vec<tokio::sync::Mutex<()>>,
+    telemetry: EngineTelemetry,
+}
+
+fn parse_ckpt_filename(name: &str) -> Option<u64> {
+    let hex_part = name.strip_prefix("ckpt-")?;
+    if hex_part.len() != 16 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex_part, 16).ok()
 }
 
 impl<D: Disk> Engine<D> {
@@ -156,22 +192,47 @@ impl<D: Disk> Engine<D> {
             fmt
         };
 
-        // 4. Replay WAL files in ascending order
+        // 4. Load highest-LSN complete checkpoint in `ckpt/` if present (`ST-8`)
+        let mut ckpt_files: Vec<(u64, String)> = Vec::new();
+        for name in disk.read_dir("ckpt")? {
+            if let Some(lsn) = parse_ckpt_filename(&name) {
+                ckpt_files.push((lsn, format!("ckpt/{name}")));
+            }
+        }
+        ckpt_files.sort_by_key(|(lsn, _)| *lsn);
+
+        let (mut catalog, base_lsn, ckpt_next_seg_id, ckpt_live_segments) =
+            if let Some(&(latest_lsn, ref rel_path)) = ckpt_files.last() {
+                let cf = disk.open(rel_path, OpenOpts::read_only())?;
+                let loaded =
+                    read_checkpoint_from_file(&cf, Some(latest_lsn), Some(format.uuid_lo()))
+                        .map_err(EngineOpenError::Corrupt)?;
+                (
+                    loaded.catalog,
+                    loaded.ckpt_lsn,
+                    loaded.next_seg_id,
+                    loaded.live_segments,
+                )
+            } else {
+                (MemoryCatalog::default(), 0u64, 1u32, BTreeSet::new())
+            };
+
+        // 5. Replay WAL files in ascending order for LSN > base_lsn (`ST-6`, `ST-8`)
         let mut wal_files: Vec<(u32, String)> = Vec::new();
         for name in disk.read_dir("wal")? {
-            if let Some(stem) = name.strip_suffix(".log") {
-                if let Ok(seq) = stem.parse::<u32>() {
+            if let Some(stem) = name.strip_suffix(".log")
+                && let Ok(seq) = stem.parse::<u32>() {
                     wal_files.push((seq, format!("wal/{name}")));
                 }
-            }
         }
         wal_files.sort_by_key(|(seq, _)| *seq);
 
-        let mut catalog = MemoryCatalog::default();
-        let mut expected_lsn = 1u64;
+        let mut expected_lsn = base_lsn + 1;
+        let mut cur_lsn: Option<u64> = None;
         let mut deleted_segments: BTreeSet<u32> = BTreeSet::new();
         let mut created_segments: BTreeSet<u32> = BTreeSet::new();
         let mut last_wal_state: Option<(u32, u64)> = None;
+        let mut post_ckpt_wal_bytes = 0u64;
 
         let total_wals = wal_files.len();
         for (idx, (wal_seq, rel_path)) in wal_files.into_iter().enumerate() {
@@ -179,7 +240,8 @@ impl<D: Disk> Engine<D> {
             let f = disk.open(&rel_path, OpenOpts::open_rw())?;
             let file_len = f.len()?;
             if file_len < WAL_HEADER_LEN {
-                if is_last_wal {
+                let prev_reached_ckpt = cur_lsn.unwrap_or(1) >= expected_lsn;
+                if is_last_wal && prev_reached_ckpt {
                     // Unfinished rollover at tail: discard empty/torn new WAL file
                     drop(f);
                     disk.remove_file(&rel_path)?;
@@ -187,7 +249,7 @@ impl<D: Disk> Engine<D> {
                     break;
                 } else {
                     return Err(EngineOpenError::Corrupt(format!(
-                        "{rel_path} truncated header in non-final WAL"
+                        "{rel_path} truncated header in WAL"
                     )));
                 }
             }
@@ -198,7 +260,8 @@ impl<D: Disk> Engine<D> {
             let first_lsn = match decode_wal_header(&hdr, wal_seq, format.uuid_lo()) {
                 Ok(lsn) => lsn,
                 Err(msg) => {
-                    if is_last_wal && idx > 0 {
+                    let prev_reached_ckpt = cur_lsn.unwrap_or(1) >= expected_lsn;
+                    if is_last_wal && idx > 0 && prev_reached_ckpt {
                         drop(f);
                         disk.remove_file(&rel_path)?;
                         disk.sync_dir("wal")?;
@@ -208,24 +271,38 @@ impl<D: Disk> Engine<D> {
                 }
             };
 
-            if first_lsn != expected_lsn {
-                return Err(EngineOpenError::Corrupt(format!(
-                    "{rel_path}: expected first_lsn {expected_lsn}, got {first_lsn}"
-                )));
-            }
+            let mut scan_lsn = match cur_lsn {
+                None => {
+                    if first_lsn > expected_lsn {
+                        return Err(EngineOpenError::Corrupt(format!(
+                            "{rel_path}: missing WAL gap after ckpt_lsn {base_lsn}, earliest first_lsn is {first_lsn}"
+                        )));
+                    }
+                    first_lsn
+                }
+                Some(c) => {
+                    if first_lsn != c {
+                        return Err(EngineOpenError::Corrupt(format!(
+                            "{rel_path}: expected first_lsn {c}, got {first_lsn}"
+                        )));
+                    }
+                    c
+                }
+            };
 
             let mut pos = WAL_HEADER_LEN as usize;
             while pos < raw.len() {
                 match decode_wal_record(&raw[pos..]) {
                     Ok(rec) => {
-                        if rec.lsn != expected_lsn {
+                        if rec.lsn != scan_lsn {
                             if is_last_wal
-                                && !has_later_committed_record(&raw[pos..], expected_lsn)
+                                && scan_lsn > base_lsn
+                                && !has_later_committed_record(&raw[pos..], scan_lsn)
                             {
                                 warn!(
                                     rel_path,
                                     pos,
-                                    expected_lsn,
+                                    scan_lsn,
                                     got_lsn = rec.lsn,
                                     "truncating out-of-order un-synced WAL tail (ST-6)"
                                 );
@@ -234,26 +311,34 @@ impl<D: Disk> Engine<D> {
                                 break;
                             }
                             return Err(EngineOpenError::Corrupt(format!(
-                                "{rel_path}@{pos}: LSN gap expected {expected_lsn}, got {}",
+                                "{rel_path}@{pos}: LSN gap expected {scan_lsn}, got {}",
                                 rec.lsn
                             )));
                         }
-                        apply_wal_op(
-                            &mut catalog,
-                            &mut created_segments,
-                            &mut deleted_segments,
-                            rec.op,
-                        );
-                        expected_lsn += 1;
+                        if scan_lsn > base_lsn {
+                            apply_wal_op(
+                                &mut catalog,
+                                &mut created_segments,
+                                &mut deleted_segments,
+                                rec.op,
+                            );
+                            post_ckpt_wal_bytes += rec.total_frame_bytes as u64;
+                        }
+                        scan_lsn += 1;
                         pos += rec.total_frame_bytes;
                     }
                     Err(_err) => {
                         // [ST-6] Distinguish torn tail vs mid-WAL corruption!
-                        if is_last_wal && !has_later_committed_record(&raw[pos..], expected_lsn) {
+                        // Records <= base_lsn were guaranteed fdatasync'd before checkpoint, so
+                        // corruption at scan_lsn <= base_lsn is NEVER a torn tail!
+                        if is_last_wal
+                            && scan_lsn > base_lsn
+                            && !has_later_committed_record(&raw[pos..], scan_lsn)
+                        {
                             warn!(
                                 rel_path,
                                 pos,
-                                expected_lsn,
+                                scan_lsn,
                                 "truncating torn WAL tail at un-synced boundary (ST-6)"
                             );
                             f.set_len(pos as u64)?;
@@ -261,13 +346,28 @@ impl<D: Disk> Engine<D> {
                             break;
                         } else {
                             return Err(EngineOpenError::Corrupt(format!(
-                                "{rel_path}@{pos}: mid-WAL corruption detected at LSN {expected_lsn}"
+                                "{rel_path}@{pos}: mid-WAL corruption detected at LSN {scan_lsn}"
                             )));
                         }
                     }
                 }
             }
+            cur_lsn = Some(scan_lsn);
             last_wal_state = Some((wal_seq, pos as u64));
+        }
+
+        if let Some(c) = cur_lsn {
+            if c < expected_lsn {
+                return Err(EngineOpenError::Corrupt(format!(
+                    "WAL ended at LSN {} before checkpoint LSN {base_lsn}",
+                    c.saturating_sub(1)
+                )));
+            }
+            expected_lsn = c;
+        } else if base_lsn > 0 {
+            return Err(EngineOpenError::Corrupt(format!(
+                "no WAL files found for checkpoint LSN {base_lsn}"
+            )));
         }
 
         // Open or create active WAL file
@@ -280,13 +380,14 @@ impl<D: Disk> Engine<D> {
                     write_pos,
                     next_lsn: expected_lsn,
                     synced_lsn: expected_lsn.saturating_sub(1),
+                    bytes_since_checkpoint: post_ckpt_wal_bytes,
                 }
             }
             None => {
                 let wal_seq = 1u32;
                 let path = format!("wal/{wal_seq:08}.log");
                 let f = disk.open(&path, OpenOpts::create_truncate_rw())?;
-                let hdr = encode_wal_header(wal_seq, 1, format.uuid_lo());
+                let hdr = encode_wal_header(wal_seq, expected_lsn, format.uuid_lo());
                 f.write_all_at(0, &hdr)?;
                 f.sync_data()?;
                 disk.sync_dir("wal")?;
@@ -294,13 +395,22 @@ impl<D: Disk> Engine<D> {
                     wal_seq,
                     file: f,
                     write_pos: WAL_HEADER_LEN,
-                    next_lsn: 1,
-                    synced_lsn: 0,
+                    next_lsn: expected_lsn,
+                    synced_lsn: expected_lsn.saturating_sub(1),
+                    bytes_since_checkpoint: 0,
                 }
             }
         };
 
-        // 5. Reconcile segment files & verify referenced extents (both objects AND active uploads!)
+        // Prune expired 24h completed_uploads on startup (02-storage-engine §6.1 step 7)
+        let startup_now_ms = now_epoch_ms();
+        let retention_ms = cfg.completed_upload_retention_ms;
+        for b in catalog.buckets.values_mut() {
+            b.completed_uploads
+                .retain(|_, (cms, _)| startup_now_ms.saturating_sub(*cms) <= retention_ms);
+        }
+
+        // 6. Reconcile segment files & verify referenced extents (both objects AND active uploads!)
         let mut live_bytes_map: BTreeMap<u32, u64> = BTreeMap::new();
         let mut max_ref_end: BTreeMap<u32, u64> = BTreeMap::new();
         for b in catalog.buckets.values() {
@@ -331,13 +441,16 @@ impl<D: Disk> Engine<D> {
         }
 
         let mut segments: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
-        let mut max_seg_id = 0u32;
+        let mut max_seg_id = ckpt_next_seg_id.saturating_sub(1);
 
         for name in disk.read_dir("seg")? {
-            if let Some(stem) = name.strip_suffix(".seg") {
-                if let Ok(seg_id) = stem.parse::<u32>() {
-                    if deleted_segments.contains(&seg_id) {
-                        // [ST-7] Finish interrupted segment deletion recorded in WAL
+            if let Some(stem) = name.strip_suffix(".seg")
+                && let Ok(seg_id) = stem.parse::<u32>() {
+                    let deleted_before_ckpt = base_lsn > 0
+                        && seg_id < ckpt_next_seg_id
+                        && !ckpt_live_segments.contains(&seg_id);
+                    if deleted_segments.contains(&seg_id) || deleted_before_ckpt {
+                        // [ST-7] Finish interrupted segment deletion recorded in WAL or prior to checkpoint
                         let _ = disk.remove_file(&format!("seg/{name}"));
                         let _ = disk.sync_dir("seg");
                         continue;
@@ -385,12 +498,12 @@ impl<D: Disk> Engine<D> {
                             live_bytes: AtomicU64::new(
                                 live_bytes_map.get(&seg_id).copied().unwrap_or(0),
                             ),
-                            active_readers: AtomicUsize::new(0),
+                            inflight_writers: AtomicUsize::new(0),
+                            pin_state: AtomicUsize::new(0),
                             state: AtomicU8::new(SEG_STATE_SEALED),
                         }),
                     );
                 }
-            }
         }
 
         // Verify no committed extent references a missing segment!
@@ -407,7 +520,7 @@ impl<D: Disk> Engine<D> {
             slot.state.store(SEG_STATE_ACTIVE, Ordering::Release);
             last_id
         } else {
-            let seg_id = 1u32;
+            let seg_id = max_seg_id + 1;
             let slot = create_segment_slot(&disk, seg_id, format.uuid_lo())?;
             max_seg_id = seg_id;
             segments.insert(seg_id, slot);
@@ -419,6 +532,10 @@ impl<D: Disk> Engine<D> {
             .collect();
 
         let initial_next_seq = catalog.next_seq + 1;
+        let telemetry = EngineTelemetry::default();
+        telemetry
+            .last_checkpoint_lsn
+            .store(base_lsn, Ordering::Relaxed);
 
         Ok(Arc::new(Self {
             disk,
@@ -435,7 +552,10 @@ impl<D: Disk> Engine<D> {
             }),
             wal: Mutex::new(wal_state),
             group_commit_queue: Mutex::new(GroupCommitQueue::default()),
+            batch_full_notify: tokio::sync::Notify::new(),
+            ckpt_gate: tokio::sync::RwLock::new(()),
             key_locks,
+            telemetry,
         }))
     }
 
@@ -495,56 +615,72 @@ impl<D: Disk> Engine<D> {
     }
 
     /// Write a single framed data block (`<= max_block_payload`) into the active segment.
-    fn write_data_block(&self, payload: &[u8]) -> StoreResult<(Extent, Arc<SegmentSlot<D>>)> {
+    fn write_data_block(&self, payload: &[u8]) -> StoreResult<(Extent, InflightWriteGuard<D>)> {
+        let mut frame = Vec::with_capacity(BLOCK_HEADER_LEN as usize + payload.len());
+        self.write_data_block_reuse(payload, &mut frame)
+    }
+
+    fn write_data_block_reuse(
+        &self,
+        payload: &[u8],
+        frame: &mut Vec<u8>,
+    ) -> StoreResult<(Extent, InflightWriteGuard<D>)> {
         let payload_len = payload.len() as u32;
         let payload_crc = crc32c::crc32c(payload);
         let hdr = encode_block_header(payload_len, payload_crc);
         let frame_len = BLOCK_HEADER_LEN + payload_len as u64;
 
-        let (slot, offset) = {
+        let (guard, offset) = {
             let mut mgr = self.seg_mgr.lock().unwrap();
             let cur_id = mgr.active_seg_id;
             let cur_slot = Arc::clone(mgr.segments.get(&cur_id).unwrap());
             let cur_pos = cur_slot.write_pos.load(Ordering::SeqCst);
 
-            if cur_pos > SEG_HEADER_LEN && cur_pos + frame_len > self.cfg.segment_size {
-                cur_slot.state.store(SEG_STATE_SEALED, Ordering::Release);
-                let new_id = mgr.next_seg_id;
-                mgr.next_seg_id += 1;
-                let new_slot = create_segment_slot(&self.disk, new_id, self.format.uuid_lo())
-                    .map_err(|e| self.poison_read_only("create_segment", e))?;
-                let off = new_slot.write_pos.fetch_add(frame_len, Ordering::SeqCst);
-                mgr.active_seg_id = new_id;
-                mgr.segments.insert(new_id, Arc::clone(&new_slot));
-                (new_slot, off)
-            } else {
-                let off = cur_slot.write_pos.fetch_add(frame_len, Ordering::SeqCst);
-                (cur_slot, off)
-            }
+            let (chosen_slot, off) =
+                if cur_pos > SEG_HEADER_LEN && cur_pos + frame_len > self.cfg.segment_size {
+                    cur_slot.state.store(SEG_STATE_SEALED, Ordering::Release);
+                    let new_id = mgr.next_seg_id;
+                    mgr.next_seg_id += 1;
+                    let new_slot = create_segment_slot(&self.disk, new_id, self.format.uuid_lo())
+                        .map_err(|e| self.poison_read_only("create_segment", e))?;
+                    let off = new_slot.write_pos.fetch_add(frame_len, Ordering::SeqCst);
+                    mgr.active_seg_id = new_id;
+                    mgr.segments.insert(new_id, Arc::clone(&new_slot));
+                    (new_slot, off)
+                } else {
+                    let off = cur_slot.write_pos.fetch_add(frame_len, Ordering::SeqCst);
+                    (cur_slot, off)
+                };
+            (InflightWriteGuard::acquire(&chosen_slot), off)
         };
 
-        let mut frame = Vec::with_capacity(frame_len as usize);
+        frame.clear();
+        frame.reserve(frame_len as usize);
         frame.extend_from_slice(&hdr);
         frame.extend_from_slice(payload);
-        slot.file.write_all_at(offset, &frame).map_err(|e| {
-            error!(seg_id = slot.seg_id, offset, ?e, "segment write failed");
+        guard.slot().file.write_all_at(offset, frame).map_err(|e| {
+            error!(seg_id = guard.seg_id(), offset, ?e, "segment write failed");
             S3Error::new(S3ErrorCode::InternalError, "Disk write error")
         })?;
 
         Ok((
             Extent {
-                seg_id: slot.seg_id,
+                seg_id: guard.seg_id(),
                 offset,
                 len: payload_len,
                 crc32c: payload_crc,
             },
-            slot,
+            guard,
         ))
     }
 
-    /// Flush a batch of WAL operations in a single `write_all_at` + `sync_data` (`fdatasync`).
+    /// Flush coalesced data segments + a batch of WAL operations in a single group commit (§8.3).
     /// On `EIO`, immediately poisons read-only WITHOUT updating `synced_lsn` or catalog (§10).
-    fn flush_wal_batch(&self, ops: &[WalOp]) -> Vec<StoreResult<u64>> {
+    fn flush_wal_batch(
+        &self,
+        segs: &BTreeMap<u32, Arc<SegmentSlot<D>>>,
+        ops: &[WalOp],
+    ) -> Vec<StoreResult<u64>> {
         if ops.is_empty() {
             return Vec::new();
         }
@@ -555,6 +691,19 @@ impl<D: Disk> Engine<D> {
             );
             return vec![Err(err); ops.len()];
         }
+
+        // Step 3 (coalesced across group-commit batch): sync each touched segment once (`ST-1`, §8.3)
+        for slot in segs.values() {
+            let t0 = Instant::now();
+            if let Err(e) = slot.file.sync_data() {
+                let err = self.poison_read_only("group_commit_seg_fdatasync", e);
+                return vec![Err(err); ops.len()];
+            }
+            self.telemetry
+                .seg_fsync_us
+                .observe(t0.elapsed().as_micros() as u64);
+        }
+
         let mut wal = self.wal.lock().unwrap();
         if self.is_read_only_poisoned() {
             let err = S3Error::new(
@@ -563,6 +712,10 @@ impl<D: Disk> Engine<D> {
             );
             return vec![Err(err); ops.len()];
         }
+
+        self.telemetry
+            .group_commit_batch_size
+            .observe(ops.len() as u64);
 
         let first_lsn = wal.next_lsn;
         let prev_synced = wal.synced_lsn;
@@ -610,13 +763,18 @@ impl<D: Disk> Engine<D> {
             let err = self.poison_read_only("wal_write", e);
             return vec![Err(err); ops.len()];
         }
+        let t_wal = Instant::now();
         if let Err(e) = wal.file.sync_data() {
             let err = self.poison_read_only("wal_fdatasync", e);
             return vec![Err(err); ops.len()];
         }
+        self.telemetry
+            .wal_fsync_us
+            .observe(t_wal.elapsed().as_micros() as u64);
 
         let last_lsn = *lsns.last().unwrap();
         wal.write_pos += encoded.len() as u64;
+        wal.bytes_since_checkpoint += encoded.len() as u64;
         wal.next_lsn = last_lsn + 1;
         wal.synced_lsn = last_lsn;
         lsns.into_iter().map(Ok).collect()
@@ -625,7 +783,7 @@ impl<D: Disk> Engine<D> {
     fn drain_pending_group_commits_sync(&self) {
         let max_batch = self.cfg.group_commit_max_batch.max(1);
         loop {
-            let chunk: Vec<(WalOp, tokio::sync::oneshot::Sender<StoreResult<u64>>)> = {
+            let chunk: Vec<PendingCommitItem<D>> = {
                 let mut q = self.group_commit_queue.lock().unwrap();
                 if q.pending.is_empty() {
                     q.leader_active = false;
@@ -634,16 +792,37 @@ impl<D: Disk> Engine<D> {
                 let take = q.pending.len().min(max_batch);
                 q.pending.drain(..take).collect()
             };
-            let ops: Vec<WalOp> = chunk.iter().map(|(op, _)| op.clone()).collect();
-            let results = self.flush_wal_batch(&ops);
-            for ((_, tx), res) in chunk.into_iter().zip(results) {
-                let _ = tx.send(res);
+            let mut merged_segs = BTreeMap::new();
+            let mut ops = Vec::with_capacity(chunk.len());
+            for item in &chunk {
+                for (&sid, slot) in &item.segs {
+                    merged_segs.entry(sid).or_insert_with(|| Arc::clone(slot));
+                }
+                ops.push(item.op.clone());
+            }
+            let results = self.flush_wal_batch(&merged_segs, &ops);
+            for (item, res) in chunk.into_iter().zip(results) {
+                let _ = item.tx.send(res);
             }
         }
     }
 
-    /// Group-Commit WAL append + `fdatasync` (§8.3). Concurrent callers batch into a single `fdatasync`.
-    async fn commit_wal(&self, op: WalOp) -> StoreResult<u64> {
+    async fn commit_wal(&self, op: WalOp) -> StoreResult<tokio::sync::RwLockReadGuard<'_, ()>> {
+        self.commit_wal_with_segments(&BTreeMap::new(), op).await
+    }
+
+    /// Group-Commit segment `fdatasync` + WAL append & `fdatasync` (§8.3).
+    /// Returns a `ckpt_gate` read guard that MUST be held until the caller finishes updating `catalog`.
+    async fn commit_wal_with_segments(
+        &self,
+        seg_guards: &BTreeMap<u32, InflightWriteGuard<D>>,
+        op: WalOp,
+    ) -> StoreResult<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let mut segs: BTreeMap<u32, Arc<SegmentSlot<D>>> = seg_guards
+            .iter()
+            .map(|(&sid, g)| (sid, Arc::clone(g.slot())))
+            .collect();
+        let ckpt_guard = self.ckpt_gate.read().await;
         if self.is_read_only_poisoned() {
             return Err(S3Error::new(
                 S3ErrorCode::InternalError,
@@ -651,11 +830,19 @@ impl<D: Disk> Engine<D> {
             ));
         }
 
+        let max_batch = self.cfg.group_commit_max_batch.max(1);
         let follower_rx = {
             let mut q = self.group_commit_queue.lock().unwrap();
             if q.leader_active {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                q.pending.push((op.clone(), tx));
+                q.pending.push(PendingCommitItem {
+                    segs: std::mem::take(&mut segs),
+                    op: op.clone(),
+                    tx,
+                });
+                if 1 + q.pending.len() >= max_batch {
+                    self.batch_full_notify.notify_one();
+                }
                 Some(rx)
             } else {
                 q.leader_active = true;
@@ -664,12 +851,13 @@ impl<D: Disk> Engine<D> {
         };
 
         if let Some(rx) = follower_rx {
-            return rx.await.unwrap_or_else(|_| {
+            let _lsn = rx.await.unwrap_or_else(|_| {
                 Err(S3Error::new(
                     S3ErrorCode::InternalError,
                     "Group commit channel closed",
                 ))
-            });
+            })?;
+            return Ok(ckpt_guard);
         }
 
         struct LeaderDropGuard<'a, D: Disk> {
@@ -689,14 +877,23 @@ impl<D: Disk> Engine<D> {
             disarmed: false,
         };
 
-        if self.cfg.group_commit_window_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(self.cfg.group_commit_window_ms)).await;
+        if self.cfg.group_commit_window_ms > 0 && max_batch > 1 {
+            let already_full = {
+                let q = self.group_commit_queue.lock().unwrap();
+                1 + q.pending.len() >= max_batch
+            };
+            if !already_full {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(self.cfg.group_commit_window_ms)) => {}
+                    _ = self.batch_full_notify.notified() => {}
+                }
+            }
         } else {
             tokio::task::yield_now().await;
         }
 
-        let max_followers = self.cfg.group_commit_max_batch.max(1).saturating_sub(1);
-        let followers: Vec<(WalOp, tokio::sync::oneshot::Sender<StoreResult<u64>>)> = {
+        let max_followers = max_batch.saturating_sub(1);
+        let followers: Vec<PendingCommitItem<D>> = {
             let mut q = self.group_commit_queue.lock().unwrap();
             let take = q.pending.len().min(max_followers);
             q.pending.drain(..take).collect()
@@ -704,30 +901,253 @@ impl<D: Disk> Engine<D> {
 
         let mut batch_ops = Vec::with_capacity(1 + followers.len());
         batch_ops.push(op);
-        for (fop, _) in &followers {
-            batch_ops.push(fop.clone());
+        for f in &followers {
+            for (&sid, slot) in &f.segs {
+                segs.entry(sid).or_insert_with(|| Arc::clone(slot));
+            }
+            batch_ops.push(f.op.clone());
         }
 
-        let mut results = self.flush_wal_batch(&batch_ops);
+        let mut results = self.flush_wal_batch(&segs, &batch_ops);
         let my_res = results.remove(0);
-        for ((_, tx), res) in followers.into_iter().zip(results) {
-            let _ = tx.send(res);
+        for (f, res) in followers.into_iter().zip(results) {
+            let _ = f.tx.send(res);
         }
 
         self.drain_pending_group_commits_sync();
         guard.disarmed = true;
-        my_res
+        my_res?;
+        Ok(ckpt_guard)
+    }
+
+    /// Check whether WAL bytes accumulated since the last checkpoint exceed `checkpoint_wal_bytes` (§8.7).
+    pub fn should_checkpoint(&self) -> bool {
+        if self.is_read_only_poisoned() {
+            return false;
+        }
+        let wal = self.wal.lock().unwrap();
+        wal.synced_lsn > self.telemetry.last_checkpoint_lsn.load(Ordering::Relaxed)
+            && wal.bytes_since_checkpoint >= self.cfg.checkpoint_wal_bytes
+    }
+
+    /// Write an atomic full metadata checkpoint (`ckpt/ckpt-%016x`, `ST-8`) and prune obsolete checkpoints/WALs.
+    pub async fn write_checkpoint(&self) -> StoreResult<u64> {
+        self.check_writable(false)?;
+        let _exclusive = self.ckpt_gate.write().await;
+        self.check_writable(false)?;
+
+        let (ckpt_lsn, active_wal_seq) = {
+            let wal = self.wal.lock().unwrap();
+            (wal.synced_lsn, wal.wal_seq)
+        };
+        if ckpt_lsn == 0 {
+            return Ok(0);
+        }
+        let prev_ckpt = self.telemetry.last_checkpoint_lsn.load(Ordering::Relaxed);
+        if ckpt_lsn <= prev_ckpt {
+            return Ok(ckpt_lsn);
+        }
+
+        let tmp_path = format!("tmp/ckpt-{ckpt_lsn:016x}.tmp");
+        let final_path = format!("ckpt/ckpt-{ckpt_lsn:016x}");
+
+        let tmp_file = self
+            .disk
+            .open(&tmp_path, OpenOpts::create_truncate_rw())
+            .map_err(|e| self.poison_read_only("ckpt_open_tmp", e))?;
+
+        {
+            let cat = self.catalog.read().unwrap();
+            let (next_seg_id, live_segments) = {
+                let mgr = self.seg_mgr.lock().unwrap();
+                let live: BTreeSet<u32> = mgr.segments.keys().copied().collect();
+                (mgr.next_seg_id, live)
+            };
+            let next_seq = self.next_seq.load(Ordering::SeqCst);
+            write_checkpoint_to_file(
+                &tmp_file,
+                self.format.uuid_lo(),
+                ckpt_lsn,
+                next_seq,
+                next_seg_id,
+                &live_segments,
+                &cat,
+            )
+            .map_err(|e| self.poison_read_only("ckpt_write_tmp", e))?;
+        }
+
+        let t0 = Instant::now();
+        tmp_file
+            .sync_data()
+            .map_err(|e| self.poison_read_only("ckpt_fdatasync", e))?;
+        drop(tmp_file);
+        self.disk
+            .rename(&tmp_path, &final_path)
+            .map_err(|e| self.poison_read_only("ckpt_rename", e))?;
+        self.disk
+            .sync_dir("ckpt")
+            .map_err(|e| self.poison_read_only("ckpt_sync_dir", e))?;
+        self.telemetry
+            .ckpt_fsync_us
+            .observe(t0.elapsed().as_micros() as u64);
+
+        {
+            let mut wal = self.wal.lock().unwrap();
+            wal.bytes_since_checkpoint = 0;
+        }
+        self.telemetry
+            .checkpoints_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .last_checkpoint_lsn
+            .store(ckpt_lsn, Ordering::Relaxed);
+
+        // Prune older checkpoints in `ckpt/` (`< ckpt_lsn`) now that `final_path` is durable
+        if let Ok(entries) = self.disk.read_dir("ckpt") {
+            let mut removed_any = false;
+            for name in entries {
+                if let Some(lsn) = parse_ckpt_filename(&name)
+                    && lsn < ckpt_lsn {
+                        let _ = self.disk.remove_file(&format!("ckpt/{name}"));
+                        removed_any = true;
+                    }
+            }
+            if removed_any {
+                let _ = self.disk.sync_dir("ckpt");
+            }
+        }
+
+        // Prune sealed WAL files strictly covered by `ckpt_lsn` (`next_file.first_lsn <= ckpt_lsn + 1`)
+        if let Ok(entries) = self.disk.read_dir("wal") {
+            let mut wal_headers: Vec<(u32, String, u64)> = Vec::new();
+            for name in entries {
+                if let Some(stem) = name.strip_suffix(".log")
+                    && let Ok(seq) = stem.parse::<u32>() {
+                        let rel = format!("wal/{name}");
+                        if let Ok(wf) = self.disk.open(&rel, OpenOpts::read_only()) {
+                            let mut hdr = [0u8; 32];
+                            if wf.read_exact_at(0, &mut hdr).is_ok()
+                                && let Ok(first_lsn) =
+                                    decode_wal_header(&hdr, seq, self.format.uuid_lo())
+                                {
+                                    wal_headers.push((seq, rel, first_lsn));
+                                }
+                        }
+                    }
+            }
+            wal_headers.sort_by_key(|(seq, _, _)| *seq);
+            let mut removed_wal = false;
+            for i in 0..wal_headers.len().saturating_sub(1) {
+                let (seq_i, ref rel_i, _) = wal_headers[i];
+                let (_, _, next_first_lsn) = wal_headers[i + 1];
+                if seq_i < active_wal_seq && next_first_lsn <= ckpt_lsn + 1 {
+                    let _ = self.disk.remove_file(rel_i);
+                    removed_wal = true;
+                }
+            }
+            if removed_wal {
+                let _ = self.disk.sync_dir("wal");
+            }
+        }
+
+        info!(ckpt_lsn, "checkpoint written and old WALs pruned");
+        Ok(ckpt_lsn)
+    }
+
+    /// Collect engine-level Prometheus metrics snapshot (`NFR-11`).
+    pub fn metrics_snapshot(&self) -> EngineMetricsSnapshot {
+        let mut wal_bytes = 0u64;
+        if let Ok(entries) = self.disk.read_dir("wal") {
+            for name in entries {
+                if name.ends_with(".log")
+                    && let Ok(wf) = self.disk.open(&format!("wal/{name}"), OpenOpts::read_only()) {
+                        wal_bytes += wf.len().unwrap_or(0);
+                    }
+            }
+        }
+
+        let (seg_live, seg_total) = {
+            let mgr = self.seg_mgr.lock().unwrap();
+            let mut live = 0u64;
+            let mut total = 0u64;
+            for slot in mgr.segments.values() {
+                live += slot.live_bytes.load(Ordering::Relaxed);
+                total += slot
+                    .write_pos
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(SEG_HEADER_LEN);
+            }
+            (live, total)
+        };
+        let seg_ratio = if seg_total == 0 {
+            1.0
+        } else {
+            (seg_live as f64) / (seg_total as f64)
+        };
+
+        let (buckets, versions, uploads) = {
+            let cat = self.catalog.read().unwrap();
+            let b_cnt = cat.buckets.len() as u64;
+            let mut v_cnt = 0u64;
+            let mut u_cnt = 0u64;
+            for b in cat.buckets.values() {
+                for chain in b.objects.values() {
+                    v_cnt += chain.len() as u64;
+                }
+                u_cnt += b.uploads.len() as u64;
+            }
+            (b_cnt, v_cnt, u_cnt)
+        };
+
+        EngineMetricsSnapshot {
+            wal_fsync_us: self.telemetry.wal_fsync_us.snapshot(),
+            seg_fsync_us: self.telemetry.seg_fsync_us.snapshot(),
+            ckpt_fsync_us: self.telemetry.ckpt_fsync_us.snapshot(),
+            group_commit_batch_size: self.telemetry.group_commit_batch_size.snapshot(),
+            wal_bytes,
+            segment_live_bytes: seg_live,
+            segment_total_bytes: seg_total,
+            segment_live_ratio: seg_ratio,
+            gc_runs_total: self.telemetry.gc_runs_total.load(Ordering::Relaxed),
+            gc_compacted_segments_total: self
+                .telemetry
+                .gc_compacted_segments_total
+                .load(Ordering::Relaxed),
+            gc_relocated_bytes_total: self
+                .telemetry
+                .gc_relocated_bytes_total
+                .load(Ordering::Relaxed),
+            gc_in_progress: self.telemetry.gc_in_progress.load(Ordering::Relaxed),
+            checkpoints_total: self.telemetry.checkpoints_total.load(Ordering::Relaxed),
+            last_checkpoint_lsn: self.telemetry.last_checkpoint_lsn.load(Ordering::Relaxed),
+            catalog_buckets: buckets,
+            catalog_object_versions: versions,
+            catalog_open_uploads: uploads,
+        }
     }
 
     /// Trigger online segment compaction / GC (`s3d compact`, §8.5).
     pub async fn compact(&self) -> StoreResult<usize> {
         self.check_writable(false)?;
+        struct GcActiveGuard<'a>(&'a AtomicBool);
+        impl Drop for GcActiveGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        self.telemetry.gc_runs_total.fetch_add(1, Ordering::Relaxed);
+        self.telemetry.gc_in_progress.store(true, Ordering::Release);
+        let _gc_active = GcActiveGuard(&self.telemetry.gc_in_progress);
+
         let candidates: Vec<Arc<SegmentSlot<D>>> = {
             let mgr = self.seg_mgr.lock().unwrap();
             mgr.segments
                 .values()
                 .filter(|s| {
                     if s.state.load(Ordering::Acquire) != SEG_STATE_SEALED {
+                        return false;
+                    }
+                    if s.inflight_writers.load(Ordering::Acquire) > 0 {
                         return false;
                     }
                     let total = s.write_pos.load(Ordering::Acquire).saturating_sub(SEG_HEADER_LEN);
@@ -776,7 +1196,7 @@ impl<D: Disk> Engine<D> {
                 }
             }
 
-            let mut touched_new_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
+            let mut touched_new_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
             let mut copied_obj = Vec::with_capacity(to_move_obj.len());
             let mut copied_part = Vec::with_capacity(to_move_part.len());
 
@@ -793,8 +1213,8 @@ impl<D: Disk> Engine<D> {
                         "GC detected block CRC mismatch",
                     ));
                 }
-                let (new_ext, new_slot) = self.write_data_block(payload)?;
-                touched_new_slots.insert(new_slot.seg_id, new_slot);
+                let (new_ext, new_guard) = self.write_data_block(payload)?;
+                touched_new_slots.entry(new_guard.seg_id()).or_insert(new_guard);
                 copied_obj.push((bname, key, seq, eidx, ext, new_ext));
             }
 
@@ -811,15 +1231,20 @@ impl<D: Disk> Engine<D> {
                         "GC detected block CRC mismatch",
                     ));
                 }
-                let (new_ext, new_slot) = self.write_data_block(payload)?;
-                touched_new_slots.insert(new_slot.seg_id, new_slot);
+                let (new_ext, new_guard) = self.write_data_block(payload)?;
+                touched_new_slots.entry(new_guard.seg_id()).or_insert(new_guard);
                 copied_part.push((bname, key, uid, pn, pseq, eidx, ext, new_ext));
             }
 
-            for slot in touched_new_slots.values() {
-                slot.file
+            for g in touched_new_slots.values() {
+                let t0 = Instant::now();
+                g.slot()
+                    .file
                     .sync_data()
                     .map_err(|e| self.poison_read_only("gc_seg_sync", e))?;
+                self.telemetry
+                    .seg_fsync_us
+                    .observe(t0.elapsed().as_micros() as u64);
             }
 
             // Re-verify under key stripe lock / catalog write lock and relocate still-live extents
@@ -846,11 +1271,12 @@ impl<D: Disk> Engine<D> {
                         old_offset: old_ext.offset,
                         new_extent: new_ext,
                     };
-                    self.commit_wal(WalOp::RelocateExtents {
-                        items: vec![rel],
-                        part_items: Vec::new(),
-                    })
-                    .await?;
+                    let _cg = self
+                        .commit_wal(WalOp::RelocateExtents {
+                            items: vec![rel],
+                            part_items: Vec::new(),
+                        })
+                        .await?;
                     {
                         let mut cat = self.catalog.write().unwrap();
                         if let Some(v) = cat
@@ -868,9 +1294,13 @@ impl<D: Disk> Engine<D> {
                         .live_bytes
                         .fetch_sub(old_ext.physical_bytes(), Ordering::AcqRel);
                     if let Some(ns) = touched_new_slots.get(&new_ext.seg_id) {
-                        ns.live_bytes
+                        ns.slot()
+                            .live_bytes
                             .fetch_add(new_ext.physical_bytes(), Ordering::AcqRel);
                     }
+                    self.telemetry
+                        .gc_relocated_bytes_total
+                        .fetch_add(new_ext.len as u64, Ordering::Relaxed);
                 }
             }
 
@@ -900,11 +1330,12 @@ impl<D: Disk> Engine<D> {
                         old_offset: old_ext.offset,
                         new_extent: new_ext,
                     };
-                    self.commit_wal(WalOp::RelocateExtents {
-                        items: Vec::new(),
-                        part_items: vec![rel],
-                    })
-                    .await?;
+                    let _cg = self
+                        .commit_wal(WalOp::RelocateExtents {
+                            items: Vec::new(),
+                            part_items: vec![rel],
+                        })
+                        .await?;
                     {
                         let mut cat = self.catalog.write().unwrap();
                         if let Some(p) = cat
@@ -923,25 +1354,33 @@ impl<D: Disk> Engine<D> {
                         .live_bytes
                         .fetch_sub(old_ext.physical_bytes(), Ordering::AcqRel);
                     if let Some(ns) = touched_new_slots.get(&new_ext.seg_id) {
-                        ns.live_bytes
+                        ns.slot()
+                            .live_bytes
                             .fetch_add(new_ext.physical_bytes(), Ordering::AcqRel);
                     }
+                    self.telemetry
+                        .gc_relocated_bytes_total
+                        .fetch_add(new_ext.len as u64, Ordering::Relaxed);
                 }
             }
 
             if old_slot.live_bytes.load(Ordering::Acquire) == 0 {
                 // [ST-7] Record deletion intent in WAL BEFORE unlinking file!
-                self.commit_wal(WalOp::DeleteSegment { seg_id: old_id })
+                let _cg = self
+                    .commit_wal(WalOp::DeleteSegment { seg_id: old_id })
                     .await?;
-                old_slot
-                    .state
-                    .store(SEG_STATE_PENDING_DELETE, Ordering::Release);
                 {
+                    // Remove from `mgr.segments` BEFORE setting `PIN_PENDING_DELETE_BIT`
+                    // so no future `pin_extents` can acquire a pin on `old_slot`!
                     let mut mgr = self.seg_mgr.lock().unwrap();
                     mgr.segments.remove(&old_id);
                 }
-                old_slot.try_reclaim_if_unpinned();
+                drop(_cg);
+                old_slot.mark_pending_delete_and_maybe_reclaim();
                 compacted += 1;
+                self.telemetry
+                    .gc_compacted_segments_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(compacted)
@@ -967,7 +1406,8 @@ fn create_segment_slot<D: Disk>(
         disk: disk.clone(),
         write_pos: AtomicU64::new(SEG_HEADER_LEN),
         live_bytes: AtomicU64::new(0),
-        active_readers: std::sync::atomic::AtomicUsize::new(0),
+        inflight_writers: std::sync::atomic::AtomicUsize::new(0),
+        pin_state: std::sync::atomic::AtomicUsize::new(0),
         state: std::sync::atomic::AtomicU8::new(SEG_STATE_ACTIVE),
     }))
 }
@@ -1105,10 +1545,10 @@ fn apply_wal_op(
                     total_size,
                     etag,
                     checksum,
-                    sys_meta,
+                    sys_meta: Arc::new(sys_meta),
                     user_meta,
-                    owner,
-                    acl,
+                    owner: Arc::new(owner),
+                    acl: Arc::new(acl),
                     tags,
                     last_modified_ms,
                     extents: extents.into(),
@@ -1131,7 +1571,7 @@ fn apply_wal_op(
                 .and_then(|b| b.objects.get_mut(&key))
                 .and_then(|c| c.iter_mut().find(|v| v.seq == seq))
             {
-                v.acl = acl;
+                v.acl = Arc::new(acl);
             }
         }
         WalOp::UpdateObjectTagging {
@@ -1274,10 +1714,10 @@ fn apply_wal_op(
                     total_size,
                     etag,
                     checksum,
-                    sys_meta,
+                    sys_meta: Arc::new(sys_meta),
                     user_meta,
-                    owner,
-                    acl,
+                    owner: Arc::new(owner),
+                    acl: Arc::new(acl),
                     tags,
                     last_modified_ms: completed_ms,
                     extents: extents.into(),
@@ -1310,15 +1750,12 @@ fn apply_wal_op(
                     .get_mut(&item.bucket)
                     .and_then(|b| b.objects.get_mut(&item.key))
                     .and_then(|c| c.iter_mut().find(|v| v.seq == item.seq))
-                {
-                    if let Some(cur) = v.extents.get(item.extent_idx) {
-                        if cur.seg_id == item.old_seg_id && cur.offset == item.old_offset {
+                    && let Some(cur) = v.extents.get(item.extent_idx)
+                        && cur.seg_id == item.old_seg_id && cur.offset == item.old_offset {
                             let mut exts = v.extents.to_vec();
                             exts[item.extent_idx] = item.new_extent;
                             v.extents = exts.into();
                         }
-                    }
-                }
             }
             for pitem in part_items {
                 if let Some(p) = catalog
@@ -1327,15 +1764,12 @@ fn apply_wal_op(
                     .and_then(|b| b.uploads.get_mut(&(pitem.key, pitem.upload_id)))
                     .and_then(|up| up.parts.get_mut(&pitem.part_number))
                     .filter(|p| p.part_seq == pitem.part_seq)
-                {
-                    if let Some(cur) = p.extents.get(pitem.extent_idx) {
-                        if cur.seg_id == pitem.old_seg_id && cur.offset == pitem.old_offset {
+                    && let Some(cur) = p.extents.get(pitem.extent_idx)
+                        && cur.seg_id == pitem.old_seg_id && cur.offset == pitem.old_offset {
                             let mut exts = p.extents.to_vec();
                             exts[pitem.extent_idx] = pitem.new_extent;
                             p.extents = exts.into();
                         }
-                    }
-                }
             }
         }
         WalOp::DeleteSegment { seg_id } => {
@@ -1367,12 +1801,11 @@ fn lookup_bucket_checked<'a>(
         S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist")
             .with_bucket(bucket_name)
     })?;
-    if let Some(expected) = &ctx.expected_bucket_owner {
-        if expected != &b.owner.user_id {
+    if let Some(expected) = &ctx.expected_bucket_owner
+        && expected != &b.owner.user_id {
             return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                 .with_bucket(bucket_name));
         }
-    }
     Ok(b)
 }
 
@@ -1409,8 +1842,8 @@ fn check_bucket_write_object<'a>(
         request_object_tags: req_tags,
         ..Default::default()
     };
-    if req_tags.is_some_and(|t| !t.is_empty()) {
-        if let Some(pol) = view.policy {
+    if req_tags.is_some_and(|t| !t.is_empty())
+        && let Some(pol) = view.policy {
             let arn = format!("arn:aws:s3:::{bucket_name}/{key}");
             if pol.evaluate(ctx, &[S3Action::PutObjectTagging], &arn, &extra)
                 == PolicyDecision::ExplicitDeny
@@ -1419,7 +1852,6 @@ fn check_bucket_write_object<'a>(
                     .with_key(bucket_name, key));
             }
         }
-    }
     if !authorize_object_action(
         &view,
         ctx,
@@ -1522,12 +1954,26 @@ fn map_body_err(err: BodyStreamError) -> S3Error {
     }
 }
 
+pub fn encode_continuation_token(bucket: &str, key: &str) -> String {
+    encode_token(bucket, key)
+}
+
+pub fn decode_continuation_token(bucket: &str, token: &str) -> StoreResult<String> {
+    decode_token(bucket, token)
+}
+
 fn encode_token(bucket: &str, key: &str) -> String {
     let raw = format!("v1:{bucket}:{key}");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
 }
 
 fn decode_token(bucket: &str, token: &str) -> StoreResult<String> {
+    if token.len() > 4096 {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The continuation token provided is incorrect",
+        ));
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
         .map_err(|_| {
@@ -1556,6 +2002,26 @@ enum MergedItem<'a> {
     CommonPrefix(String),
 }
 
+fn next_prefix_upper_bound(s: &str) -> Option<String> {
+    let mut chars: Vec<char> = s.chars().collect();
+    while let Some(last) = chars.pop() {
+        let code = last as u32;
+        let next_code = if code == 0xD7FF {
+            Some(0xE000)
+        } else if code < 0x10FFFF {
+            Some(code + 1)
+        } else {
+            None
+        };
+        if let Some(nc) = next_code
+            && let Some(nc_char) = char::from_u32(nc) {
+                chars.push(nc_char);
+                return Some(chars.into_iter().collect());
+            }
+    }
+    None
+}
+
 fn collect_visible_items<'a>(
     objects: &'a BTreeMap<String, Vec<ObjectVersionEntry>>,
     prefix: &str,
@@ -1569,48 +2035,75 @@ fn collect_visible_items<'a>(
     let mut items: Vec<MergedItem<'a>> = Vec::new();
     let mut last_cp: Option<String> = None;
     let mut is_truncated = false;
+    let delim = delimiter.filter(|d| !d.is_empty());
 
-    for (key, chain) in objects {
-        if !key.starts_with(prefix) {
-            continue;
-        }
-        let Some(head) = chain.first() else { continue };
-        if head.is_delete_marker {
-            continue;
-        }
-        if let Some(after) = after_key {
-            if key.as_str() <= after {
+    let mut cur_bound: Bound<String> = match after_key {
+        Some(a) if a >= prefix => Bound::Excluded(a.to_string()),
+        _ => Bound::Included(prefix.to_string()),
+    };
+
+    'leap: loop {
+        let mut jump_to: Option<String> = None;
+        for (key, chain) in objects.range::<String, _>((cur_bound.as_ref(), Bound::Unbounded)) {
+            if !key.starts_with(prefix) {
+                return (items, false);
+            }
+            let Some(head) = chain.first() else { continue };
+            if head.is_delete_marker {
                 continue;
             }
-        }
-
-        let rest = &key[prefix.len()..];
-        if let Some(delim) = delimiter.filter(|d| !d.is_empty()) {
-            if let Some(pos) = rest.find(delim) {
-                let cp = format!("{}{}", prefix, &rest[..pos + delim.len()]);
-                if let Some(after) = after_key {
-                    if cp.as_str() <= after {
-                        continue;
-                    }
-                }
-                if last_cp.as_deref() == Some(cp.as_str()) {
+            if let Some(after) = after_key
+                && key.as_str() <= after {
                     continue;
                 }
-                if items.len() == max_keys {
-                    is_truncated = true;
-                    break;
+
+            let rest = &key[prefix.len()..];
+            if let Some(d) = delim
+                && let Some(pos) = rest.find(d) {
+                    let cp = format!("{}{}", prefix, &rest[..pos + d.len()]);
+                    if let Some(after) = after_key
+                        && cp.as_str() <= after {
+                            jump_to = next_prefix_upper_bound(&cp);
+                            if jump_to.is_none() {
+                                return (items, false);
+                            }
+                            break;
+                        }
+                    if last_cp.as_deref() == Some(cp.as_str()) {
+                        jump_to = next_prefix_upper_bound(&cp);
+                        if jump_to.is_none() {
+                            return (items, false);
+                        }
+                        break;
+                    }
+                    if items.len() == max_keys {
+                        is_truncated = true;
+                        break 'leap;
+                    }
+                    let next_ub = next_prefix_upper_bound(&cp);
+                    last_cp = Some(cp.clone());
+                    items.push(MergedItem::CommonPrefix(cp));
+                    if let Some(ub) = next_ub {
+                        jump_to = Some(ub);
+                        break;
+                    } else {
+                        return (items, false);
+                    }
                 }
-                last_cp = Some(cp.clone());
-                items.push(MergedItem::CommonPrefix(cp));
-                continue;
+
+            if items.len() == max_keys {
+                is_truncated = true;
+                break 'leap;
             }
+            items.push(MergedItem::Object(key, head));
         }
 
-        if items.len() == max_keys {
-            is_truncated = true;
-            break;
+        match jump_to {
+            Some(ub) => {
+                cur_bound = Bound::Included(ub);
+            }
+            None => break,
         }
-        items.push(MergedItem::Object(key, head));
     }
 
     (items, is_truncated)
@@ -1625,14 +2118,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn list_buckets(&self, req: ListBucketsReq) -> StoreResult<ListBucketsResp> {
         let caller = require_authenticated(&req.ctx)?.clone();
-        if let Some(max) = req.max_buckets {
-            if !(1..=10_000).contains(&max) {
+        if let Some(max) = req.max_buckets
+            && !(1..=10_000).contains(&max) {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidArgument,
                     "max-buckets must be between 1 and 10000",
                 ));
             }
-        }
         let after = match &req.continuation_token {
             Some(tok) if !tok.is_empty() => Some(decode_token("__buckets__", tok)?),
             _ => None,
@@ -1645,16 +2137,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
             if b.owner.user_id != caller.user_id {
                 continue;
             }
-            if let Some(pfx) = &req.prefix {
-                if !b.name.starts_with(pfx) {
+            if let Some(pfx) = &req.prefix
+                && !b.name.starts_with(pfx) {
                     continue;
                 }
-            }
-            if let Some(after_name) = &after {
-                if &b.name <= after_name {
+            if let Some(after_name) = &after
+                && &b.name <= after_name {
                     continue;
                 }
-            }
             if buckets.len() == max {
                 if let Some(last) = buckets.last() {
                     next_token = Some(encode_token("__buckets__", &last.name));
@@ -1679,15 +2169,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
         validate_bucket_name(&req.bucket)?;
         self.check_writable(true)?;
 
-        if let Some(loc) = &req.location_constraint {
-            if !loc.is_empty() && loc != &self.cfg.region {
+        if let Some(loc) = &req.location_constraint
+            && !loc.is_empty() && loc != &self.cfg.region {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidLocationConstraint,
                     "The specified location-constraint is not valid",
                 )
                 .with_bucket(&req.bucket));
             }
-        }
 
         let _kl = self.key_stripe(&req.bucket, "").lock().await;
         {
@@ -1731,15 +2220,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
             None => None,
         };
         let acl = if ownership == ObjectOwnership::BucketOwnerEnforced {
-            if let Some(spec) = &req.acl {
-                if !matches!(spec, AclSpec::Canned(CannedAcl::Private)) {
+            if let Some(spec) = &req.acl
+                && !matches!(spec, AclSpec::Canned(CannedAcl::Private)) {
                     return Err(S3Error::new(
                         S3ErrorCode::InvalidBucketAclWithObjectOwnership,
                         "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
                     )
                     .with_bucket(&req.bucket));
                 }
-            }
             AccessControlPolicy::new_private(caller.clone())
         } else {
             match &req.acl {
@@ -1756,7 +2244,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             created_ms: req.ctx.request_time_ms,
             explicit_ownership,
         };
-        self.commit_wal(op).await?;
+        let _cg = self.commit_wal(op).await?;
 
         let mut cat = self.catalog.write().unwrap();
         cat.buckets.insert(
@@ -1778,6 +2266,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 completed_uploads: BTreeMap::new(),
             },
         );
+        drop(cat);
+        drop(_cg);
 
         Ok(BucketMetaSnapshot {
             name: req.bucket,
@@ -1832,10 +2322,11 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .with_bucket(&req.bucket));
             }
         }
-        self.commit_wal(WalOp::DeleteBucket {
-            name: req.bucket.clone(),
-        })
-        .await?;
+        let _cg = self
+            .commit_wal(WalOp::DeleteBucket {
+                name: req.bucket.clone(),
+            })
+            .await?;
         let mut reclaimed = Vec::new();
         {
             let mut cat = self.catalog.write().unwrap();
@@ -1850,6 +2341,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         if !reclaimed.is_empty() {
             self.adjust_live_bytes(&[], &reclaimed);
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -1888,15 +2380,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdateBucketVersioning {
-            name: req.bucket.clone(),
-            versioning: req.status,
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.versioning = req.status;
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketVersioning {
+                name: req.bucket.clone(),
+                versioning: req.status,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.versioning = req.status;
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -1945,15 +2441,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
             .map_err(|e| e.with_bucket(&req.bucket))?;
             resolve_target_acl(&b.owner, Some(&b.owner), &req.acl)?
         };
-        self.commit_wal(WalOp::UpdateBucketAcl {
-            name: req.bucket.clone(),
-            acl: new_acl.clone(),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.acl = new_acl;
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketAcl {
+                name: req.bucket.clone(),
+                acl: new_acl.clone(),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.acl = new_acl;
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -1978,7 +2478,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         )?;
         Ok(GetObjectAclResp {
             version_id: ver.version_id.clone().filter(|v| v != "null"),
-            policy: ver.acl.clone(),
+            policy: (*ver.acl).clone(),
         })
     }
 
@@ -2024,23 +2524,27 @@ impl<D: Disk> ObjectStore for Engine<D> {
             (ver.seq, acl, vid)
         };
 
-        self.commit_wal(WalOp::UpdateObjectAcl {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            seq: target_seq,
-            acl: new_acl.clone(),
-        })
-        .await?;
+        let _cg = self
+            .commit_wal(WalOp::UpdateObjectAcl {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                seq: target_seq,
+                acl: new_acl.clone(),
+            })
+            .await?;
 
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(v) = cat
-            .buckets
-            .get_mut(&req.bucket)
-            .and_then(|b| b.objects.get_mut(&req.key))
-            .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
         {
-            v.acl = new_acl;
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(v) = cat
+                .buckets
+                .get_mut(&req.bucket)
+                .and_then(|b| b.objects.get_mut(&req.key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+            {
+                v.acl = Arc::new(new_acl);
+            }
         }
+        drop(_cg);
         Ok(vid_out)
     }
 
@@ -2094,15 +2598,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .with_bucket(&req.bucket));
             }
         }
-        self.commit_wal(WalOp::UpdateBucketOwnershipControls {
-            name: req.bucket.clone(),
-            ownership: Some(req.ownership),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.explicit_ownership = Some(req.ownership);
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketOwnershipControls {
+                name: req.bucket.clone(),
+                ownership: Some(req.ownership),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.explicit_ownership = Some(req.ownership);
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2121,15 +2629,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdateBucketOwnershipControls {
-            name: req.bucket.clone(),
-            ownership: None,
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.explicit_ownership = None;
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketOwnershipControls {
+                name: req.bucket.clone(),
+                ownership: None,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.explicit_ownership = None;
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2169,15 +2681,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdateBucketTagging {
-            name: req.bucket.clone(),
-            tags: req.tags.clone(),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.tags = req.tags;
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketTagging {
+                name: req.bucket.clone(),
+                tags: req.tags.clone(),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.tags = req.tags;
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2196,15 +2712,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdateBucketTagging {
-            name: req.bucket.clone(),
-            tags: BTreeMap::new(),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.tags.clear();
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketTagging {
+                name: req.bucket.clone(),
+                tags: BTreeMap::new(),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.tags.clear();
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2257,22 +2777,26 @@ impl<D: Disk> ObjectStore for Engine<D> {
             )?;
             (ver.seq, ver.version_id.clone().filter(|v| v != "null"))
         };
-        self.commit_wal(WalOp::UpdateObjectTagging {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            seq: target_seq,
-            tags: req.tags.clone(),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(v) = cat
-            .buckets
-            .get_mut(&req.bucket)
-            .and_then(|b| b.objects.get_mut(&req.key))
-            .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+        let _cg = self
+            .commit_wal(WalOp::UpdateObjectTagging {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                seq: target_seq,
+                tags: req.tags.clone(),
+            })
+            .await?;
         {
-            v.tags = req.tags;
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(v) = cat
+                .buckets
+                .get_mut(&req.bucket)
+                .and_then(|b| b.objects.get_mut(&req.key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+            {
+                v.tags = req.tags;
+            }
         }
+        drop(_cg);
         Ok(vid_out)
     }
 
@@ -2303,22 +2827,26 @@ impl<D: Disk> ObjectStore for Engine<D> {
             )?;
             (ver.seq, ver.version_id.clone().filter(|v| v != "null"))
         };
-        self.commit_wal(WalOp::UpdateObjectTagging {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            seq: target_seq,
-            tags: BTreeMap::new(),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(v) = cat
-            .buckets
-            .get_mut(&req.bucket)
-            .and_then(|b| b.objects.get_mut(&req.key))
-            .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+        let _cg = self
+            .commit_wal(WalOp::UpdateObjectTagging {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                seq: target_seq,
+                tags: BTreeMap::new(),
+            })
+            .await?;
         {
-            v.tags.clear();
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(v) = cat
+                .buckets
+                .get_mut(&req.bucket)
+                .and_then(|b| b.objects.get_mut(&req.key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+            {
+                v.tags.clear();
+            }
         }
+        drop(_cg);
         Ok(vid_out)
     }
 
@@ -2358,15 +2886,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdateBucketCors {
-            name: req.bucket.clone(),
-            cors: Some(req.cors.clone()),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.cors = Some(req.cors);
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketCors {
+                name: req.bucket.clone(),
+                cors: Some(req.cors.clone()),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.cors = Some(req.cors);
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2385,15 +2917,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdateBucketCors {
-            name: req.bucket.clone(),
-            cors: None,
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.cors = None;
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketCors {
+                name: req.bucket.clone(),
+                cors: None,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.cors = None;
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2459,15 +2995,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
             doc
         };
-        self.commit_wal(WalOp::UpdateBucketPolicy {
-            name: req.bucket.clone(),
-            policy_json: Some(req.policy_json),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.policy = Some(doc);
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketPolicy {
+                name: req.bucket.clone(),
+                policy_json: Some(req.policy_json),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.policy = Some(doc);
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2486,15 +3026,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdateBucketPolicy {
-            name: req.bucket.clone(),
-            policy_json: None,
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.policy = None;
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketPolicy {
+                name: req.bucket.clone(),
+                policy_json: None,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.policy = None;
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2548,15 +3092,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdatePublicAccessBlock {
-            name: req.bucket.clone(),
-            config: Some(req.config),
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.public_access_block = Some(req.config);
+        let _cg = self
+            .commit_wal(WalOp::UpdatePublicAccessBlock {
+                name: req.bucket.clone(),
+                config: Some(req.config),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.public_access_block = Some(req.config);
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2575,15 +3123,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &PolicyEvalExtra::default(),
             )?;
         }
-        self.commit_wal(WalOp::UpdatePublicAccessBlock {
-            name: req.bucket.clone(),
-            config: None,
-        })
-        .await?;
-        let mut cat = self.catalog.write().unwrap();
-        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-            b.public_access_block = None;
+        let _cg = self
+            .commit_wal(WalOp::UpdatePublicAccessBlock {
+                name: req.bucket.clone(),
+                config: None,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.public_access_block = None;
+            }
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -2622,8 +3174,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         // 1. Stream data into segment blocks (<= max_block_payload) while computing digests
         let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut frame_buf: Vec<u8> = Vec::new();
         let mut extents: Vec<Extent> = Vec::new();
-        let mut touched_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
+        let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut seen_bytes = 0u64;
 
         while let Some(chunk) = poll_fn(|cx| body.poll_next_chunk(cx))
@@ -2639,36 +3192,41 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
             let mut slice: &[u8] = &chunk;
             while !slice.is_empty() {
+                if block_buf.is_empty() && slice.len() >= self.cfg.max_block_payload {
+                    let (ext, guard) = self.write_data_block_reuse(
+                        &slice[..self.cfg.max_block_payload],
+                        &mut frame_buf,
+                    )?;
+                    touched_slots.entry(guard.seg_id()).or_insert(guard);
+                    extents.push(ext);
+                    slice = &slice[self.cfg.max_block_payload..];
+                    continue;
+                }
                 let space = self.cfg.max_block_payload - block_buf.len();
                 let take = space.min(slice.len());
                 block_buf.extend_from_slice(&slice[..take]);
                 slice = &slice[take..];
                 if block_buf.len() == self.cfg.max_block_payload {
-                    let (ext, slot) = self.write_data_block(&block_buf)?;
-                    touched_slots.insert(slot.seg_id, slot);
+                    let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+                    touched_slots.entry(guard.seg_id()).or_insert(guard);
                     extents.push(ext);
                     block_buf.clear();
                 }
             }
         }
         if !block_buf.is_empty() {
-            let (ext, slot) = self.write_data_block(&block_buf)?;
-            touched_slots.insert(slot.seg_id, slot);
+            let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+            touched_slots.entry(guard.seg_id()).or_insert(guard);
             extents.push(ext);
-            block_buf.clear();
         }
+        drop(block_buf);
+        drop(frame_buf);
 
         // 2. Verify SHA-256 / Content-MD5 / Checksum BEFORE syncing or writing WAL! (PR-21)
         let digests = body.finish().map_err(map_body_err)?;
 
-        // 3. fdatasync touched data segments BEFORE writing WAL commit record (ST-1, 8.3)
-        for slot in touched_slots.values() {
-            slot.file
-                .sync_data()
-                .map_err(|e| self.poison_read_only("put_seg_fdatasync", e))?;
-        }
-
-        // 4. Acquire KeyLock, re-evaluate preconditions & ACL at commit point (FR-17), write & sync WAL
+        // 3. Acquire KeyLock, re-evaluate preconditions & ACL at commit point (FR-17),
+        //    then coalesce segment fdatasync + WAL fdatasync in group commit (ST-1, §8.3)
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
         let (versioning, obj_owner, obj_acl) = {
             let cat = self.catalog.read().unwrap();
@@ -2724,9 +3282,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
             extents: extents.clone(),
             parts: None,
         };
-        self.commit_wal(op).await?;
+        let _cg = self.commit_wal_with_segments(&touched_slots, op).await?;
 
-        // 5. Commit to in-memory catalog & update live_bytes accounting
+        // 4. Commit to in-memory catalog & update live_bytes accounting
         let mut reclaimed_extents: Vec<Extent> = Vec::new();
         {
             let mut cat = self.catalog.write().unwrap();
@@ -2742,10 +3300,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     total_size: digests.total_bytes,
                     etag: etag.clone(),
                     checksum: digests.checksum.clone(),
-                    sys_meta: req.sys_meta,
+                    sys_meta: Arc::new(req.sys_meta),
                     user_meta: req.user_meta,
-                    owner: obj_owner,
-                    acl: obj_acl,
+                    owner: Arc::new(obj_owner),
+                    acl: Arc::new(obj_acl),
                     tags: obj_tags,
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: extents.clone().into(),
@@ -2756,6 +3314,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
         }
 
         self.adjust_live_bytes(&extents, &reclaimed_extents);
+        drop(touched_slots);
+        drop(_cg);
 
         Ok(PutObjectResp {
             etag,
@@ -2899,12 +3459,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let seq = self.alloc_seq();
 
         if let Some(vid) = &req.version_id {
-            self.commit_wal(WalOp::DeleteVersion {
-                bucket: req.bucket.clone(),
-                key: req.key.clone(),
-                version_id: Some(vid.clone()),
-            })
-            .await?;
+            let _cg = self
+                .commit_wal(WalOp::DeleteVersion {
+                    bucket: req.bucket.clone(),
+                    key: req.key.clone(),
+                    version_id: Some(vid.clone()),
+                })
+                .await?;
             let mut reclaimed = Vec::new();
             let mut out_resp = DeleteObjectResp {
                 version_id: Some(vid.clone()),
@@ -2912,9 +3473,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
             };
             {
                 let mut cat = self.catalog.write().unwrap();
-                if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-                    if let Some(chain) = b.objects.get_mut(&req.key) {
-                        if let Some(pos) = chain.iter().position(|v| {
+                if let Some(b) = cat.buckets.get_mut(&req.bucket)
+                    && let Some(chain) = b.objects.get_mut(&req.key)
+                        && let Some(pos) = chain.iter().position(|v| {
                             v.version_id.as_deref().unwrap_or("null") == vid.as_str()
                         }) {
                             let removed = chain.remove(pos);
@@ -2927,33 +3488,33 @@ impl<D: Disk> ObjectStore for Engine<D> {
                                 b.objects.remove(&req.key);
                             }
                         }
-                    }
-                }
             }
             self.adjust_live_bytes(&[], &reclaimed);
+            drop(_cg);
             return Ok(out_resp);
         }
 
         match versioning {
             VersioningStatus::Unversioned => {
-                self.commit_wal(WalOp::DeleteVersion {
-                    bucket: req.bucket.clone(),
-                    key: req.key.clone(),
-                    version_id: None,
-                })
-                .await?;
+                let _cg = self
+                    .commit_wal(WalOp::DeleteVersion {
+                        bucket: req.bucket.clone(),
+                        key: req.key.clone(),
+                        version_id: None,
+                    })
+                    .await?;
                 let mut reclaimed = Vec::new();
                 {
                     let mut cat = self.catalog.write().unwrap();
-                    if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-                        if let Some(removed_chain) = b.objects.remove(&req.key) {
+                    if let Some(b) = cat.buckets.get_mut(&req.bucket)
+                        && let Some(removed_chain) = b.objects.remove(&req.key) {
                             for v in removed_chain {
                                 reclaimed.extend(v.extents.iter().copied());
                             }
                         }
-                    }
                 }
                 self.adjust_live_bytes(&[], &reclaimed);
+                drop(_cg);
                 Ok(DeleteObjectResp {
                     version_id: None,
                     is_delete_marker: false,
@@ -2972,25 +3533,26 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     client_requested: false,
                 };
                 let dm_acl = AccessControlPolicy::new_private(dm_owner.clone());
-                self.commit_wal(WalOp::PutVersion {
-                    bucket: req.bucket.clone(),
-                    key: req.key.clone(),
-                    seq,
-                    version_id: Some(vid.clone()),
-                    is_delete_marker: true,
-                    total_size: 0,
-                    etag: String::new(),
-                    checksum: dummy_csum.clone(),
-                    sys_meta: SystemMeta::default(),
-                    user_meta: Vec::new(),
-                    owner: dm_owner.clone(),
-                    acl: dm_acl.clone(),
-                    tags: BTreeMap::new(),
-                    last_modified_ms: req.ctx.request_time_ms,
-                    extents: Vec::new(),
-                    parts: None,
-                })
-                .await?;
+                let _cg = self
+                    .commit_wal(WalOp::PutVersion {
+                        bucket: req.bucket.clone(),
+                        key: req.key.clone(),
+                        seq,
+                        version_id: Some(vid.clone()),
+                        is_delete_marker: true,
+                        total_size: 0,
+                        etag: String::new(),
+                        checksum: dummy_csum.clone(),
+                        sys_meta: SystemMeta::default(),
+                        user_meta: Vec::new(),
+                        owner: dm_owner.clone(),
+                        acl: dm_acl.clone(),
+                        tags: BTreeMap::new(),
+                        last_modified_ms: req.ctx.request_time_ms,
+                        extents: Vec::new(),
+                        parts: None,
+                    })
+                    .await?;
 
                 let mut reclaimed = Vec::new();
                 {
@@ -3019,10 +3581,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                                 total_size: 0,
                                 etag: String::new(),
                                 checksum: dummy_csum,
-                                sys_meta: SystemMeta::default(),
+                                sys_meta: Arc::new(SystemMeta::default()),
                                 user_meta: Vec::new(),
-                                owner: dm_owner,
-                                acl: dm_acl,
+                                owner: Arc::new(dm_owner),
+                                acl: Arc::new(dm_acl),
                                 tags: BTreeMap::new(),
                                 last_modified_ms: req.ctx.request_time_ms,
                                 extents: Arc::new([]),
@@ -3032,6 +3594,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     }
                 }
                 self.adjust_live_bytes(&[], &reclaimed);
+                drop(_cg);
                 Ok(DeleteObjectResp {
                     version_id: Some(vid),
                     is_delete_marker: true,
@@ -3084,7 +3647,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         key: item.key,
                         version_id: item.version_id,
                         code: err.code.as_str().to_string(),
-                        message: err.message,
+                        message: err.message.clone(),
                     });
                 }
             }
@@ -3172,7 +3735,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         // 2. Copy blocks sequentially into active segment (maintaining strict 1-to-1 block ownership!)
         let mut new_extents = Vec::with_capacity(src_ver.extents.len());
-        let mut touched_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
+        let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut md5_hasher = Md5::new();
         let mut csum_hasher = ActiveHasher::new(src_ver.checksum.algorithm);
 
@@ -3194,19 +3757,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
             md5_hasher.update(payload);
             csum_hasher.update(payload);
-            let (new_ext, slot) = self.write_data_block(payload)?;
-            touched_slots.insert(slot.seg_id, slot);
+            let (new_ext, guard) = self.write_data_block(payload)?;
+            touched_slots.entry(guard.seg_id()).or_insert(guard);
             new_extents.push(new_ext);
         }
         drop(src_pins);
 
-        for slot in touched_slots.values() {
-            slot.file
-                .sync_data()
-                .map_err(|e| self.poison_read_only("copy_seg_sync", e))?;
-        }
-
-        // 3. Commit under destination key lock
+        // 3. Commit under destination key lock (coalescing segment + WAL fdatasync in group commit)
         let _kl = self.key_stripe(&req.dst_bucket, &req.dst_key).lock().await;
         let req_tags_for_auth = match req.tagging_directive {
             TaggingDirective::Copy => (!src_ver.tags.is_empty()).then_some(&dst_tags),
@@ -3251,10 +3808,16 @@ impl<D: Disk> ObjectStore for Engine<D> {
             VersioningStatus::Suspended => Some("null".to_string()),
             VersioningStatus::Enabled => Some(format!("v{seq:016x}")),
         };
-        let (sys_meta, user_meta) = if req.replace_metadata {
-            (req.sys_meta, req.user_meta)
+        let (sys_meta_val, sys_meta_arc, user_meta) = if req.replace_metadata {
+            let sm = req.sys_meta;
+            let arc = Arc::new(sm.clone());
+            (sm, arc, req.user_meta)
         } else {
-            (src_ver.sys_meta.clone(), src_ver.user_meta.clone())
+            (
+                (*src_ver.sys_meta).clone(),
+                Arc::clone(&src_ver.sys_meta),
+                src_ver.user_meta.clone(),
+            )
         };
         let md5_raw: [u8; 16] = md5_hasher.finalize().into();
         let etag = format!("\"{}\"", hex::encode(md5_raw));
@@ -3274,7 +3837,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             total_size: src_ver.total_size,
             etag: etag.clone(),
             checksum: dst_csum.clone(),
-            sys_meta: sys_meta.clone(),
+            sys_meta: sys_meta_val,
             user_meta: user_meta.clone(),
             owner: dst_owner.clone(),
             acl: dst_acl.clone(),
@@ -3283,7 +3846,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             extents: new_extents.clone(),
             parts: None,
         };
-        self.commit_wal(op).await?;
+        let _cg = self.commit_wal_with_segments(&touched_slots, op).await?;
 
         let mut reclaimed = Vec::new();
         {
@@ -3300,10 +3863,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     total_size: src_ver.total_size,
                     etag: etag.clone(),
                     checksum: dst_csum.clone(),
-                    sys_meta,
+                    sys_meta: sys_meta_arc,
                     user_meta,
-                    owner: dst_owner,
-                    acl: dst_acl,
+                    owner: Arc::new(dst_owner),
+                    acl: Arc::new(dst_acl),
                     tags: dst_tags,
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: new_extents.clone().into(),
@@ -3313,6 +3876,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
         }
         self.adjust_live_bytes(&new_extents, &reclaimed);
+        drop(touched_slots);
+        drop(_cg);
 
         Ok(CopyObjectResp {
             etag,
@@ -3376,21 +3941,22 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let upload_id = format!("mp{seq:016x}{}", hex::encode(entropy));
         let up_tags = req.tags.unwrap_or_default();
 
-        self.commit_wal(WalOp::CreateMultipartUpload {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            upload_id: upload_id.clone(),
-            initiator: initiator.clone(),
-            owner: obj_owner.clone(),
-            acl: obj_acl.clone(),
-            tags: up_tags.clone(),
-            initiated_ms: req.ctx.request_time_ms,
-            sys_meta: req.sys_meta.clone(),
-            user_meta: req.user_meta.clone(),
-            checksum_algorithm: req.checksum_algorithm,
-            checksum_type: resolved_type,
-        })
-        .await?;
+        let _cg = self
+            .commit_wal(WalOp::CreateMultipartUpload {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                upload_id: upload_id.clone(),
+                initiator: initiator.clone(),
+                owner: obj_owner.clone(),
+                acl: obj_acl.clone(),
+                tags: up_tags.clone(),
+                initiated_ms: req.ctx.request_time_ms,
+                sys_meta: req.sys_meta.clone(),
+                user_meta: req.user_meta.clone(),
+                checksum_algorithm: req.checksum_algorithm,
+                checksum_type: resolved_type,
+            })
+            .await?;
 
         {
             let mut cat = self.catalog.write().unwrap();
@@ -3417,6 +3983,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 );
             }
         }
+        drop(_cg);
 
         Ok(CreateMultipartUploadResp {
             bucket: req.bucket,
@@ -3485,8 +4052,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
         };
 
         let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut frame_buf: Vec<u8> = Vec::new();
         let mut extents: Vec<Extent> = Vec::new();
-        let mut touched_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
+        let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut seen_bytes = 0u64;
         let mut crc64_hasher = crc64fast_nvme::Digest::new();
         let mut up_csum_hasher = up_alg.map(ActiveHasher::new);
@@ -3508,28 +4076,39 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
             let mut slice: &[u8] = &chunk;
             while !slice.is_empty() {
+                if block_buf.is_empty() && slice.len() >= self.cfg.max_block_payload {
+                    let (ext, guard) = self.write_data_block_reuse(
+                        &slice[..self.cfg.max_block_payload],
+                        &mut frame_buf,
+                    )?;
+                    touched_slots.entry(guard.seg_id()).or_insert(guard);
+                    extents.push(ext);
+                    slice = &slice[self.cfg.max_block_payload..];
+                    continue;
+                }
                 let space = self.cfg.max_block_payload - block_buf.len();
                 let take = space.min(slice.len());
                 block_buf.extend_from_slice(&slice[..take]);
                 slice = &slice[take..];
                 if block_buf.len() == self.cfg.max_block_payload {
-                    let (ext, slot) = self.write_data_block(&block_buf)?;
-                    touched_slots.insert(slot.seg_id, slot);
+                    let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+                    touched_slots.entry(guard.seg_id()).or_insert(guard);
                     extents.push(ext);
                     block_buf.clear();
                 }
             }
         }
         if !block_buf.is_empty() {
-            let (ext, slot) = self.write_data_block(&block_buf)?;
-            touched_slots.insert(slot.seg_id, slot);
+            let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+            touched_slots.entry(guard.seg_id()).or_insert(guard);
             extents.push(ext);
-            block_buf.clear();
         }
+        drop(block_buf);
+        drop(frame_buf);
 
         let digests = body.finish().map_err(map_body_err)?;
-        if let Some(alg) = up_alg {
-            if digests.checksum.client_requested && digests.checksum.algorithm != alg {
+        if let Some(alg) = up_alg
+            && digests.checksum.client_requested && digests.checksum.algorithm != alg {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidRequest,
                     format!(
@@ -3538,13 +4117,6 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     ),
                 ));
             }
-        }
-
-        for slot in touched_slots.values() {
-            slot.file
-                .sync_data()
-                .map_err(|e| self.poison_read_only("upload_part_seg_fdatasync", e))?;
-        }
 
         let part_crc64 = crc64_hasher.sum64();
         let part_csum = up_alg
@@ -3592,21 +4164,25 @@ impl<D: Disk> ObjectStore for Engine<D> {
         }
         let part_seq = self.alloc_seq();
 
-        self.commit_wal(WalOp::PutUploadPart {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            upload_id: req.upload_id.clone(),
-            part_seq,
-            part_number: req.part_number,
-            last_modified_ms: req.ctx.request_time_ms,
-            etag: etag.clone(),
-            size: digests.total_bytes,
-            md5: digests.md5,
-            crc64_nvme: part_crc64,
-            checksum: part_csum.clone(),
-            extents: extents.clone(),
-        })
-        .await?;
+        let _cg = self
+            .commit_wal_with_segments(
+                &touched_slots,
+                WalOp::PutUploadPart {
+                    bucket: req.bucket.clone(),
+                    key: req.key.clone(),
+                    upload_id: req.upload_id.clone(),
+                    part_seq,
+                    part_number: req.part_number,
+                    last_modified_ms: req.ctx.request_time_ms,
+                    etag: etag.clone(),
+                    size: digests.total_bytes,
+                    md5: digests.md5,
+                    crc64_nvme: part_crc64,
+                    checksum: part_csum.clone(),
+                    extents: extents.clone(),
+                },
+            )
+            .await?;
 
         let mut reclaimed = Vec::new();
         {
@@ -3618,8 +4194,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .buckets
                 .get_mut(&req.bucket)
                 .and_then(|b| b.uploads.get_mut(&(req.key, req.upload_id)))
-            {
-                if let Some(old_part) = up.parts.insert(
+                && let Some(old_part) = up.parts.insert(
                     req.part_number,
                     UploadPartEntry {
                         part_seq,
@@ -3635,9 +4210,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 ) {
                     reclaimed.extend(old_part.extents.iter().copied());
                 }
-            }
         }
         self.adjust_live_bytes(&extents, &reclaimed);
+        drop(touched_slots);
+        drop(_cg);
 
         Ok(UploadPartResp {
             etag,
@@ -3752,7 +4328,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
         let mut extents: Vec<Extent> = Vec::new();
-        let mut touched_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
+        let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut md5_hasher = Md5::new();
         let mut crc64_hasher = crc64fast_nvme::Digest::new();
         let mut up_csum_hasher = up_alg.map(ActiveHasher::new);
@@ -3806,27 +4382,21 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     block_buf.extend_from_slice(&slice[..take]);
                     slice = &slice[take..];
                     if block_buf.len() == self.cfg.max_block_payload {
-                        let (new_ext, slot) = self.write_data_block(&block_buf)?;
-                        touched_slots.insert(slot.seg_id, slot);
+                        let (new_ext, guard) = self.write_data_block(&block_buf)?;
+                        touched_slots.entry(guard.seg_id()).or_insert(guard);
                         extents.push(new_ext);
                         block_buf.clear();
                     }
                 }
             }
             if !block_buf.is_empty() {
-                let (new_ext, slot) = self.write_data_block(&block_buf)?;
-                touched_slots.insert(slot.seg_id, slot);
+                let (new_ext, guard) = self.write_data_block(&block_buf)?;
+                touched_slots.entry(guard.seg_id()).or_insert(guard);
                 extents.push(new_ext);
                 block_buf.clear();
             }
         }
         drop(src_pins);
-
-        for slot in touched_slots.values() {
-            slot.file
-                .sync_data()
-                .map_err(|e| self.poison_read_only("upload_part_copy_seg_sync", e))?;
-        }
 
         let part_len = slice_end_excl - slice_start;
         let md5: [u8; 16] = md5_hasher.finalize().into();
@@ -3873,21 +4443,25 @@ impl<D: Disk> ObjectStore for Engine<D> {
         }
         let part_seq = self.alloc_seq();
 
-        self.commit_wal(WalOp::PutUploadPart {
-            bucket: req.dst_bucket.clone(),
-            key: req.dst_key.clone(),
-            upload_id: req.upload_id.clone(),
-            part_seq,
-            part_number: req.part_number,
-            last_modified_ms: req.ctx.request_time_ms,
-            etag: etag.clone(),
-            size: part_len,
-            md5,
-            crc64_nvme: part_crc64,
-            checksum: part_csum.clone(),
-            extents: extents.clone(),
-        })
-        .await?;
+        let _cg = self
+            .commit_wal_with_segments(
+                &touched_slots,
+                WalOp::PutUploadPart {
+                    bucket: req.dst_bucket.clone(),
+                    key: req.dst_key.clone(),
+                    upload_id: req.upload_id.clone(),
+                    part_seq,
+                    part_number: req.part_number,
+                    last_modified_ms: req.ctx.request_time_ms,
+                    etag: etag.clone(),
+                    size: part_len,
+                    md5,
+                    crc64_nvme: part_crc64,
+                    checksum: part_csum.clone(),
+                    extents: extents.clone(),
+                },
+            )
+            .await?;
 
         let mut reclaimed = Vec::new();
         {
@@ -3899,8 +4473,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .buckets
                 .get_mut(&req.dst_bucket)
                 .and_then(|b| b.uploads.get_mut(&(req.dst_key, req.upload_id)))
-            {
-                if let Some(old_part) = up.parts.insert(
+                && let Some(old_part) = up.parts.insert(
                     req.part_number,
                     UploadPartEntry {
                         part_seq,
@@ -3916,9 +4489,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 ) {
                     reclaimed.extend(old_part.extents.iter().copied());
                 }
-            }
         }
         self.adjust_live_bytes(&extents, &reclaimed);
+        drop(touched_slots);
+        drop(_cg);
 
         Ok(UploadPartCopyResp {
             etag,
@@ -4122,14 +4696,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 "Your proposed upload exceeds the maximum allowed size",
             ));
         }
-        if let Some(exp_size) = req.expected_object_size {
-            if exp_size != total_size {
+        if let Some(exp_size) = req.expected_object_size
+            && exp_size != total_size {
                 return Err(S3Error::new(
                     S3ErrorCode::PreconditionFailed,
                     "Object size does not match x-amz-mp-object-size.",
                 ));
             }
-        }
 
         // [PR-25] Combine checksums mathematically WITHOUT re-reading part data!
         let final_checksum = match (up.checksum_algorithm, up.checksum_type) {
@@ -4165,17 +4738,16 @@ impl<D: Disk> ObjectStore for Engine<D> {
             },
         };
 
-        if let Some((exp_alg, exp_val)) = &req.expected_checksum {
-            if !final_checksum.client_requested
+        if let Some((exp_alg, exp_val)) = &req.expected_checksum
+            && (!final_checksum.client_requested
                 || *exp_alg != final_checksum.algorithm
-                || exp_val.trim() != final_checksum.value_b64
+                || exp_val.trim() != final_checksum.value_b64)
             {
                 return Err(S3Error::new(
                     S3ErrorCode::BadDigest,
                     "The digest you specified did not match the calculated digest.",
                 ));
             }
-        }
 
         // [FR-15, FR-17] Evaluate destination preconditions at commit point
         {
@@ -4204,26 +4776,27 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .then(|| final_checksum.clone()),
         };
 
-        self.commit_wal(WalOp::CompleteMultipartUpload {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            upload_id: req.upload_id.clone(),
-            seq,
-            version_id: version_id.clone(),
-            total_size,
-            etag: etag.clone(),
-            checksum: final_checksum.clone(),
-            sys_meta: up.sys_meta.clone(),
-            user_meta: up.user_meta.clone(),
-            owner: up.owner.clone(),
-            acl: up.acl.clone(),
-            tags: up.tags.clone(),
-            completed_ms: req.ctx.request_time_ms,
-            extents: combined_extents.clone(),
-            parts: boundaries.clone(),
-            resp: resp.clone(),
-        })
-        .await?;
+        let _cg = self
+            .commit_wal(WalOp::CompleteMultipartUpload {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                upload_id: req.upload_id.clone(),
+                seq,
+                version_id: version_id.clone(),
+                total_size,
+                etag: etag.clone(),
+                checksum: final_checksum.clone(),
+                sys_meta: up.sys_meta.clone(),
+                user_meta: up.user_meta.clone(),
+                owner: up.owner.clone(),
+                acl: up.acl.clone(),
+                tags: up.tags.clone(),
+                completed_ms: req.ctx.request_time_ms,
+                extents: combined_extents.clone(),
+                parts: boundaries.clone(),
+                resp: resp.clone(),
+            })
+            .await?;
 
         let mut reclaimed = Vec::new();
         {
@@ -4239,10 +4812,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     total_size,
                     etag,
                     checksum: final_checksum,
-                    sys_meta: up.sys_meta,
+                    sys_meta: Arc::new(up.sys_meta),
                     user_meta: up.user_meta,
-                    owner: up.owner,
-                    acl: up.acl,
+                    owner: Arc::new(up.owner),
+                    acl: Arc::new(up.acl),
                     tags: up.tags,
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: combined_extents.into(),
@@ -4265,6 +4838,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         if !reclaimed.is_empty() {
             self.adjust_live_bytes(&[], &reclaimed);
         }
+        drop(_cg);
 
         Ok(resp)
     }
@@ -4316,27 +4890,28 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
         }
 
-        self.commit_wal(WalOp::AbortMultipartUpload {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            upload_id: req.upload_id.clone(),
-        })
-        .await?;
+        let _cg = self
+            .commit_wal(WalOp::AbortMultipartUpload {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                upload_id: req.upload_id.clone(),
+            })
+            .await?;
 
         let mut reclaimed = Vec::new();
         {
             let mut cat = self.catalog.write().unwrap();
-            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
-                if let Some(removed_up) = b.uploads.remove(&(req.key, req.upload_id)) {
+            if let Some(b) = cat.buckets.get_mut(&req.bucket)
+                && let Some(removed_up) = b.uploads.remove(&(req.key, req.upload_id)) {
                     for p in removed_up.parts.into_values() {
                         reclaimed.extend(p.extents.iter().copied());
                     }
                 }
-            }
         }
         if !reclaimed.is_empty() {
             self.adjust_live_bytes(&[], &reclaimed);
         }
+        drop(_cg);
         Ok(())
     }
 
@@ -4456,9 +5031,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let mut next_um = None;
 
         if max_u > 0 {
-            for ((key, uid), up) in &b.uploads {
+            let lower_key = if km.as_str() > req.prefix.as_str() {
+                km.clone()
+            } else {
+                req.prefix.clone()
+            };
+            for ((key, uid), up) in b.uploads.range((lower_key, String::new())..) {
                 if !key.starts_with(&req.prefix) {
-                    continue;
+                    break;
                 }
                 if !km.is_empty() {
                     if key.as_str() < km.as_str() {
@@ -4469,8 +5049,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     }
                 }
                 let rest = &key[req.prefix.len()..];
-                if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty()) {
-                    if let Some(pos) = rest.find(delim) {
+                if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty())
+                    && let Some(pos) = rest.find(delim) {
                         let cp = format!("{}{}", req.prefix, &rest[..pos + delim.len()]);
                         if !km.is_empty() && cp.as_str() <= km.as_str() {
                             continue;
@@ -4488,7 +5068,6 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         common_prefixes.push(cp);
                         continue;
                     }
-                }
                 if uploads.len() + common_prefixes.len() == max_u {
                     is_truncated = true;
                     break;
@@ -4567,7 +5146,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         last_modified_ms: v.last_modified_ms,
                         etag: v.etag.clone(),
                         size: v.total_size,
-                        owner: v.owner.clone(),
+                        owner: (*v.owner).clone(),
                         checksum_alg: Some(v.checksum.algorithm),
                         checksum_type: Some(v.checksum.checksum_type),
                     });
@@ -4647,7 +5226,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         last_modified_ms: v.last_modified_ms,
                         etag: v.etag.clone(),
                         size: v.total_size,
-                        owner: v.owner.clone(),
+                        owner: (*v.owner).clone(),
                         checksum_alg: Some(v.checksum.algorithm),
                         checksum_type: Some(v.checksum.checksum_type),
                     });
@@ -4727,16 +5306,24 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let mut next_km = None;
         let mut next_vm = None;
 
-        'outer: for (key, chain) in &b.objects {
+        let lower_key: &str = if km.as_str() > req.prefix.as_str() {
+            km.as_str()
+        } else {
+            req.prefix.as_str()
+        };
+        'outer: for (key, chain) in b
+            .objects
+            .range::<str, _>((Bound::Included(lower_key), Bound::Unbounded))
+        {
             if !key.starts_with(&req.prefix) {
-                continue;
+                break 'outer;
             }
             if !km.is_empty() && key.as_str() < km.as_str() {
                 continue;
             }
             let rest = &key[req.prefix.len()..];
-            if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty()) {
-                if let Some(pos) = rest.find(delim) {
+            if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty())
+                && let Some(pos) = rest.find(delim) {
                     let cp = format!("{}{}", req.prefix, &rest[..pos + delim.len()]);
                     if !km.is_empty() && cp.as_str() <= km.as_str() {
                         continue;
@@ -4754,7 +5341,6 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     common_prefixes.push(cp);
                     continue;
                 }
-            }
 
             let mut skip_until_marker = !km.is_empty() && key == &km;
             for (idx, v) in chain.iter().enumerate() {
@@ -4782,7 +5368,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     last_modified_ms: v.last_modified_ms,
                     etag: v.etag.clone(),
                     size: v.total_size,
-                    owner: v.owner.clone(),
+                    owner: (*v.owner).clone(),
                 });
             }
         }
@@ -4829,14 +5415,14 @@ impl<D: Disk> Engine<D> {
         let mgr = self.seg_mgr.lock().unwrap();
         let mut pins = BTreeMap::new();
         for ext in extents {
-            if !pins.contains_key(&ext.seg_id) {
+            if let std::collections::btree_map::Entry::Vacant(e) = pins.entry(ext.seg_id) {
                 let slot = mgr.segments.get(&ext.seg_id).ok_or_else(|| {
                     S3Error::new(
                         S3ErrorCode::InternalError,
                         "Referenced segment missing from segment table",
                     )
                 })?;
-                pins.insert(ext.seg_id, SegmentPin::acquire(slot));
+                e.insert(SegmentPin::acquire(slot));
             }
         }
         Ok(pins)
@@ -4914,13 +5500,13 @@ impl<D: Disk> Engine<D> {
                     request_object_tags: req_tags,
                     ..Default::default()
                 };
-                let acl_grant = acl_needed.map(|perm| (&ver.acl, perm));
+                let acl_grant = acl_needed.map(|perm| (&*ver.acl, perm));
                 if !authorize_object_action(
                     &view,
                     ctx,
                     key,
                     actions,
-                    Some(&ver.owner),
+                    Some(&*ver.owner),
                     acl_grant,
                     false,
                     &extra,
@@ -5002,8 +5588,8 @@ impl<D: Disk> Engine<D> {
             ctx,
             key,
             actions,
-            Some(&ver.owner),
-            Some((&ver.acl, AclPermission::Read)),
+            Some(&*ver.owner),
+            Some((&*ver.acl, AclPermission::Read)),
             false,
             &extra,
         ) {
@@ -5168,8 +5754,8 @@ impl<D: Disk> Engine<D> {
             content_range,
             etag: ver.etag,
             last_modified_ms: ver.last_modified_ms,
-            owner: ver.owner,
-            sys_meta: ver.sys_meta,
+            owner: (*ver.owner).clone(),
+            sys_meta: (*ver.sys_meta).clone(),
             user_meta: ver.user_meta,
             checksum,
             parts_count,
@@ -5184,9 +5770,11 @@ impl<D: Disk> Engine<D> {
 #[derive(Debug, Serialize)]
 pub struct FsckReport {
     pub status: String,
+    pub instance_uuid: String,
     pub checked_lsn: u64,
     pub buckets: usize,
     pub object_versions: usize,
+    pub open_uploads: usize,
     pub segments_checked: usize,
     pub bytes_verified: u64,
     pub errors: Vec<String>,
@@ -5200,9 +5788,11 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
             errors.push(format!("recovery/open failed: {e}"));
             return FsckReport {
                 status: "corrupted".into(),
+                instance_uuid: String::new(),
                 checked_lsn: 0,
                 buckets: 0,
                 object_versions: 0,
+                open_uploads: 0,
                 segments_checked: 0,
                 bytes_verified: 0,
                 errors,
@@ -5210,16 +5800,44 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
         }
     };
 
+    let instance_uuid = hex::encode(engine.format.instance_uuid);
+
+    // Verify ALL checkpoint files in `ckpt/` (including older ones if any exist)
+    if let Ok(entries) = disk.read_dir("ckpt") {
+        for name in entries {
+            if let Some(hex_str) = name.strip_prefix("ckpt-")
+                && hex_str.len() == 16
+                    && let Ok(exp_lsn) = u64::from_str_radix(hex_str, 16) {
+                        let rel = format!("ckpt/{name}");
+                        match disk.open(&rel, OpenOpts::read_only()) {
+                            Ok(f) => {
+                                if let Err(msg) = read_checkpoint_from_file(
+                                    &f,
+                                    Some(exp_lsn),
+                                    Some(engine.format.uuid_lo()),
+                                ) {
+                                    errors.push(format!("checkpoint {rel} corrupt: {msg}"));
+                                }
+                            }
+                            Err(e) => errors.push(format!("checkpoint {rel} open failed: {e}")),
+                        }
+                    }
+        }
+    }
+
     let checked_lsn = engine.wal.lock().unwrap().synced_lsn;
     let segments_checked = engine.seg_mgr.lock().unwrap().segments.len();
     let mut object_versions = 0usize;
+    let mut open_uploads = 0usize;
     let mut bytes_verified = 0u64;
+    let mut seen_extents: BTreeSet<(u32, u64)> = BTreeSet::new();
 
     let cat = engine.catalog.read().unwrap();
     let buckets = cat.buckets.len();
     let mgr = engine.seg_mgr.lock().unwrap();
 
     for (bname, b) in &cat.buckets {
+        open_uploads += b.uploads.len();
         for (key, chain) in &b.objects {
             for v in chain {
                 object_versions += 1;
@@ -5227,10 +5845,68 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                     continue;
                 }
                 let mut md5_h = Md5::new();
+                let mut full_csum_h = ActiveHasher::new(v.checksum.algorithm);
                 let mut actual_size = 0u64;
+
+                // Track per-part MD5 & checksum boundaries when `v.parts` is present
+                let mut mp_part_idx = 0usize;
+                let mut mp_part_rem = v
+                    .parts
+                    .as_ref()
+                    .and_then(|ps| ps.first())
+                    .map(|p| p.size)
+                    .unwrap_or(0);
+                let mut mp_part_md5 = Md5::new();
+                let mut mp_md5_concat: Vec<u8> = Vec::new();
+                let mut mp_part_csum_h = v
+                    .parts
+                    .as_ref()
+                    .and_then(|ps| ps.first())
+                    .and_then(|p| p.checksum.as_ref())
+                    .map(|(alg, _)| ActiveHasher::new(*alg));
+                let mut mp_part_csum_b64s: Vec<String> = Vec::new();
+
+                // Advance past any 0-byte leading parts
+                if let Some(parts) = &v.parts {
+                    while mp_part_idx < parts.len() && mp_part_rem == 0 {
+                        let p = &parts[mp_part_idx];
+                        let d: [u8; 16] = std::mem::take(&mut mp_part_md5).finalize().into();
+                        mp_md5_concat.extend_from_slice(&d);
+                        if let Some((alg, ref exp_b64)) = p.checksum {
+                            let calc_b64 = mp_part_csum_h
+                                .take()
+                                .unwrap_or_else(|| ActiveHasher::new(alg))
+                                .finalize_b64();
+                            if &calc_b64 != exp_b64 {
+                                errors.push(format!(
+                                    "{bname}/{key}: part {} checksum mismatch expected {exp_b64}, got {calc_b64}",
+                                    p.part_number
+                                ));
+                            }
+                            mp_part_csum_b64s.push(calc_b64);
+                        }
+                        mp_part_idx += 1;
+                        if mp_part_idx < parts.len() {
+                            mp_part_rem = parts[mp_part_idx].size;
+                            mp_part_csum_h = parts[mp_part_idx]
+                                .checksum
+                                .as_ref()
+                                .map(|(alg, _)| ActiveHasher::new(*alg));
+                        }
+                    }
+                }
+
+                let mut read_ok = true;
                 for ext in v.extents.iter() {
+                    if !seen_extents.insert((ext.seg_id, ext.offset)) {
+                        errors.push(format!(
+                            "{bname}/{key}: duplicate extent ownership seg {} off {}",
+                            ext.seg_id, ext.offset
+                        ));
+                    }
                     let Some(slot) = mgr.segments.get(&ext.seg_id) else {
                         errors.push(format!("{bname}/{key}: missing segment {}", ext.seg_id));
+                        read_ok = false;
                         continue;
                     };
                     let mut raw = vec![0u8; ext.physical_bytes() as usize];
@@ -5239,6 +5915,7 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                             "{bname}/{key}: read error seg {} off {}: {e}",
                             ext.seg_id, ext.offset
                         ));
+                        read_ok = false;
                         continue;
                     }
                     let hdr: [u8; 12] = raw[0..12].try_into().unwrap();
@@ -5253,10 +5930,55 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                                 ));
                             }
                             md5_h.update(payload);
+                            full_csum_h.update(payload);
                             actual_size += payload.len() as u64;
                             bytes_verified += payload.len() as u64;
+
+                            if let Some(parts) = &v.parts {
+                                let mut rem_slice = payload;
+                                while !rem_slice.is_empty() && mp_part_idx < parts.len() {
+                                    let take = (mp_part_rem as usize).min(rem_slice.len());
+                                    let chunk = &rem_slice[..take];
+                                    rem_slice = &rem_slice[take..];
+                                    mp_part_md5.update(chunk);
+                                    if let Some(h) = &mut mp_part_csum_h {
+                                        h.update(chunk);
+                                    }
+                                    mp_part_rem -= take as u64;
+                                    while mp_part_idx < parts.len() && mp_part_rem == 0 {
+                                        let p = &parts[mp_part_idx];
+                                        let d: [u8; 16] =
+                                            std::mem::take(&mut mp_part_md5).finalize().into();
+                                        mp_md5_concat.extend_from_slice(&d);
+                                        if let Some((alg, ref exp_b64)) = p.checksum {
+                                            let calc_b64 = mp_part_csum_h
+                                                .take()
+                                                .unwrap_or_else(|| ActiveHasher::new(alg))
+                                                .finalize_b64();
+                                            if &calc_b64 != exp_b64 {
+                                                errors.push(format!(
+                                                    "{bname}/{key}: part {} checksum mismatch expected {exp_b64}, got {calc_b64}",
+                                                    p.part_number
+                                                ));
+                                            }
+                                            mp_part_csum_b64s.push(calc_b64);
+                                        }
+                                        mp_part_idx += 1;
+                                        if mp_part_idx < parts.len() {
+                                            mp_part_rem = parts[mp_part_idx].size;
+                                            mp_part_csum_h = parts[mp_part_idx]
+                                                .checksum
+                                                .as_ref()
+                                                .map(|(alg, _)| ActiveHasher::new(*alg));
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        Err(msg) => errors.push(format!("{bname}/{key}: {msg}")),
+                        Err(msg) => {
+                            errors.push(format!("{bname}/{key}: {msg}"));
+                            read_ok = false;
+                        }
                     }
                 }
                 if actual_size != v.total_size {
@@ -5272,8 +5994,18 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                             "{bname}/{key}: multipart part sizes sum {parts_sum} != {}",
                             v.total_size
                         ));
+                    } else if read_ok {
+                        let outer_md5: [u8; 16] = Md5::digest(&mp_md5_concat).into();
+                        let expected_etag =
+                            format!("\"{}-{}\"", hex::encode(outer_md5), parts.len());
+                        if expected_etag != v.etag {
+                            errors.push(format!(
+                                "{bname}/{key}: multipart ETag mismatch expected {}, got {}",
+                                v.etag, expected_etag
+                            ));
+                        }
                     }
-                } else {
+                } else if read_ok {
                     let expected_etag = format!("\"{}\"", hex::encode(md5_h.finalize()));
                     if expected_etag != v.etag {
                         errors.push(format!(
@@ -5282,18 +6014,63 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                         ));
                     }
                 }
+
+                if read_ok && !v.checksum.value_b64.is_empty() {
+                    match v.checksum.checksum_type {
+                        ChecksumType::FullObject => {
+                            let calc_b64 = full_csum_h.finalize_b64();
+                            if calc_b64 != v.checksum.value_b64 {
+                                errors.push(format!(
+                                    "{bname}/{key}: full-object {} checksum mismatch expected {}, got {}",
+                                    v.checksum.algorithm.as_aws_str(),
+                                    v.checksum.value_b64,
+                                    calc_b64
+                                ));
+                            }
+                        }
+                        ChecksumType::Composite => {
+                            match compute_composite_checksum_b64(
+                                v.checksum.algorithm,
+                                &mp_part_csum_b64s,
+                            ) {
+                                Ok(calc_b64) if calc_b64 != v.checksum.value_b64 => {
+                                    errors.push(format!(
+                                        "{bname}/{key}: composite {} checksum mismatch expected {}, got {}",
+                                        v.checksum.algorithm.as_aws_str(),
+                                        v.checksum.value_b64,
+                                        calc_b64
+                                    ));
+                                }
+                                Err(e) => errors.push(format!(
+                                    "{bname}/{key}: composite checksum compute failed: {e}"
+                                )),
+                                Ok(_) => {}
+                            }
+                        }
+                    }
+                }
             }
         }
 
         for ((key, uid), up) in &b.uploads {
             for p in up.parts.values() {
                 let mut part_bytes = 0u64;
+                let mut part_md5 = Md5::new();
+                let mut part_csum_h = p.checksum.as_ref().map(|(alg, _)| ActiveHasher::new(*alg));
+                let mut read_ok = true;
                 for ext in p.extents.iter() {
+                    if !seen_extents.insert((ext.seg_id, ext.offset)) {
+                        errors.push(format!(
+                            "{bname}/{key} upload {uid} part {}: duplicate extent seg {} off {}",
+                            p.part_number, ext.seg_id, ext.offset
+                        ));
+                    }
                     let Some(slot) = mgr.segments.get(&ext.seg_id) else {
                         errors.push(format!(
                             "{bname}/{key} upload {uid} part {}: missing segment {}",
                             p.part_number, ext.seg_id
                         ));
+                        read_ok = false;
                         continue;
                     };
                     let mut raw = vec![0u8; ext.physical_bytes() as usize];
@@ -5302,6 +6079,7 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                             "{bname}/{key} upload {uid} part {}: read error: {e}",
                             p.part_number
                         ));
+                        read_ok = false;
                         continue;
                     }
                     let hdr: [u8; 12] = raw[0..12].try_into().unwrap();
@@ -5317,13 +6095,20 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                                     p.part_number
                                 ));
                             }
+                            part_md5.update(payload);
+                            if let Some(h) = &mut part_csum_h {
+                                h.update(payload);
+                            }
                             part_bytes += payload.len() as u64;
                             bytes_verified += payload.len() as u64;
                         }
-                        Err(msg) => errors.push(format!(
-                            "{bname}/{key} upload {uid} part {}: {msg}",
-                            p.part_number
-                        )),
+                        Err(msg) => {
+                            errors.push(format!(
+                                "{bname}/{key} upload {uid} part {}: {msg}",
+                                p.part_number
+                            ));
+                            read_ok = false;
+                        }
                     }
                 }
                 if part_bytes != p.size {
@@ -5331,6 +6116,24 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                         "{bname}/{key} upload {uid} part {}: size mismatch expected {}, got {part_bytes}",
                         p.part_number, p.size
                     ));
+                } else if read_ok {
+                    let md5_arr: [u8; 16] = part_md5.finalize().into();
+                    if md5_arr != p.md5 {
+                        errors.push(format!(
+                            "{bname}/{key} upload {uid} part {}: MD5 mismatch",
+                            p.part_number
+                        ));
+                    }
+                    if let Some((_, ref exp_b64)) = p.checksum
+                        && let Some(h) = part_csum_h {
+                            let calc = h.finalize_b64();
+                            if &calc != exp_b64 {
+                                errors.push(format!(
+                                    "{bname}/{key} upload {uid} part {}: checksum mismatch expected {exp_b64}, got {calc}",
+                                    p.part_number
+                                ));
+                            }
+                        }
                 }
             }
         }
@@ -5342,9 +6145,11 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
         } else {
             "corrupted".into()
         },
+        instance_uuid,
         checked_lsn,
         buckets,
         object_versions,
+        open_uploads,
         segments_checked,
         bytes_verified,
         errors,

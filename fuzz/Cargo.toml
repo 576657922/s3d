@@ -1,0 +1,71 @@
+[package]
+name = "s3d-cargo-fuzz"
+version = "0.1.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+s3d-fuzz = { path = "../crates/s3d-fuzz" }
+
+# Standalone workspace so `cargo test --workspace` on stable Rust does not pull `libfuzzer-sys`.
+[workspace]
+
+[[bin]]
+name = "fuzz_auth_header"
+path = "fuzz_targets/fuzz_auth_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_canonical_request"
+path = "fuzz_targets/fuzz_canonical_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_aws_chunked"
+path = "fuzz_targets/fuzz_aws_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_xml_requests"
+path = "fuzz_targets/fuzz_xml_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_range_header"
+path = "fuzz_targets/fuzz_range_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_continuation_token"
+path = "fuzz_targets/fuzz_continuation_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_post_policy"
+path = "fuzz_targets/fuzz_post_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal_ckpt_decode"
+path = "fuzz_targets/fuzz_wal_ckpt_decode.rs"
+test = false
+doc = false
+bench = false

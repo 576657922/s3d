@@ -109,8 +109,8 @@ fn combine_reflected_crc32_poly(poly: u32, mut crc1: u32, crc2: u32, mut len2: u
     }
     let mut odd = [0u32; 32];
     odd[0] = poly;
-    for i in 1..32 {
-        odd[i] = 1u32 << (i - 1);
+    for (i, slot) in odd.iter_mut().enumerate().skip(1) {
+        *slot = 1u32 << (i - 1);
     }
     let mut even = gf2_matrix_square_32(&odd);
     odd = gf2_matrix_square_32(&even);
@@ -165,8 +165,8 @@ pub fn combine_crc64_nvme(mut crc1: u64, crc2: u64, mut len2: u64) -> u64 {
     let poly: u64 = 0x9A6C_9329_AC4B_C9B5;
     let mut odd = [0u64; 64];
     odd[0] = poly;
-    for i in 1..64 {
-        odd[i] = 1u64 << (i - 1);
+    for (i, slot) in odd.iter_mut().enumerate().skip(1) {
+        *slot = 1u64 << (i - 1);
     }
     let mut even = gf2_matrix_square_64(&odd);
     odd = gf2_matrix_square_64(&even);

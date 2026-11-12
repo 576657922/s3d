@@ -121,13 +121,12 @@ impl AwsChunkedDecoder {
 
                     // [PR-12] Non-final chunks must be >= 8 KiB!
                     if chunk_len > 0 {
-                        if let Some(prev) = self.prev_chunk_len {
-                            if prev < MIN_NON_FINAL_AWS_CHUNK {
+                        if let Some(prev) = self.prev_chunk_len
+                            && prev < MIN_NON_FINAL_AWS_CHUNK {
                                 return Err(BodyStreamError::InvalidChunkedEncoding(
                                     "non-final aws-chunked block smaller than 8 KiB".into(),
                                 ));
                             }
-                        }
                         self.prev_chunk_len = Some(chunk_len);
                     }
 
@@ -187,12 +186,11 @@ impl AwsChunkedDecoder {
                     *remaining -= take;
                     self.decoded_so_far += take as u64;
 
-                    if self.signed.is_some() {
+                    if let Some(sctx) = &mut self.signed {
                         // Buffer chunk until chunk-signature is verified before releasing downstream!
                         chunk_buf.extend_from_slice(&piece);
                         if *remaining == 0 {
                             let full_chunk = chunk_buf.split().freeze();
-                            let sctx = self.signed.as_mut().unwrap();
                             let calc = compute_chunk_signature(
                                 &sctx.signing_key,
                                 &sctx.amz_date,

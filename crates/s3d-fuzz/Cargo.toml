@@ -1,0 +1,23 @@
+[package]
+name = "s3d-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+crc32c.workspace = true
+http.workspace = true
+rand.workspace = true
+s3d-disk.workspace = true
+s3d-engine.workspace = true
+s3d-proto.workspace = true
+s3d-server.workspace = true
+s3d-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -20,24 +20,74 @@ pub const SEG_STATE_ACTIVE: u8 = 0;
 pub const SEG_STATE_SEALED: u8 = 1;
 pub const SEG_STATE_PENDING_DELETE: u8 = 2;
 
+/// High bit in `SegmentSlot::pin_state` indicating GC has unmapped the segment from `seg_mgr`
+/// and scheduled physical reclamation as soon as the active reader count reaches 0.
+pub const PIN_PENDING_DELETE_BIT: usize = 1usize << (usize::BITS - 1);
+
 pub struct SegmentSlot<D: Disk> {
     pub seg_id: u32,
     pub file: Arc<D::File>,
     pub disk: D,
     pub write_pos: AtomicU64,
     pub live_bytes: AtomicU64,
-    pub active_readers: AtomicUsize,
+    /// Number of in-flight writers that have written blocks to this segment and not yet
+    /// completed `catalog.write()` + `live_bytes` accounting. Incremented under `seg_mgr` lock
+    /// in `write_data_block`, preventing GC from selecting a newly sealed segment prematurely.
+    pub inflight_writers: AtomicUsize,
+    /// Packed single-word `(PIN_PENDING_DELETE_BIT | active_readers)`.
+    /// Using a single atomic guarantees a total modification order under C++11/Rust `AcqRel`
+    /// (verified exhaustively by `VR-4` `loom_segment_pin_vs_delete`).
+    pub pin_state: AtomicUsize,
     pub state: AtomicU8,
 }
 
+/// RAII guard preventing GC from compacting/deleting a segment while an in-flight writer
+/// has written blocks to it that have not yet been committed to `catalog` and `live_bytes`.
+pub struct InflightWriteGuard<D: Disk> {
+    slot: Arc<SegmentSlot<D>>,
+}
+
+impl<D: Disk> InflightWriteGuard<D> {
+    pub fn acquire(slot: &Arc<SegmentSlot<D>>) -> Self {
+        slot.inflight_writers.fetch_add(1, Ordering::Relaxed);
+        Self {
+            slot: Arc::clone(slot),
+        }
+    }
+
+    pub fn slot(&self) -> &Arc<SegmentSlot<D>> {
+        &self.slot
+    }
+
+    pub fn seg_id(&self) -> u32 {
+        self.slot.seg_id
+    }
+}
+
+impl<D: Disk> Drop for InflightWriteGuard<D> {
+    fn drop(&mut self) {
+        self.slot.inflight_writers.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl<D: Disk> SegmentSlot<D> {
-    pub fn try_reclaim_if_unpinned(&self) {
-        if self.state.load(Ordering::Acquire) == SEG_STATE_PENDING_DELETE
-            && self.active_readers.load(Ordering::Acquire) == 0
-        {
-            let path = format!("seg/{:08}.seg", self.seg_id);
-            let _ = self.disk.remove_file(&path);
-            let _ = self.disk.sync_dir("seg");
+    fn reclaim_now(&self) {
+        let path = format!("seg/{:08}.seg", self.seg_id);
+        let _ = self.disk.remove_file(&path);
+        let _ = self.disk.sync_dir("seg");
+    }
+
+    /// Called by GC *after* removing `seg_id` from `seg_mgr.segments` so no new `SegmentPin`
+    /// can ever be acquired. Unlinks immediately if `active_readers == 0`; otherwise the last
+    /// `SegmentPin::drop` observes `PIN_PENDING_DELETE_BIT | 1` and unlinks.
+    pub fn mark_pending_delete_and_maybe_reclaim(&self) {
+        self.state
+            .store(SEG_STATE_PENDING_DELETE, Ordering::Release);
+        let prev = self
+            .pin_state
+            .fetch_or(PIN_PENDING_DELETE_BIT, Ordering::AcqRel);
+        if prev == 0 {
+            self.reclaim_now();
         }
     }
 }
@@ -49,7 +99,12 @@ pub struct SegmentPin<D: Disk> {
 
 impl<D: Disk> SegmentPin<D> {
     pub fn acquire(slot: &Arc<SegmentSlot<D>>) -> Self {
-        slot.active_readers.fetch_add(1, Ordering::Acquire);
+        let prev = slot.pin_state.fetch_add(1, Ordering::Relaxed);
+        debug_assert_eq!(
+            prev & PIN_PENDING_DELETE_BIT,
+            0,
+            "SegmentPin acquired after PIN_PENDING_DELETE_BIT was set"
+        );
         Self {
             slot: Arc::clone(slot),
         }
@@ -62,9 +117,9 @@ impl<D: Disk> SegmentPin<D> {
 
 impl<D: Disk> Drop for SegmentPin<D> {
     fn drop(&mut self) {
-        let prev = self.slot.active_readers.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            self.slot.try_reclaim_if_unpinned();
+        let prev = self.slot.pin_state.fetch_sub(1, Ordering::AcqRel);
+        if prev == (PIN_PENDING_DELETE_BIT | 1) {
+            self.slot.reclaim_now();
         }
     }
 }
@@ -77,10 +132,10 @@ pub struct ObjectVersionEntry {
     pub total_size: u64,
     pub etag: String,
     pub checksum: ChecksumState,
-    pub sys_meta: SystemMeta,
+    pub sys_meta: Arc<SystemMeta>,
     pub user_meta: Vec<(String, String)>,
-    pub owner: OwnerInfo,
-    pub acl: AccessControlPolicy,
+    pub owner: Arc<OwnerInfo>,
+    pub acl: Arc<AccessControlPolicy>,
     pub tags: BTreeMap<String, String>,
     pub last_modified_ms: i64,
     pub extents: Arc<[Extent]>,
@@ -151,7 +206,7 @@ impl BucketEntry {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MemoryCatalog {
     pub next_seq: u64,
     pub buckets: BTreeMap<String, BucketEntry>,
@@ -263,7 +318,7 @@ impl<D: Disk> AsyncByteReader for EngineByteReader<D> {
             )));
         }
 
-        let out = Bytes::copy_from_slice(&payload[rel_s..rel_e]);
+        let out = Bytes::from(raw).slice((12 + rel_s)..(12 + rel_e));
         Poll::Ready(Ok(Some(out)))
     }
 }

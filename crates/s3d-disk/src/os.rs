@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions as StdOpenOptions};
 use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
@@ -24,6 +25,14 @@ impl OsDisk {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Open a file with OS page-cache bypass enabled where supported (`F_NOCACHE` on macOS,
+    /// matching `fio --direct=1` for `VR-9` sequential disk bandwidth baselines).
+    pub fn open_uncached(&self, rel_path: &str, opts: OpenOpts) -> DiskResult<OsFile> {
+        let f = self.open(rel_path, opts)?;
+        set_fd_nocache(&f.file)?;
+        Ok(f)
     }
 
     fn resolve(&self, rel: &str) -> DiskResult<PathBuf> {
@@ -161,12 +170,17 @@ fn map_io_err(err: std::io::Error) -> DiskError {
     }
 }
 
-/// Isolated FFI wrapper around POSIX `statvfs` (reviewed per VR-10).
+/// Isolated FFI wrapper around POSIX `statvfs` (reviewed per `VR-10`).
 #[allow(unsafe_code)]
 fn statvfs_available_bytes(path: &Path) -> DiskResult<u64> {
     let c_path =
         CString::new(path.as_os_str().as_bytes()).map_err(|_| DiskError::InvalidInput)?;
+    // SAFETY: `statvfs` is a plain C struct of POD integer fields (`u64`/`u32`/`c_ulong`)
+    // with no non-zero niche invariants; zero-initializing it before passing a valid mutable
+    // pointer and NUL-terminated `c_path.as_ptr()` to `libc::statvfs` is sound.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is alive and NUL-terminated for the duration of the call, and `&mut stat`
+    // points to a valid writable `libc::statvfs` on the stack.
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
     if rc != 0 {
         return Err(DiskError::IoError);
@@ -177,4 +191,25 @@ fn statvfs_available_bytes(path: &Path) -> DiskResult<u64> {
         stat.f_bsize as u64
     };
     Ok((stat.f_bavail as u64).saturating_mul(frsize))
+}
+
+/// Isolated FFI wrapper enabling `F_NOCACHE` on macOS (`VR-10` audited).
+#[allow(unsafe_code)]
+fn set_fd_nocache(file: &File) -> DiskResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let fd = file.as_raw_fd();
+        // SAFETY: `file` is an open `std::fs::File` whose raw file descriptor `fd` remains valid
+        // for the duration of this call; `F_NOCACHE` takes a single `c_int` (`1`) argument and
+        // does not alias or mutate any Rust memory.
+        let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1 as libc::c_int) };
+        if rc == -1 {
+            return Err(DiskError::IoError);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+    }
+    Ok(())
 }

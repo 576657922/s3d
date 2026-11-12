@@ -738,6 +738,7 @@ fn extract_request_timestamp(headers: &HeaderMap) -> StoreResult<(String, i64)> 
 
 /// Parse RFC 7231 HTTP-date OR RFC 2822 date (including `±HHMM` numeric offsets such as `-0000`)
 /// into non-negative Unix epoch milliseconds. Pre-epoch (`< 1970-01-01T00:00:00Z`) returns `Err(())`.
+#[allow(clippy::result_unit_err)]
 pub fn parse_http_or_rfc2822_date_ms(s: &str) -> Result<i64, ()> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -845,6 +846,7 @@ pub(crate) fn days_in_month(year: i64, month: u32) -> u32 {
 }
 
 /// Parse `YYYYMMDDTHHMMSSZ` into Unix epoch milliseconds.
+#[allow(clippy::result_unit_err)]
 pub fn parse_iso8601_compact_ms(s: &str) -> Result<i64, ()> {
     let b = s.trim().as_bytes();
     if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
@@ -873,7 +875,7 @@ pub fn parse_iso8601_compact_ms(s: &str) -> Result<i64, ()> {
     }
 
     let days = days_from_civil(year, month as u32, day as u32);
-    Ok(((days * 86_400 + hour * 3600 + min * 60 + sec) * 1000) as i64)
+    Ok((days * 86_400 + hour * 3600 + min * 60 + sec) * 1000)
 }
 
 pub fn format_iso8601_compact(epoch_ms: i64) -> String {

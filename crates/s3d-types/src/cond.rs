@@ -47,14 +47,13 @@ pub fn evaluate_read_preconditions(
                 "At least one of the pre-conditions you specified did not hold",
             ));
         }
-    } else if let Some(unmod_sec) = cond.if_unmodified_since_sec {
-        if obj_sec > unmod_sec {
+    } else if let Some(unmod_sec) = cond.if_unmodified_since_sec
+        && obj_sec > unmod_sec {
             return Err(S3Error::new(
                 S3ErrorCode::PreconditionFailed,
                 "At least one of the pre-conditions you specified did not hold",
             ));
         }
-    }
 
     // Step 3 & 4: If-None-Match takes precedence over If-Modified-Since (FR-13).
     if let Some(if_none_match) = &cond.if_none_match {
@@ -63,13 +62,12 @@ pub fn evaluate_read_preconditions(
                 .with_header("ETag", current_etag.to_string())
                 .with_header("Last-Modified", last_modified_http.to_string()));
         }
-    } else if let Some(mod_sec) = cond.if_modified_since_sec {
-        if obj_sec <= mod_sec {
+    } else if let Some(mod_sec) = cond.if_modified_since_sec
+        && obj_sec <= mod_sec {
             return Err(S3Error::new(S3ErrorCode::NotModified, "Not Modified")
                 .with_header("ETag", current_etag.to_string())
                 .with_header("Last-Modified", last_modified_http.to_string()));
         }
-    }
 
     Ok(())
 }
@@ -112,17 +110,15 @@ pub fn evaluate_write_preconditions(
         .with_key(bucket, key));
     }
 
-    if let Some(if_none_match) = &cond.if_none_match {
-        if let HeadState::Present { etag } = head {
-            if etag_list_matches(if_none_match, etag) {
+    if let Some(if_none_match) = &cond.if_none_match
+        && let HeadState::Present { etag } = head
+            && etag_list_matches(if_none_match, etag) {
                 return Err(S3Error::new(
                     S3ErrorCode::PreconditionFailed,
                     "At least one of the pre-conditions you specified did not hold",
                 )
                 .with_key(bucket, key));
             }
-        }
-    }
 
     if let Some(if_match) = &cond.if_match {
         match head {

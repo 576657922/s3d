@@ -74,6 +74,9 @@ pub fn render_error_xml(err: &S3Error, request_id: &str, host_id: &str) -> Strin
 
 /// Parse optional `CreateBucketConfiguration` XML body; returns `Option<LocationConstraint>`.
 pub fn parse_create_bucket_xml(body: &[u8]) -> StoreResult<Option<String>> {
+    if body.len() > 1024 * 1024 {
+        return Err(malformed_xml());
+    }
     if body.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(None);
     }
@@ -1036,6 +1039,9 @@ where
     FId: Fn(&str) -> Option<OwnerInfo>,
     FEmail: Fn(&str) -> Option<OwnerInfo>,
 {
+    if body.is_empty() || body.len() > 1024 * 1024 {
+        return Err(malformed_xml());
+    }
     check_no_dtd_or_entity(body)?;
     let mut reader = Reader::from_reader(body);
     reader.config_mut().trim_text(true);
@@ -1057,13 +1063,14 @@ where
     let mut grantee_uri: Option<String> = None;
     let mut grant_perm: Option<String> = None;
 
-    let mut raw_grants: Vec<(
+    type RawAclGrant = (
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
-    )> = Vec::new();
+    );
+    let mut raw_grants: Vec<RawAclGrant> = Vec::new();
 
     let malformed_acl = || {
         S3Error::new(
@@ -1093,11 +1100,10 @@ where
                         in_grantee = true;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                            if key == "type" || key.ends_with(":type") {
-                                if let Ok(v) = attr.unescape_value() {
+                            if (key == "type" || key.ends_with(":type"))
+                                && let Ok(v) = attr.unescape_value() {
                                     grantee_type = Some(v.into_owned());
                                 }
-                            }
                         }
                     }
                     "ID" | "DisplayName" | "EmailAddress" | "URI" | "Permission" => {

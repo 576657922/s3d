@@ -643,11 +643,10 @@ impl IdBijection {
     fn record_ver_pair(&mut self, ev: &Option<String>, mv: &Option<String>) {
         match (ev, mv) {
             (Some(e), Some(m)) => {
-                if let Some(prev) = self.m2e_ver.insert(m.clone(), e.clone()) {
-                    if m != "null" {
+                if let Some(prev) = self.m2e_ver.insert(m.clone(), e.clone())
+                    && m != "null" {
                         assert_eq!(&prev, e, "version bijection conflict for {m}");
                     }
-                }
                 self.ver_ring.push((e.clone(), m.clone()));
                 if self.ver_ring.len() > 16 {
                     self.ver_ring.remove(0);
@@ -2153,6 +2152,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
     let cfg = EngineConfig {
         segment_size: 24 * 1024,
         wal_file_size: 12 * 1024,
+        checkpoint_wal_bytes: 16 * 1024,
         max_block_payload: 4 * 1024,
         ..EngineConfig::default()
     };
@@ -2422,13 +2422,22 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
         if round % 20 == 0 {
             engine.compact().await.unwrap();
         }
+        if round > 0 && round % 25 == 0 {
+            engine.write_checkpoint().await.unwrap();
+        }
+
+        // Simulate a crashed in-flight checkpoint write in `tmp/` (`ST-8`)
+        if rng.gen_bool(0.3)
+            && let Ok(tf) = disk.open("tmp/ckpt-inflight.tmp", OpenOpts::create_truncate_rw()) {
+                let _ = tf.write_all_at(0, b"S3DCKP01-partial-uncommitted");
+            }
 
         // Inject un-fsynced dirty tail writes onto active WAL and active segment right before power cut
         // to simulate an in-flight crashed write tearing across 4 KiB sectors! (ST-3, ST-6)
         if rng.gen_bool(0.6) {
-            if let Ok(wal_files) = disk.read_dir("wal") {
-                if let Some(last_wal) = wal_files.last() {
-                    if let Ok(wf) = disk.open(&format!("wal/{last_wal}"), OpenOpts::open_rw()) {
+            if let Ok(wal_files) = disk.read_dir("wal")
+                && let Some(last_wal) = wal_files.last()
+                    && let Ok(wf) = disk.open(&format!("wal/{last_wal}"), OpenOpts::open_rw()) {
                         let pos = wf.len().unwrap();
                         let mut junk = vec![0u8; rng.gen_range(5..6000)];
                         rng.fill(&mut junk[..]);
@@ -2436,18 +2445,14 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                             .copy_from_slice(&s3d_engine::format::WAL_RECORD_MAGIC.to_le_bytes());
                         let _ = wf.write_all_at(pos, &junk);
                     }
-                }
-            }
-            if let Ok(seg_files) = disk.read_dir("seg") {
-                if let Some(last_seg) = seg_files.last() {
-                    if let Ok(sf) = disk.open(&format!("seg/{last_seg}"), OpenOpts::open_rw()) {
+            if let Ok(seg_files) = disk.read_dir("seg")
+                && let Some(last_seg) = seg_files.last()
+                    && let Ok(sf) = disk.open(&format!("seg/{last_seg}"), OpenOpts::open_rw()) {
                         let pos = sf.len().unwrap();
                         let mut junk = vec![0u8; rng.gen_range(16..5000)];
                         rng.fill(&mut junk[..]);
                         let _ = sf.write_all_at(pos, &junk);
                     }
-                }
-            }
         }
 
         drop(engine);
@@ -2503,6 +2508,54 @@ fn vr3_10k_random_power_cuts_m1_gate() {
     let done = total_rounds.load(Ordering::SeqCst);
     assert_eq!(done, CHAINS * ROUNDS_PER_CHAIN);
     eprintln!("VR-3 M1 gate passed: {done} random power-cut cycles executed, 0 violations.");
+}
+
+/// M3 Full Gate (`VR-3`): 100,000 random power-cut cycles (200 chains * 500 rounds)
+/// with concurrent GC compaction, WAL rollover/pruning, and checkpoints — zero violations.
+#[test]
+#[ignore]
+fn vr3_100k_random_power_cuts_m3_gate() {
+    const CHAINS: usize = 200;
+    const ROUNDS_PER_CHAIN: usize = 500;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .min(CHAINS);
+    let next_chain = Arc::new(AtomicUsize::new(0));
+    let total_rounds = Arc::new(AtomicUsize::new(0));
+    let t0 = std::time::Instant::now();
+
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let next_chain = Arc::clone(&next_chain);
+        let total_rounds = Arc::clone(&total_rounds);
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            loop {
+                let cid = next_chain.fetch_add(1, Ordering::SeqCst);
+                if cid >= CHAINS {
+                    break;
+                }
+                rt.block_on(run_power_cut_chain(0xD3AD_0000 + cid as u64, ROUNDS_PER_CHAIN));
+                let cur = total_rounds.fetch_add(ROUNDS_PER_CHAIN, Ordering::SeqCst) + ROUNDS_PER_CHAIN;
+                if cur.is_multiple_of(10_000) {
+                    eprintln!("VR-3 M3 progress: {cur} / {} power-cuts verified", CHAINS * ROUNDS_PER_CHAIN);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let done = total_rounds.load(Ordering::SeqCst);
+    assert_eq!(done, CHAINS * ROUNDS_PER_CHAIN);
+    eprintln!(
+        "VR-3 M3 gate passed: {done} random power-cut cycles executed in {:.2}s, 0 violations.",
+        t0.elapsed().as_secs_f64()
+    );
 }
 
 #[tokio::test]

@@ -177,8 +177,10 @@ async fn m2_virtual_hosted_streaming_trailer_cors_and_post_sigv4() {
         secret_key: SecretKey::new(SK),
     }];
     let auth = Arc::new(SigV4Verifier::new(REGION.to_string(), accounts));
-    let mut cfg = ServerConfig::default();
-    cfg.base_domain = BASE_DOMAIN.to_string();
+    let cfg = ServerConfig {
+        base_domain: BASE_DOMAIN.to_string(),
+        ..Default::default()
+    };
 
     let s3_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let s3_addr = s3_listener.local_addr().unwrap();

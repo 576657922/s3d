@@ -1,4 +1,8 @@
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
+
 use base64::Engine as _;
+use bytes::Bytes;
 use crc32fast::Hasher as Crc32Hasher;
 use md5::{Digest as _, Md5};
 use s3d_types::{
@@ -84,11 +88,109 @@ pub fn validate_checksum_b64_format(alg: ChecksumAlgorithm, b64_val: &str) -> St
     Ok(())
 }
 
+/// Threshold (`256 KiB` in production; `1 KiB` under Miri for fast UB/leak checking) above which
+/// RFC 1321 `Md5` (`ETag`) hashing is pipelined onto a bounded background worker (`<= 1 MiB` queued)
+/// so single-stream multi-GiB `PutObject` / `UploadPart` overlaps serial 64-round MD5 with
+/// `CRC64NVME`, `CRC32C`, TCP reads, and `pwrite`.
+const MD5_WORKER_THRESHOLD_BYTES: u64 = if cfg!(miri) { 1024 } else { 256 * 1024 };
+
+struct Md5Worker {
+    tx: Option<SyncSender<Bytes>>,
+    handle: Option<JoinHandle<Md5>>,
+}
+
+impl Drop for Md5Worker {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+enum Md5Accumulator {
+    Inline(Md5),
+    Worker(Md5Worker),
+    Taken,
+}
+
+impl Md5Accumulator {
+    fn new() -> Self {
+        Self::Inline(Md5::new())
+    }
+
+    fn feed_bytes(&mut self, total_bytes: u64, chunk: &Bytes) {
+        match self {
+            Self::Inline(h) => {
+                if total_bytes <= MD5_WORKER_THRESHOLD_BYTES {
+                    h.update(chunk);
+                } else {
+                    let Self::Inline(mut md5) = std::mem::replace(self, Self::Taken) else {
+                        unreachable!();
+                    };
+                    let (tx, rx) = mpsc::sync_channel::<Bytes>(4);
+                    let first = chunk.clone();
+                    let mut worker_md5 = md5.clone();
+                    match thread::Builder::new().name("s3d-md5".into()).spawn(move || {
+                        worker_md5.update(&first);
+                        while let Ok(buf) = rx.recv() {
+                            worker_md5.update(&buf);
+                        }
+                        worker_md5
+                    }) {
+                        Ok(handle) => {
+                            *self = Self::Worker(Md5Worker {
+                                tx: Some(tx),
+                                handle: Some(handle),
+                            });
+                        }
+                        Err(_) => {
+                            md5.update(chunk);
+                            *self = Self::Inline(md5);
+                        }
+                    }
+                }
+            }
+            Self::Worker(Md5Worker { tx: Some(tx), .. }) => {
+                let _ = tx.send(chunk.clone());
+            }
+            Self::Worker(Md5Worker { tx: None, .. }) | Self::Taken => unreachable!(),
+        }
+    }
+
+    fn feed_slice(&mut self, total_bytes: u64, chunk: &[u8]) {
+        if let Self::Inline(h) = self
+            && total_bytes <= MD5_WORKER_THRESHOLD_BYTES
+        {
+            h.update(chunk);
+            return;
+        }
+        self.feed_bytes(total_bytes, &Bytes::copy_from_slice(chunk));
+    }
+
+    fn finalize(self) -> [u8; 16] {
+        match self {
+            Self::Inline(h) => h.finalize().into(),
+            Self::Worker(mut w) => {
+                drop(w.tx.take());
+                w.handle
+                    .take()
+                    .expect("md5 worker handle missing")
+                    .join()
+                    .expect("s3d-md5 background worker panicked")
+                    .finalize()
+                    .into()
+            }
+            Self::Taken => unreachable!(),
+        }
+    }
+}
+
 /// Streaming digest accumulator verifying `Content-MD5`, `x-amz-content-sha256`, and `x-amz-checksum-*`.
 pub struct StreamingDigestVerifier {
     total_bytes: u64,
     expected_len: Option<u64>,
-    md5: Md5,
+    md5: Md5Accumulator,
     expected_md5: Option<[u8; 16]>,
     sha256: Option<(Sha256, [u8; 32])>,
     checksum_alg: ChecksumAlgorithm,
@@ -111,7 +213,7 @@ impl StreamingDigestVerifier {
         Self {
             total_bytes: 0,
             expected_len,
-            md5: Md5::new(),
+            md5: Md5Accumulator::new(),
             expected_md5,
             sha256: expected_sha256.map(|exp| (Sha256::new(), exp)),
             checksum_alg: alg,
@@ -128,7 +230,17 @@ impl StreamingDigestVerifier {
 
     pub fn update(&mut self, chunk: &[u8]) {
         self.total_bytes += chunk.len() as u64;
-        self.md5.update(chunk);
+        self.md5.feed_slice(self.total_bytes, chunk);
+        if let Some((h, _)) = &mut self.sha256 {
+            h.update(chunk);
+        }
+        self.checksum_hasher.update(chunk);
+    }
+
+    /// Zero-copy `Bytes` fast path avoiding slice cloning when offloading large streams to `Md5Accumulator`.
+    pub fn update_bytes(&mut self, chunk: &Bytes) {
+        self.total_bytes += chunk.len() as u64;
+        self.md5.feed_bytes(self.total_bytes, chunk);
         if let Some((h, _)) = &mut self.sha256 {
             h.update(chunk);
         }
@@ -136,29 +248,26 @@ impl StreamingDigestVerifier {
     }
 
     pub fn finish(self) -> Result<VerifiedDigests, BodyStreamError> {
-        if let Some(exp_len) = self.expected_len {
-            if self.total_bytes != exp_len {
+        if let Some(exp_len) = self.expected_len
+            && self.total_bytes != exp_len {
                 return Err(BodyStreamError::IncompleteBody);
             }
-        }
         if let Some((sha, exp_sha)) = self.sha256 {
             let actual_sha: [u8; 32] = sha.finalize().into();
             if actual_sha != exp_sha {
                 return Err(BodyStreamError::Sha256Mismatch);
             }
         }
-        let actual_md5: [u8; 16] = self.md5.finalize().into();
-        if let Some(exp_md5) = self.expected_md5 {
-            if actual_md5 != exp_md5 {
+        let actual_md5: [u8; 16] = self.md5.finalize();
+        if let Some(exp_md5) = self.expected_md5
+            && actual_md5 != exp_md5 {
                 return Err(BodyStreamError::BadDigest);
             }
-        }
         let actual_csum_b64 = self.checksum_hasher.finalize_b64();
-        if let Some(exp_b64) = &self.expected_checksum_b64 {
-            if exp_b64.trim() != actual_csum_b64 {
+        if let Some(exp_b64) = &self.expected_checksum_b64
+            && exp_b64.trim() != actual_csum_b64 {
                 return Err(BodyStreamError::BadDigest);
             }
-        }
         Ok(VerifiedDigests {
             total_bytes: self.total_bytes,
             md5: actual_md5,
@@ -201,8 +310,8 @@ fn combine_reflected_crc32_poly(poly: u32, mut crc1: u32, crc2: u32, mut len2: u
     }
     let mut odd = [0u32; 32];
     odd[0] = poly;
-    for i in 1..32 {
-        odd[i] = 1u32 << (i - 1);
+    for (i, slot) in odd.iter_mut().enumerate().skip(1) {
+        *slot = 1u32 << (i - 1);
     }
     let mut even = gf2_matrix_square_32(&odd);
     odd = gf2_matrix_square_32(&even); // 4-bit shift
@@ -258,8 +367,8 @@ pub fn combine_crc64_nvme(mut crc1: u64, crc2: u64, mut len2: u64) -> u64 {
     let poly: u64 = 0x9A6C_9329_AC4B_C9B5;
     let mut odd = [0u64; 64];
     odd[0] = poly;
-    for i in 1..64 {
-        odd[i] = 1u64 << (i - 1);
+    for (i, slot) in odd.iter_mut().enumerate().skip(1) {
+        *slot = 1u64 << (i - 1);
     }
     let mut even = gf2_matrix_square_64(&odd);
     odd = gf2_matrix_square_64(&even);
@@ -321,5 +430,46 @@ mod tests {
             combine_crc64_nvme(crc64(part1), crc64(part2), part2.len() as u64),
             crc64(&combined)
         );
+    }
+
+    #[test]
+    fn pipelined_md5_worker_matches_inline_and_handles_early_drop() {
+        let total_len = if cfg!(miri) { 4096 } else { 1024 * 1024 };
+        let step_a = if cfg!(miri) { 512 } else { 64 * 1024 };
+        let step_b = if cfg!(miri) { 700 } else { 100_000 };
+        let step_c = if cfg!(miri) { 1024 } else { 128 * 1024 };
+
+        let mut full = Vec::with_capacity(total_len);
+        for i in 0..total_len {
+            full.push((i as u8).wrapping_mul(31).wrapping_add(7));
+        }
+        let expected_md5: [u8; 16] = Md5::digest(&full).into();
+
+        // 1. Feed above worker threshold via `update_bytes`
+        let mut v_bytes =
+            StreamingDigestVerifier::new(Some(full.len() as u64), Some(expected_md5), None, None);
+        for chunk in full.chunks(step_a) {
+            v_bytes.update_bytes(&Bytes::copy_from_slice(chunk));
+        }
+        let d1 = v_bytes.finish().unwrap();
+        assert_eq!(d1.md5, expected_md5);
+        assert_eq!(d1.total_bytes, full.len() as u64);
+
+        // 2. Feed above worker threshold via `update` slice path
+        let mut v_slice =
+            StreamingDigestVerifier::new(Some(full.len() as u64), Some(expected_md5), None, None);
+        for chunk in full.chunks(step_b) {
+            v_slice.update(chunk);
+        }
+        let d2 = v_slice.finish().unwrap();
+        assert_eq!(d2.md5, expected_md5);
+        assert_eq!(d2.checksum.value_b64, d1.checksum.value_b64);
+
+        // 3. Early drop after spawning worker (simulates aborted stream) reaps thread cleanly
+        let mut v_abort = StreamingDigestVerifier::new(None, None, None, None);
+        for chunk in full.chunks(step_c).take(4) {
+            v_abort.update_bytes(&Bytes::copy_from_slice(chunk));
+        }
+        drop(v_abort);
     }
 }

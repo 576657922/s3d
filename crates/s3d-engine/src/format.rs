@@ -462,13 +462,11 @@ pub fn has_later_committed_record(tail: &[u8], failed_expected_lsn: u64) -> bool
     let magic_bytes = WAL_RECORD_MAGIC.to_le_bytes();
     let mut i = 1usize;
     while i + 30 <= tail.len() {
-        if tail[i..i + 4] == magic_bytes {
-            if let Ok(rec) = decode_wal_record(&tail[i..]) {
-                if rec.lsn > failed_expected_lsn && rec.synced_lsn >= failed_expected_lsn {
+        if tail[i..i + 4] == magic_bytes
+            && let Ok(rec) = decode_wal_record(&tail[i..])
+                && rec.lsn > failed_expected_lsn && rec.synced_lsn >= failed_expected_lsn {
                     return true;
                 }
-            }
-        }
         i += 1;
     }
     false

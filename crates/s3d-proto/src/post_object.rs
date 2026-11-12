@@ -71,14 +71,13 @@ pub fn parse_multipart_boundary(content_type: &str) -> StoreResult<Vec<u8>> {
     }
     for param in parts {
         let param = param.trim();
-        if let Some((k, v)) = param.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("boundary") {
+        if let Some((k, v)) = param.split_once('=')
+            && k.trim().eq_ignore_ascii_case("boundary") {
                 let unquoted = v.trim().trim_matches('"');
                 if !unquoted.is_empty() && unquoted.len() <= 200 {
                     return Ok(unquoted.as_bytes().to_vec());
                 }
             }
-        }
     }
     Err(invalid_arg(
         "The Content-Type is missing a multipart boundary",
@@ -126,11 +125,13 @@ fn parse_disposition_params(val: &str) -> (Option<String>, Option<String>) {
     (name, filename)
 }
 
+type ParsedMultipartForm = (Vec<(String, String)>, String, Option<String>, Bytes);
+
 /// Parse `multipart/form-data` up to and including the `name="file"` part (all parts after `file` are ignored).
 fn parse_multipart_form(
     body: &Bytes,
     boundary: &[u8],
-) -> StoreResult<(Vec<(String, String)>, String, Option<String>, Bytes)> {
+) -> StoreResult<ParsedMultipartForm> {
     let mut dash_boundary = Vec::with_capacity(2 + boundary.len());
     dash_boundary.extend_from_slice(b"--");
     dash_boundary.extend_from_slice(boundary);
@@ -196,7 +197,7 @@ fn parse_multipart_form(
         };
         let part_body_end = if next_b >= body_start + 2 && &bytes[next_b - 2..next_b] == b"\r\n" {
             next_b - 2
-        } else if next_b >= body_start + 1 && bytes[next_b - 1] == b'\n' {
+        } else if next_b > body_start && bytes[next_b - 1] == b'\n' {
             next_b - 1
         } else {
             return Err(invalid_arg("Malformed multipart boundary delimiter"));
@@ -562,14 +563,13 @@ pub fn parse_and_verify_post_object(
         ));
     }
 
-    if let Some(form_bkt) = get_field(&fields, "bucket") {
-        if form_bkt != bucket {
+    if let Some(form_bkt) = get_field(&fields, "bucket")
+        && form_bkt != bucket {
             return Err(S3Error::new(
                 S3ErrorCode::AccessDenied,
                 "Invalid according to Policy: Policy Condition failed: bucket mismatch",
             ));
         }
-    }
 
     if let Some(conds) = parsed_policy {
         let mut covered_fields: HashSet<String> = HashSet::new();
@@ -680,14 +680,13 @@ pub fn parse_and_verify_post_object(
     }
 
     // Extract SystemMeta & UserMeta
-    if let Some(sc) = get_field(&fields, "x-amz-storage-class") {
-        if sc.trim() != "STANDARD" {
+    if let Some(sc) = get_field(&fields, "x-amz-storage-class")
+        && sc.trim() != "STANDARD" {
             return Err(S3Error::new(
                 S3ErrorCode::InvalidStorageClass,
                 "The storage class you specified is not valid",
             ));
         }
-    }
     let sys_meta = SystemMeta {
         content_type: get_field(&fields, "content-type")
             .filter(|s| !s.is_empty())

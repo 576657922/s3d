@@ -1,0 +1,74 @@
+{
+  "generated_at_epoch_s": 1794471772,
+  "per_target_budget_secs": 3605,
+  "wall_clock_secs": 3605.002346417,
+  "targets": [
+    {
+      "target": "fuzz_auth_header",
+      "duration_secs": 3605.0000745,
+      "total_executions": 2802551812,
+      "execs_per_sec": 777406.8665972783,
+      "crashes": 0,
+      "passed": true
+    },
+    {
+      "target": "fuzz_canonical_request",
+      "duration_secs": 3605.001659916,
+      "total_executions": 354297858,
+      "execs_per_sec": 98279.52700811114,
+      "crashes": 0,
+      "passed": true
+    },
+    {
+      "target": "fuzz_aws_chunked",
+      "duration_secs": 3605.000251875,
+      "total_executions": 2196935170,
+      "execs_per_sec": 609413.319418591,
+      "crashes": 0,
+      "passed": true
+    },
+    {
+      "target": "fuzz_xml_requests",
+      "duration_secs": 3605.001907,
+      "total_executions": 66789385,
+      "execs_per_sec": 18526.865372889803,
+      "crashes": 0,
+      "passed": true
+    },
+    {
+      "target": "fuzz_range_header",
+      "duration_secs": 3605.00030075,
+      "total_executions": 2971789316,
+      "execs_per_sec": 824352.0299795081,
+      "crashes": 0,
+      "passed": true
+    },
+    {
+      "target": "fuzz_continuation_token",
+      "duration_secs": 3605.000005416,
+      "total_executions": 1623544066,
+      "execs_per_sec": 450358.96353976586,
+      "crashes": 0,
+      "passed": true
+    },
+    {
+      "target": "fuzz_post_policy",
+      "duration_secs": 3605.000504,
+      "total_executions": 360845058,
+      "execs_per_sec": 100095.70251089208,
+      "crashes": 0,
+      "passed": true
+    },
+    {
+      "target": "fuzz_wal_ckpt_decode",
+      "duration_secs": 3605.000325125,
+      "total_executions": 1471941890,
+      "execs_per_sec": 408305.61920933024,
+      "crashes": 0,
+      "passed": true
+    }
+  ],
+  "total_executions": 11848694555,
+  "total_crashes": 0,
+  "all_passed": true
+}

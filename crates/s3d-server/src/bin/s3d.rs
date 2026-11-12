@@ -151,7 +151,7 @@ async fn main() -> ExitCode {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("error: failed to open data_dir {}: {e}", data_dir.display());
-                    return ExitCode::from(2);
+                    return ExitCode::from(1);
                 }
             };
             let report = run_fsck(disk);
@@ -160,7 +160,7 @@ async fn main() -> ExitCode {
             if report.errors.is_empty() && report.status == "ok" {
                 ExitCode::SUCCESS
             } else {
-                ExitCode::from(2)
+                ExitCode::from(1)
             }
         }
         Commands::Compact {
