@@ -274,6 +274,8 @@ def main() -> int:
         tests = manifest["tests"]
         if sel == "M0":
             picked = [t["nodeid"] for t in tests if t["domain"] in ("bucket", "object_core")]
+        elif sel == "M2":
+            picked = [t["nodeid"] for t in tests if t["tier"] in ("P0", "P1")]
         elif sel in ("P0", "P1", "P2"):
             picked = [t["nodeid"] for t in tests if t["tier"] == sel]
         elif sel == "ALL":

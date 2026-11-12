@@ -165,13 +165,14 @@ where
             }
             Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
             accepted = s3_listener.accept() => {
-                let (stream, _) = match accepted {
+                let (stream, peer_addr) = match accepted {
                     Ok(pair) => pair,
                     Err(e) => {
                         warn!(?e, "accept error on S3 listener");
                         continue;
                     }
                 };
+                let peer_ip = Some(peer_addr.ip());
                 let _ = stream.set_nodelay(true);
 
                 match Arc::clone(&conn_sem).try_acquire_owned() {
@@ -186,7 +187,7 @@ where
                             let svc = service_fn(move |req: Request<Incoming>| {
                                 let st_req = Arc::clone(&st_svc);
                                 async move {
-                                    Ok::<_, Infallible>(handle_s3_request(st_req, req).await)
+                                    Ok::<_, Infallible>(handle_s3_request(st_req, req, peer_ip).await)
                                 }
                             });
                             let conn = http1::Builder::new()

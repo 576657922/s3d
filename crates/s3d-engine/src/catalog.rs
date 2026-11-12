@@ -7,9 +7,10 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use s3d_disk::{Disk, DiskFile};
 use s3d_types::{
-    AccessControlPolicy, AsyncByteReader, ChecksumAlgorithm, ChecksumState, ChecksumType,
-    CompleteMultipartUploadResp, ObjectOwnership, OwnerInfo, S3Error, S3ErrorCode, StoreResult,
-    SystemMeta, VersioningStatus,
+    AccessControlPolicy, AsyncByteReader, BucketAuthView, BucketPolicyDoc, ChecksumAlgorithm,
+    ChecksumState, ChecksumType, CompleteMultipartUploadResp, CorsConfiguration, ObjectOwnership,
+    OwnerInfo, PublicAccessBlockConfig, S3Error, S3ErrorCode, StoreResult, SystemMeta,
+    VersioningStatus,
 };
 use tracing::error;
 
@@ -80,6 +81,7 @@ pub struct ObjectVersionEntry {
     pub user_meta: Vec<(String, String)>,
     pub owner: OwnerInfo,
     pub acl: AccessControlPolicy,
+    pub tags: BTreeMap<String, String>,
     pub last_modified_ms: i64,
     pub extents: Arc<[Extent]>,
     pub parts: Option<Arc<[PartBoundaryInfo]>>,
@@ -105,6 +107,7 @@ pub struct MultipartUploadEntry {
     pub initiator: OwnerInfo,
     pub owner: OwnerInfo,
     pub acl: AccessControlPolicy,
+    pub tags: BTreeMap<String, String>,
     pub initiated_ms: i64,
     pub sys_meta: SystemMeta,
     pub user_meta: Vec<(String, String)>,
@@ -121,10 +124,31 @@ pub struct BucketEntry {
     pub region: String,
     pub created_ms: i64,
     pub versioning: VersioningStatus,
-    pub ownership: ObjectOwnership,
+    pub explicit_ownership: Option<ObjectOwnership>,
+    pub tags: BTreeMap<String, String>,
+    pub cors: Option<CorsConfiguration>,
+    pub policy: Option<BucketPolicyDoc>,
+    pub public_access_block: Option<PublicAccessBlockConfig>,
     pub objects: BTreeMap<String, Vec<ObjectVersionEntry>>, // newest-first
     pub uploads: BTreeMap<(String, String), MultipartUploadEntry>, // (key, upload_id)
     pub completed_uploads: BTreeMap<(String, String), (i64, CompleteMultipartUploadResp)>,
+}
+
+impl BucketEntry {
+    pub fn effective_ownership(&self, default_ownership: ObjectOwnership) -> ObjectOwnership {
+        self.explicit_ownership.unwrap_or(default_ownership)
+    }
+
+    pub fn auth_view(&self, default_ownership: ObjectOwnership) -> BucketAuthView<'_> {
+        BucketAuthView {
+            name: &self.name,
+            owner: &self.owner,
+            acl: &self.acl,
+            ownership: self.effective_ownership(default_ownership),
+            policy: self.policy.as_ref(),
+            public_access_block: self.public_access_block.as_ref(),
+        }
+    }
 }
 
 #[derive(Default)]

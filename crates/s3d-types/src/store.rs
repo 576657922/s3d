@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -8,8 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::acl::{AccessControlPolicy, AclSpec};
 use crate::cond::Preconditions;
+use crate::cors::CorsConfiguration;
 use crate::error::StoreResult;
+use crate::policy::{PublicAccessBlockConfig, RequestPolicyContext};
 use crate::range::ByteRangeSpec;
+use crate::tagging::TaggingDirective;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretKey(String);
@@ -50,12 +54,13 @@ pub struct AccountRecord {
     pub secret_key: SecretKey,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CallerContext {
     pub caller: Option<OwnerInfo>,
     pub request_time_ms: i64,
     pub expected_bucket_owner: Option<String>,
     pub is_authenticated: bool,
+    pub policy_ctx: RequestPolicyContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +208,25 @@ pub enum ObjectOwnership {
     BucketOwnerPreferred,
 }
 
+impl ObjectOwnership {
+    pub const fn as_aws_str(self) -> &'static str {
+        match self {
+            Self::BucketOwnerEnforced => "BucketOwnerEnforced",
+            Self::ObjectWriter => "ObjectWriter",
+            Self::BucketOwnerPreferred => "BucketOwnerPreferred",
+        }
+    }
+
+    pub fn from_aws_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "BucketOwnerEnforced" => Some(Self::BucketOwnerEnforced),
+            "ObjectWriter" => Some(Self::ObjectWriter),
+            "BucketOwnerPreferred" => Some(Self::BucketOwnerPreferred),
+            _ => None,
+        }
+    }
+}
+
 // ---- Streaming Body Abstractions ----
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +349,7 @@ pub struct PutObjectReq {
     pub sys_meta: SystemMeta,
     pub user_meta: Vec<(String, String)>,
     pub acl: Option<AclSpec>,
+    pub tags: Option<BTreeMap<String, String>>,
     pub preconditions: Preconditions,
     pub max_bytes_limit: u64,
 }
@@ -364,6 +389,7 @@ pub struct ObjectMetaSnapshot {
     pub user_meta: Vec<(String, String)>,
     pub checksum: Option<ChecksumState>,
     pub parts_count: Option<u32>,
+    pub tags_count: usize,
 }
 
 pub struct GetObjectResp<R> {
@@ -435,6 +461,8 @@ pub struct CopyObjectReq {
     pub sys_meta: SystemMeta,
     pub user_meta: Vec<(String, String)>,
     pub acl: Option<AclSpec>,
+    pub tagging_directive: TaggingDirective,
+    pub tags: Option<BTreeMap<String, String>>,
     pub src_preconditions: Preconditions,
     pub dst_preconditions: Preconditions,
 }
@@ -612,6 +640,7 @@ pub struct CreateMultipartUploadReq {
     pub sys_meta: SystemMeta,
     pub user_meta: Vec<(String, String)>,
     pub acl: Option<AclSpec>,
+    pub tags: Option<BTreeMap<String, String>>,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: Option<ChecksumType>,
 }
@@ -834,6 +863,66 @@ pub struct PutObjectAclReq {
     pub acl: AclSpec,
 }
 
+// ---- M2 OwnershipControls, Tagging, CORS, Policy & PublicAccessBlock DTOs ----
+
+#[derive(Debug, Clone)]
+pub struct PutBucketOwnershipControlsReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub ownership: ObjectOwnership,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutBucketTaggingReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectTaggingRef {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetObjectTaggingResp {
+    pub version_id: Option<String>,
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutObjectTaggingReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutBucketCorsReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub cors: CorsConfiguration,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutBucketPolicyReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub policy_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutPublicAccessBlockReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub config: PublicAccessBlockConfig,
+}
+
 // ---- Core ObjectStore Trait ----
 
 pub trait ObjectStore: Send + Sync + 'static {
@@ -885,6 +974,97 @@ pub trait ObjectStore: Send + Sync + 'static {
         &self,
         req: PutObjectAclReq,
     ) -> impl Future<Output = StoreResult<Option<String>>> + Send;
+
+    fn get_bucket_ownership_controls(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<ObjectOwnership>> + Send;
+
+    fn put_bucket_ownership_controls(
+        &self,
+        req: PutBucketOwnershipControlsReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn delete_bucket_ownership_controls(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_bucket_tagging(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<BTreeMap<String, String>>> + Send;
+
+    fn put_bucket_tagging(
+        &self,
+        req: PutBucketTaggingReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn delete_bucket_tagging(&self, req: BucketRef) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_object_tagging(
+        &self,
+        req: ObjectTaggingRef,
+    ) -> impl Future<Output = StoreResult<GetObjectTaggingResp>> + Send;
+
+    fn put_object_tagging(
+        &self,
+        req: PutObjectTaggingReq,
+    ) -> impl Future<Output = StoreResult<Option<String>>> + Send;
+
+    fn delete_object_tagging(
+        &self,
+        req: ObjectTaggingRef,
+    ) -> impl Future<Output = StoreResult<Option<String>>> + Send;
+
+    fn get_bucket_cors(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<CorsConfiguration>> + Send;
+
+    fn put_bucket_cors(
+        &self,
+        req: PutBucketCorsReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn delete_bucket_cors(&self, req: BucketRef) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn lookup_bucket_cors_unauth(
+        &self,
+        bucket: &str,
+    ) -> impl Future<Output = StoreResult<Option<CorsConfiguration>>> + Send;
+
+    fn get_bucket_policy(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<String>> + Send;
+
+    fn put_bucket_policy(
+        &self,
+        req: PutBucketPolicyReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn delete_bucket_policy(&self, req: BucketRef) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_bucket_policy_status(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<bool>> + Send;
+
+    fn get_public_access_block(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<PublicAccessBlockConfig>> + Send;
+
+    fn put_public_access_block(
+        &self,
+        req: PutPublicAccessBlockReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn delete_public_access_block(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
 
     fn put_object<S: VerifiedBodyStream>(
         &self,

@@ -1,13 +1,19 @@
 pub mod acl;
 pub mod cond;
+pub mod cors;
 pub mod error;
+pub mod policy;
 pub mod range;
 pub mod store;
+pub mod tagging;
 pub mod validation;
 
 pub use acl::*;
 pub use cond::*;
+pub use cors::*;
 pub use error::*;
+pub use policy::*;
 pub use range::*;
 pub use store::*;
+pub use tagging::*;
 pub use validation::*;

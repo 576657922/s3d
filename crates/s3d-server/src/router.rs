@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,19 +12,16 @@ use s3d_proto::*;
 use s3d_types::*;
 use tracing::info;
 
-use crate::body::{drain_empty_or_ignore, HyperVerifiedBodyStream, S3ResponseBody};
+use crate::body::{
+    collect_raw_incoming_bounded, drain_empty_or_ignore, HyperVerifiedBodyStream,
+    PreVerifiedBytesStream, S3ResponseBody,
+};
 use crate::config::ServerConfig;
 use crate::metrics::ServerMetrics;
 
 const MAX_HEADER_SECTION_BYTES: usize = 8192; // PR-19
 
 const UNIMPLEMENTED_BUCKET_SUBRESOURCES: &[&str] = &[
-    "policy",
-    "policyStatus",
-    "publicAccessBlock",
-    "ownershipControls",
-    "tagging",
-    "cors",
     "lifecycle",
     "encryption",
     "object-lock",
@@ -40,7 +38,6 @@ const UNIMPLEMENTED_BUCKET_SUBRESOURCES: &[&str] = &[
 ];
 
 const UNIMPLEMENTED_OBJECT_SUBRESOURCES: &[&str] = &[
-    "tagging",
     "retention",
     "legal-hold",
     "select",
@@ -58,6 +55,7 @@ pub struct AppState<S: ObjectStore> {
 pub async fn handle_s3_request<S: ObjectStore>(
     state: Arc<AppState<S>>,
     req: Request<Incoming>,
+    peer_ip: Option<IpAddr>,
 ) -> Response<S3ResponseBody<S::Reader>> {
     let start = Instant::now();
     let (request_id, host_id) = generate_request_ids();
@@ -69,6 +67,19 @@ pub async fn handle_s3_request<S: ObjectStore>(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
+    let origin_hdr = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ac_req_method_hdr = req
+        .headers()
+        .get("access-control-request-method")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let mut op_name: &'static str = "Unknown";
     let mut bucket_log: Option<String> = None;
     let mut key_log: Option<String> = None;
@@ -77,6 +88,7 @@ pub async fn handle_s3_request<S: ObjectStore>(
     let result = dispatch_inner(
         &state,
         req,
+        peer_ip,
         &mut op_name,
         &mut bucket_log,
         &mut key_log,
@@ -84,13 +96,26 @@ pub async fn handle_s3_request<S: ObjectStore>(
     )
     .await;
 
-    let resp = match result {
+    let mut resp = match result {
         Ok(mut r) => {
             inject_common_headers(r.headers_mut(), &request_id, &host_id);
             r
         }
         Err(err) => build_error_response(err, is_head, &request_id, &host_id),
     };
+
+    if method != Method::OPTIONS {
+        if let (Some(origin), Some(bkt)) = (&origin_hdr, &bucket_log) {
+            if let Ok(Some(cors)) = state.store.lookup_bucket_cors_unauth(bkt).await {
+                let eff_method = ac_req_method_hdr
+                    .as_deref()
+                    .unwrap_or_else(|| method.as_str());
+                if let Some(cors_hdrs) = cors.match_origin_request(origin, eff_method) {
+                    apply_cors_headers(resp.headers_mut(), &cors_hdrs);
+                }
+            }
+        }
+    }
 
     let status = resp.status().as_u16();
     let elapsed_us = start.elapsed().as_micros() as u64;
@@ -115,6 +140,7 @@ pub async fn handle_s3_request<S: ObjectStore>(
 async fn dispatch_inner<S: ObjectStore>(
     state: &AppState<S>,
     req: Request<Incoming>,
+    peer_ip: Option<IpAddr>,
     op_name: &mut &'static str,
     bucket_log: &mut Option<String>,
     key_log: &mut Option<String>,
@@ -163,20 +189,94 @@ async fn dispatch_inner<S: ObjectStore>(
     // 4. Handle CORS Preflight `OPTIONS` before SigV4 (`OPTIONS` is never signed)
     if *method == Method::OPTIONS {
         *op_name = "OptionsPreflight";
-        if !headers.contains_key("origin") {
+        drain_empty_or_ignore(incoming).await;
+        let bkt = match &parsed_uri.target {
+            S3Target::Bucket { bucket } | S3Target::Object { bucket, .. } => bucket.as_str(),
+            S3Target::ServiceRoot => {
+                return Err(S3Error::new(
+                    S3ErrorCode::BadRequest,
+                    "Insufficient information. Bucket target needed.",
+                ));
+            }
+        };
+        let origin = headers
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let req_method = headers
+            .get("access-control-request-method")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (Some(origin), Some(req_method)) = (origin, req_method) else {
             return Err(S3Error::new(
-                S3ErrorCode::InvalidRequest,
+                S3ErrorCode::BadRequest,
                 "Insufficient information. Origin request header needed.",
             ));
+        };
+        if !is_valid_cors_method(&req_method.to_ascii_uppercase()) {
+            return Err(S3Error::new(
+                S3ErrorCode::BadRequest,
+                format!("Invalid Access-Control-Request-Method: {req_method}"),
+            ));
         }
-        return Err(S3Error::new(
-            S3ErrorCode::AccessDenied,
-            "CORSResponse: This CORS request is not allowed.",
-        ));
+
+        let mut req_headers = Vec::new();
+        for hv in headers.get_all("access-control-request-headers") {
+            if let Ok(s) = hv.to_str() {
+                for tok in s.split(',') {
+                    let t = tok.trim();
+                    if !t.is_empty() {
+                        req_headers.push(t.to_string());
+                    }
+                }
+            }
+        }
+
+        let Some(cors) = state.store.lookup_bucket_cors_unauth(bkt).await? else {
+            return Err(S3Error::new(
+                S3ErrorCode::AccessDenied,
+                "CORSResponse: This CORS request is not allowed.",
+            ));
+        };
+        let Some(cors_hdrs) = cors.match_preflight(origin, req_method, &req_headers) else {
+            return Err(S3Error::new(
+                S3ErrorCode::AccessDenied,
+                "CORSResponse: This CORS request is not allowed.",
+            ));
+        };
+
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Length", "0")
+            .body(S3ResponseBody::empty())
+            .unwrap();
+        apply_cors_headers(resp.headers_mut(), &cors_hdrs);
+        return Ok(resp);
+    }
+
+    let now_ms = now_epoch_ms();
+
+    // 4b. HTML Form `PostObject` (`POST /{bucket}` without subresource query) (`FR-48` / P1)
+    if let S3Target::Bucket { bucket } = &parsed_uri.target {
+        if *method == Method::POST && parsed_uri.query.is_empty() {
+            *op_name = "PostObject";
+            return handle_post_object(
+                state,
+                headers,
+                incoming,
+                bucket.clone(),
+                peer_ip,
+                now_ms,
+                key_log,
+                caller_log,
+            )
+            .await;
+        }
     }
 
     // 5. SigV4 / Presigned / Anonymous authentication (`PR-6` ~ `PR-12`)
-    let now_ms = now_epoch_ms();
     let auth_out = state
         .auth
         .verify_request(method, &parsed_uri, headers, now_ms)?;
@@ -193,11 +293,13 @@ async fn dispatch_inner<S: ObjectStore>(
         })
         .transpose()?;
 
+    let policy_ctx = build_request_policy_context(headers, peer_ip);
     let ctx = CallerContext {
         caller: auth_out.caller.clone(),
         request_time_ms: now_ms,
         expected_bucket_owner,
         is_authenticated: auth_out.is_authenticated,
+        policy_ctx,
     };
 
     // 6. Dispatch by `(S3Target, Method, subresource)`
@@ -313,6 +415,334 @@ async fn handle_bucket_target<S: ObjectStore>(
                 format!("Bucket subresource '?{sub}' is not implemented yet."),
             )
             .with_bucket(&bucket));
+        }
+    }
+
+    if has_query_key(query, "ownershipControls") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketOwnershipControls";
+                drain_empty_or_ignore(incoming).await;
+                let own = state
+                    .store
+                    .get_bucket_ownership_controls(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_ownership_controls_xml(own),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketOwnershipControls";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let ownership = parse_ownership_controls_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_bucket_ownership_controls(PutBucketOwnershipControlsReq {
+                        ctx,
+                        bucket,
+                        ownership,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeleteBucketOwnershipControls";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .delete_bucket_ownership_controls(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "tagging") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketTagging";
+                drain_empty_or_ignore(incoming).await;
+                let tags = state
+                    .store
+                    .get_bucket_tagging(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(StatusCode::OK, render_tagging_xml(&tags)));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketTagging";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    128 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let tags = parse_tagging_xml(&raw_xml, MAX_BUCKET_TAGS)?;
+                state
+                    .store
+                    .put_bucket_tagging(PutBucketTaggingReq { ctx, bucket, tags })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeleteBucketTagging";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .delete_bucket_tagging(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "cors") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketCors";
+                drain_empty_or_ignore(incoming).await;
+                let cors = state
+                    .store
+                    .get_bucket_cors(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(StatusCode::OK, render_cors_xml(&cors)));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketCors";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    128 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let cors = parse_cors_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_bucket_cors(PutBucketCorsReq { ctx, bucket, cors })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeleteBucketCors";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .delete_bucket_cors(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "policyStatus") {
+        if *method != Method::GET {
+            return Err(S3Error::new(
+                S3ErrorCode::MethodNotAllowed,
+                "Method not allowed",
+            ));
+        }
+        *op_name = "GetBucketPolicyStatus";
+        drain_empty_or_ignore(incoming).await;
+        let is_public = state
+            .store
+            .get_bucket_policy_status(BucketRef { ctx, bucket })
+            .await?;
+        return Ok(xml_response(
+            StatusCode::OK,
+            render_policy_status_xml(is_public),
+        ));
+    }
+
+    if has_query_key(query, "policy") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketPolicy";
+                drain_empty_or_ignore(incoming).await;
+                let policy_json = state
+                    .store
+                    .get_bucket_policy(BucketRef { ctx, bucket })
+                    .await?;
+                let len = policy_json.len().to_string();
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", len)
+                    .body(S3ResponseBody::from_bytes(Bytes::from(policy_json)))
+                    .unwrap());
+            }
+            Method::PUT => {
+                *op_name = "PutBucketPolicy";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_body, _) = stream.collect_bounded().await?;
+                let policy_json = std::str::from_utf8(&raw_body)
+                    .map_err(|_| {
+                        S3Error::new(
+                            S3ErrorCode::MalformedPolicy,
+                            "Bucket policy must be valid UTF-8 JSON",
+                        )
+                    })?
+                    .to_string();
+                state
+                    .store
+                    .put_bucket_policy(PutBucketPolicyReq {
+                        ctx,
+                        bucket,
+                        policy_json,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeleteBucketPolicy";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .delete_bucket_policy(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "publicAccessBlock") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetPublicAccessBlock";
+                drain_empty_or_ignore(incoming).await;
+                let pab = state
+                    .store
+                    .get_public_access_block(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_public_access_block_xml(&pab),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutPublicAccessBlock";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let config = parse_public_access_block_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_public_access_block(PutPublicAccessBlockReq {
+                        ctx,
+                        bucket,
+                        config,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeletePublicAccessBlock";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .delete_public_access_block(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
         }
     }
 
@@ -766,7 +1196,92 @@ async fn handle_object_target<S: ObjectStore>(
         }
     }
 
-    // 0. `GET/PUT /{b}/{k}?acl` (`PR-32`)
+    // 0a. `GET/PUT/DELETE /{b}/{k}?tagging`
+    if has_query_key(query, "tagging") {
+        let version_id = get_query_param(query, "versionId").map(str::to_string);
+        match *method {
+            Method::GET => {
+                *op_name = "GetObjectTagging";
+                drain_empty_or_ignore(incoming).await;
+                let resp = state
+                    .store
+                    .get_object_tagging(ObjectTaggingRef {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                    })
+                    .await?;
+                let xml = render_tagging_xml(&resp.tags);
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/xml")
+                    .header("Content-Length", xml.len().to_string());
+                if let Some(vid) = &resp.version_id {
+                    builder = builder.header("x-amz-version-id", vid);
+                }
+                return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
+            }
+            Method::PUT => {
+                *op_name = "PutObjectTagging";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    128 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let tags = parse_tagging_xml(&raw_xml, MAX_OBJECT_TAGS)?;
+                let vid_out = state
+                    .store
+                    .put_object_tagging(PutObjectTaggingReq {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                        tags,
+                    })
+                    .await?;
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0");
+                if let Some(vid) = &vid_out {
+                    builder = builder.header("x-amz-version-id", vid);
+                }
+                return Ok(builder.body(S3ResponseBody::empty()).unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeleteObjectTagging";
+                drain_empty_or_ignore(incoming).await;
+                let vid_out = state
+                    .store
+                    .delete_object_tagging(ObjectTaggingRef {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                    })
+                    .await?;
+                let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
+                if let Some(vid) = &vid_out {
+                    builder = builder.header("x-amz-version-id", vid);
+                }
+                return Ok(builder.body(S3ResponseBody::empty()).unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "The specified method is not allowed against this resource.",
+                ));
+            }
+        }
+    }
+
+    // 0b. `GET/PUT /{b}/{k}?acl` (`PR-32`)
     if has_query_key(query, "acl") {
         let version_id = get_query_param(query, "versionId").map(str::to_string);
         match *method {
@@ -918,6 +1433,7 @@ async fn handle_object_target<S: ObjectStore>(
 
         let sys_meta = extract_system_meta(headers);
         let user_meta = extract_user_meta(headers)?;
+        let tags = parse_optional_object_tagging_header(headers)?;
         let checksum_algorithm = match headers.get("x-amz-checksum-algorithm") {
             Some(hv) => {
                 let s = hv
@@ -967,9 +1483,10 @@ async fn handle_object_target<S: ObjectStore>(
                 key,
                 sys_meta,
                 user_meta,
+                acl,
+                tags,
                 checksum_algorithm,
                 checksum_type,
-                acl,
             })
             .await?;
 
@@ -1288,6 +1805,8 @@ async fn handle_object_target<S: ObjectStore>(
                         ))
                     }
                 };
+                let tagging_directive = parse_tagging_directive_header(headers)?;
+                let tags = parse_optional_object_tagging_header(headers)?;
                 let sys_meta = extract_system_meta(headers);
                 let user_meta = extract_user_meta(headers)?;
                 let src_preconditions = extract_copy_source_preconditions(headers)?;
@@ -1305,9 +1824,11 @@ async fn handle_object_target<S: ObjectStore>(
                         replace_metadata,
                         sys_meta,
                         user_meta,
+                        acl,
+                        tagging_directive,
+                        tags,
                         src_preconditions,
                         dst_preconditions,
-                        acl,
                     })
                     .await?;
 
@@ -1350,6 +1871,7 @@ async fn handle_object_target<S: ObjectStore>(
             let header_csum = parse_header_checksum(headers)?;
             let sys_meta = extract_system_meta(headers);
             let user_meta = extract_user_meta(headers)?;
+            let tags = parse_optional_object_tagging_header(headers)?;
             let preconditions = extract_write_preconditions(headers);
             let max_put = MAX_SINGLE_PUT_BYTES.min(state.cfg.max_object_size);
 
@@ -1380,8 +1902,9 @@ async fn handle_object_target<S: ObjectStore>(
                         key,
                         sys_meta,
                         user_meta,
-                        preconditions,
                         acl,
+                        tags,
+                        preconditions,
                         max_bytes_limit: max_put,
                     },
                     stream,
@@ -1598,6 +2121,9 @@ fn build_object_read_response<R>(
     }
     if let Some(pc) = meta.parts_count {
         insert_header_latin1_safe(hdrs, "x-amz-mp-parts-count", &pc.to_string());
+    }
+    if meta.tags_count > 0 {
+        insert_header_latin1_safe(hdrs, "x-amz-tagging-count", &meta.tags_count.to_string());
     }
     if let Some(csum) = &meta.checksum {
         insert_header_latin1_safe(hdrs, csum.algorithm.header_name(), &csum.value_b64);
@@ -2276,4 +2802,220 @@ fn parse_copy_source(raw: &str) -> StoreResult<(String, String, Option<String>)>
         }
     }
     Ok((src_bucket, src_key, src_vid))
+}
+
+fn apply_cors_headers(hdrs: &mut HeaderMap, cors: &CorsResponseHeaders) {
+    insert_header_latin1_safe(hdrs, "access-control-allow-origin", &cors.allow_origin);
+    insert_header_latin1_safe(hdrs, "access-control-allow-methods", &cors.allow_methods);
+    if cors.allow_credentials {
+        hdrs.insert(
+            "access-control-allow-credentials",
+            HeaderValue::from_static("true"),
+        );
+    }
+    if let Some(ah) = &cors.allow_headers {
+        insert_header_latin1_safe(hdrs, "access-control-allow-headers", ah);
+    }
+    if let Some(eh) = &cors.expose_headers {
+        insert_header_latin1_safe(hdrs, "access-control-expose-headers", eh);
+    }
+    if let Some(age) = cors.max_age_seconds {
+        insert_header_latin1_safe(hdrs, "access-control-max-age", &age.to_string());
+    }
+    hdrs.insert("vary", HeaderValue::from_static("Origin"));
+}
+
+fn parse_optional_object_tagging_header(
+    headers: &HeaderMap,
+) -> StoreResult<Option<std::collections::BTreeMap<String, String>>> {
+    let Some(hv) = headers.get("x-amz-tagging") else {
+        return Ok(None);
+    };
+    let s = hv
+        .to_str()
+        .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid x-amz-tagging header"))?;
+    Ok(Some(parse_tagging_header(s, MAX_OBJECT_TAGS)?))
+}
+
+fn parse_tagging_directive_header(headers: &HeaderMap) -> StoreResult<TaggingDirective> {
+    match headers
+        .get("x-amz-tagging-directive")
+        .and_then(|v| v.to_str().ok())
+    {
+        None | Some("COPY") => Ok(TaggingDirective::Copy),
+        Some("REPLACE") => Ok(TaggingDirective::Replace),
+        Some(_) => Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "Unknown tagging directive.",
+        )),
+    }
+}
+
+fn build_request_policy_context(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+) -> RequestPolicyContext {
+    let opt_hdr = |name: &str| -> Option<String> {
+        headers
+            .get(name)
+            .map(decode_header_value_str)
+            .map(|s| s.trim().to_string())
+    };
+    let x_amz_copy_source = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| parse_copy_source(raw).ok())
+        .map(|(b, k, _)| format!("{b}/{k}"));
+
+    RequestPolicyContext {
+        source_ip: peer_ip,
+        referer: opt_hdr("referer"),
+        x_amz_acl: opt_hdr("x-amz-acl"),
+        x_amz_grant_full_control: opt_hdr("x-amz-grant-full-control"),
+        x_amz_grant_read: opt_hdr("x-amz-grant-read"),
+        x_amz_grant_write: opt_hdr("x-amz-grant-write"),
+        x_amz_grant_read_acp: opt_hdr("x-amz-grant-read-acp"),
+        x_amz_grant_write_acp: opt_hdr("x-amz-grant-write-acp"),
+        x_amz_copy_source,
+        x_amz_metadata_directive: opt_hdr("x-amz-metadata-directive"),
+        x_amz_server_side_encryption: opt_hdr("x-amz-server-side-encryption"),
+        x_amz_sse_customer_algorithm: opt_hdr("x-amz-server-side-encryption-customer-algorithm"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_post_object<S: ObjectStore>(
+    state: &AppState<S>,
+    headers: &HeaderMap,
+    incoming: Incoming,
+    bucket: String,
+    peer_ip: Option<IpAddr>,
+    now_ms: i64,
+    key_log: &mut Option<String>,
+    caller_log: &mut Option<String>,
+) -> StoreResult<Response<S3ResponseBody<S::Reader>>> {
+    let ct_str = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let max_put = MAX_SINGLE_PUT_BYTES.min(state.cfg.max_object_size);
+    let max_form_bytes = max_put.saturating_add(2 * 1024 * 1024);
+    let raw_body = collect_raw_incoming_bounded(incoming, max_form_bytes).await?;
+
+    let parsed =
+        parse_and_verify_post_object(&state.auth, &bucket, ct_str, raw_body, now_ms)?;
+    *key_log = Some(parsed.key.clone());
+    if let Some(c) = &parsed.caller {
+        *caller_log = Some(c.user_id.clone());
+    }
+
+    let referer = headers
+        .get("referer")
+        .map(decode_header_value_str)
+        .map(|s| s.trim().to_string());
+    let policy_ctx = RequestPolicyContext {
+        source_ip: peer_ip,
+        referer,
+        x_amz_acl: parsed.x_amz_acl_raw.clone(),
+        ..Default::default()
+    };
+    let ctx = CallerContext {
+        caller: parsed.caller,
+        request_time_ms: now_ms,
+        expected_bucket_owner: None,
+        is_authenticated: parsed.is_authenticated,
+        policy_ctx,
+    };
+
+    let key = parsed.key;
+    let stream = PreVerifiedBytesStream::new(parsed.file_bytes, parsed.expected_checksum.clone());
+    let put_resp = state
+        .store
+        .put_object(
+            PutObjectReq {
+                ctx,
+                bucket: bucket.clone(),
+                key: key.clone(),
+                sys_meta: parsed.sys_meta,
+                user_meta: parsed.user_meta,
+                acl: parsed.acl,
+                tags: parsed.tags,
+                preconditions: Preconditions::default(),
+                max_bytes_limit: max_put,
+            },
+            stream,
+        )
+        .await?;
+
+    let host_str = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let location = format!(
+        "http://{host_str}/{}/{}",
+        aws_uri_encode(&bucket, true),
+        aws_uri_encode(&key, false)
+    );
+
+    if let Some(redir) = parsed.success_redirect {
+        let sep = if redir.contains('?') { '&' } else { '?' };
+        let redir_loc = format!(
+            "{redir}{sep}bucket={}&key={}&etag={}",
+            aws_uri_encode(&bucket, true),
+            aws_uri_encode(&key, true),
+            aws_uri_encode(&put_resp.etag, true),
+        );
+        let mut builder = Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header("Location", redir_loc)
+            .header("ETag", &put_resp.etag)
+            .header("Content-Length", "0");
+        if let Some(vid) = &put_resp.version_id {
+            if vid != "null" {
+                builder = builder.header("x-amz-version-id", vid);
+            }
+        }
+        return Ok(builder.body(S3ResponseBody::empty()).unwrap());
+    }
+
+    if parsed.success_status == 201 {
+        let xml = render_post_response_xml(&location, &bucket, &key, &put_resp.etag);
+        let mut builder = Response::builder()
+            .status(StatusCode::CREATED)
+            .header("Content-Type", "application/xml")
+            .header("Content-Length", xml.len().to_string())
+            .header("Location", &location)
+            .header("ETag", &put_resp.etag);
+        if let Some(vid) = &put_resp.version_id {
+            if vid != "null" {
+                builder = builder.header("x-amz-version-id", vid);
+            }
+        }
+        if put_resp.checksum.client_requested {
+            builder = builder.header(
+                put_resp.checksum.algorithm.header_name(),
+                &put_resp.checksum.value_b64,
+            );
+        }
+        return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
+    }
+
+    let status = StatusCode::from_u16(parsed.success_status).unwrap_or(StatusCode::NO_CONTENT);
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Location", &location)
+        .header("ETag", &put_resp.etag)
+        .header("Content-Length", "0");
+    if let Some(vid) = &put_resp.version_id {
+        if vid != "null" {
+            builder = builder.header("x-amz-version-id", vid);
+        }
+    }
+    if put_resp.checksum.client_requested {
+        builder = builder.header(
+            put_resp.checksum.algorithm.header_name(),
+            &put_resp.checksum.value_b64,
+        );
+    }
+    Ok(builder.body(S3ResponseBody::empty()).unwrap())
 }

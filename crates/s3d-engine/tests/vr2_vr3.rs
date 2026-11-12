@@ -34,6 +34,7 @@ fn test_caller(user_idx: u8, time_ms: i64) -> CallerContext {
             request_time_ms: time_ms,
             expected_bucket_owner: None,
             is_authenticated: true,
+            policy_ctx: RequestPolicyContext::default(),
         },
         1 => CallerContext {
             caller: Some(OwnerInfo {
@@ -44,13 +45,42 @@ fn test_caller(user_idx: u8, time_ms: i64) -> CallerContext {
             request_time_ms: time_ms,
             expected_bucket_owner: None,
             is_authenticated: true,
+            policy_ctx: RequestPolicyContext::default(),
         },
         _ => CallerContext {
             caller: None,
             request_time_ms: time_ms,
             expected_bucket_owner: None,
             is_authenticated: false,
+            policy_ctx: RequestPolicyContext::default(),
         },
+    }
+}
+
+fn sample_tags(tag_slot: Option<u8>) -> Option<BTreeMap<String, String>> {
+    match tag_slot {
+        None => None,
+        Some(0) => Some(BTreeMap::new()),
+        Some(1) => Some(BTreeMap::from([("env".to_string(), "prod".to_string())])),
+        _ => Some(BTreeMap::from([
+            ("a".to_string(), "".to_string()),
+            ("env".to_string(), "stage".to_string()),
+        ])),
+    }
+}
+
+fn sample_policy_json(bucket: &str, variant: u8) -> String {
+    match variant {
+        0 => format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::{bucket}","arn:aws:s3:::{bucket}/*"]}}]}}"#
+        ),
+        1 => format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"fedcba9876543210"}},"Action":"s3:*","Resource":["arn:aws:s3:::{bucket}","arn:aws:s3:::{bucket}/*"]}}]}}"#
+        ),
+        2 => format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
+        ),
+        _ => r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(), // invalid (empty statement)
     }
 }
 
@@ -112,6 +142,7 @@ enum ModelOp {
         bad_digest: bool,
         if_none_match_star: bool,
         canned_acl: Option<u8>,
+        tag_slot: Option<u8>,
     },
     Get {
         u: u8,
@@ -155,6 +186,8 @@ enum ModelOp {
         dk: u8,
         replace_meta: bool,
         canned_acl: Option<u8>,
+        replace_tags: bool,
+        tag_slot: Option<u8>,
     },
     ListV1 {
         u: u8,
@@ -183,6 +216,7 @@ enum ModelOp {
         k: u8,
         csum_idx: u8,
         full_obj_csum: bool,
+        tag_slot: Option<u8>,
     },
     MpuPart {
         u: u8,
@@ -235,7 +269,47 @@ enum ModelOp {
         ver_slot: Option<u8>,
         put_canned: Option<u8>,
     },
+    BucketOwnership {
+        u: u8,
+        b: u8,
+        action: u8, // 0=get, 1=delete, 2..=4=put
+    },
+    BucketTagging {
+        u: u8,
+        b: u8,
+        action: u8, // 0=get, 1=delete, 2..=4=put
+    },
+    ObjectTagging {
+        u: u8,
+        b: u8,
+        k: u8,
+        ver_slot: Option<u8>,
+        action: u8, // 0=get, 1=delete, 2..=4=put
+    },
+    BucketCors {
+        u: u8,
+        b: u8,
+        action: u8, // 0=get, 1=delete, 2=put
+    },
+    BucketPolicy {
+        u: u8,
+        b: u8,
+        action: u8, // 0=get, 1=delete, 2=status, 3..=6=put(variant)
+    },
+    PublicAccessBlock {
+        u: u8,
+        b: u8,
+        action: u8, // 0=get, 1=delete, 2=put
+        bits: u8,
+    },
     Compact,
+}
+
+fn opt_tag_slot() -> impl Strategy<Value = Option<u8>> {
+    prop_oneof![
+        3 => Just(None),
+        2 => (0u8..3).prop_map(Some),
+    ]
 }
 
 fn user_strategy() -> impl Strategy<Value = u8> {
@@ -293,9 +367,21 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
             prop::bool::weighted(0.1),
             prop::bool::weighted(0.2),
             opt_canned_strategy(),
+            opt_tag_slot(),
         )
             .prop_map(
-                |(u, b, k, size, seed, csum_idx, bad_digest, if_none_match_star, canned_acl)| {
+                |(
+                    u,
+                    b,
+                    k,
+                    size,
+                    seed,
+                    csum_idx,
+                    bad_digest,
+                    if_none_match_star,
+                    canned_acl,
+                    tag_slot,
+                )| {
                     ModelOp::Put {
                         u,
                         b,
@@ -306,8 +392,9 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                         bad_digest,
                         if_none_match_star,
                         canned_acl,
+                        tag_slot,
                     }
-                }
+                },
             ),
         4 => (
             user_strategy(),
@@ -364,9 +451,11 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
             0u8..5,
             any::<bool>(),
             opt_canned_strategy(),
+            any::<bool>(),
+            opt_tag_slot(),
         )
             .prop_map(
-                |(u, sb, sk, ver_slot, db, dk, replace_meta, canned_acl)| ModelOp::Copy {
+                |(
                     u,
                     sb,
                     sk,
@@ -375,7 +464,20 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                     dk,
                     replace_meta,
                     canned_acl,
-                }
+                    replace_tags,
+                    tag_slot,
+                )| ModelOp::Copy {
+                    u,
+                    sb,
+                    sk,
+                    ver_slot,
+                    db,
+                    dk,
+                    replace_meta,
+                    canned_acl,
+                    replace_tags,
+                    tag_slot,
+                },
             ),
         2 => (user_strategy(), 0u8..2, 0u8..4, any::<bool>(), 0usize..=4)
             .prop_map(|(u, b, prefix_idx, delim, max_keys)| ModelOp::ListV1 {
@@ -401,14 +503,24 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                 delim,
                 max_keys,
             }),
-        3 => (user_strategy(), 0u8..2, 0u8..4, 0u8..6, any::<bool>())
-            .prop_map(|(u, b, k, csum_idx, full_obj_csum)| ModelOp::MpuCreate {
-                u,
-                b,
-                k,
-                csum_idx,
-                full_obj_csum,
-            }),
+        3 => (
+            user_strategy(),
+            0u8..2,
+            0u8..4,
+            0u8..6,
+            any::<bool>(),
+            opt_tag_slot(),
+        )
+            .prop_map(
+                |(u, b, k, csum_idx, full_obj_csum, tag_slot)| ModelOp::MpuCreate {
+                    u,
+                    b,
+                    k,
+                    csum_idx,
+                    full_obj_csum,
+                    tag_slot,
+                },
+            ),
         4 => (
             user_strategy(),
             0u8..4,
@@ -482,6 +594,29 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                 k,
                 ver_slot,
                 put_canned,
+            }),
+        2 => (user_strategy(), 0u8..2, 0u8..5)
+            .prop_map(|(u, b, action)| ModelOp::BucketOwnership { u, b, action }),
+        2 => (user_strategy(), 0u8..2, 0u8..5)
+            .prop_map(|(u, b, action)| ModelOp::BucketTagging { u, b, action }),
+        2 => (user_strategy(), 0u8..2, 0u8..4, opt_ver_slot(), 0u8..5)
+            .prop_map(|(u, b, k, ver_slot, action)| ModelOp::ObjectTagging {
+                u,
+                b,
+                k,
+                ver_slot,
+                action,
+            }),
+        2 => (user_strategy(), 0u8..2, 0u8..3)
+            .prop_map(|(u, b, action)| ModelOp::BucketCors { u, b, action }),
+        3 => (user_strategy(), 0u8..2, 0u8..7)
+            .prop_map(|(u, b, action)| ModelOp::BucketPolicy { u, b, action }),
+        2 => (user_strategy(), 0u8..2, 0u8..3, 0u8..16)
+            .prop_map(|(u, b, action, bits)| ModelOp::PublicAccessBlock {
+                u,
+                b,
+                action,
+                bits,
             }),
         1 => Just(ModelOp::Compact),
     ]
@@ -654,6 +789,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 bad_digest,
                 if_none_match_star,
                 canned_acl,
+                tag_slot,
             } => {
                 let payload: Vec<u8> = (0..size).map(|i| seed.wrapping_add(i as u8)).collect();
                 let cond = if if_none_match_star {
@@ -672,6 +808,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     sys_meta: SystemMeta::default(),
                     user_meta: vec![("k".into(), format!("v{seed}"))],
                     acl: canned_acl.map(|i| AclSpec::Canned(CANNED_ACL_POOL[i as usize])),
+                    tags: sample_tags(tag_slot),
                     preconditions: cond,
                     max_bytes_limit: MAX_SINGLE_PUT_BYTES,
                 };
@@ -741,6 +878,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         assert_eq!(ge.meta.content_range, gm.meta.content_range);
                         assert_eq!(ge.meta.checksum, gm.meta.checksum);
                         assert_eq!(ge.meta.parts_count, gm.meta.parts_count);
+                        assert_eq!(ge.meta.tags_count, gm.meta.tags_count);
                         let be = read_all(ge.reader).await.unwrap();
                         let bm = read_all(gm.reader).await.unwrap();
                         assert_eq!(be, bm);
@@ -786,6 +924,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         assert_eq!(he.content_length, hm.content_length);
                         assert_eq!(he.user_meta, hm.user_meta);
                         assert_eq!(he.owner, hm.owner);
+                        assert_eq!(he.tags_count, hm.tags_count);
                     }
                     (Err(ee), Err(em)) => assert_eq!(ee.code, em.code),
                     (l, r) => panic!("Head mismatch: engine={l:?}, model={r:?}"),
@@ -942,10 +1081,18 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 dk,
                 replace_meta,
                 canned_acl,
+                replace_tags,
+                tag_slot,
             } => {
                 let (ev, mv) = ids.pick_ver(ver_slot);
                 let ctx = test_caller(u, clock_ms);
                 let acl = canned_acl.map(|i| AclSpec::Canned(CANNED_ACL_POOL[i as usize]));
+                let tagging_directive = if replace_tags {
+                    TaggingDirective::Replace
+                } else {
+                    TaggingDirective::Copy
+                };
+                let tags = sample_tags(tag_slot);
                 let re = engine
                     .copy_object(CopyObjectReq {
                         ctx: ctx.clone(),
@@ -958,6 +1105,8 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         sys_meta: SystemMeta::default(),
                         user_meta: vec![("copied".into(), "true".into())],
                         acl: acl.clone(),
+                        tagging_directive,
+                        tags: tags.clone(),
                         src_preconditions: Preconditions::default(),
                         dst_preconditions: Preconditions::default(),
                     })
@@ -974,6 +1123,8 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         sys_meta: SystemMeta::default(),
                         user_meta: vec![("copied".into(), "true".into())],
                         acl,
+                        tagging_directive,
+                        tags,
                         src_preconditions: Preconditions::default(),
                         dst_preconditions: Preconditions::default(),
                     })
@@ -1113,6 +1264,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 k,
                 csum_idx,
                 full_obj_csum,
+                tag_slot,
             } => {
                 let alg = CSUM_POOL[csum_idx as usize];
                 let ctype = if full_obj_csum {
@@ -1127,6 +1279,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     sys_meta: SystemMeta::default(),
                     user_meta: vec![("mpu".into(), "yes".into())],
                     acl: None,
+                    tags: sample_tags(tag_slot),
                     checksum_algorithm: alg,
                     checksum_type: ctype,
                 };
@@ -1499,6 +1652,252 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     );
                 }
             }
+            ModelOp::BucketOwnership { u, b, action } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match action {
+                    0 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_ownership_controls(req.clone()).await;
+                        let rm = model.get_bucket_ownership_controls(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    1 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.delete_bucket_ownership_controls(req.clone()).await;
+                        let rm = model.delete_bucket_ownership_controls(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    _ => {
+                        let ownership = match action {
+                            2 => ObjectOwnership::ObjectWriter,
+                            3 => ObjectOwnership::BucketOwnerPreferred,
+                            _ => ObjectOwnership::BucketOwnerEnforced,
+                        };
+                        let req = PutBucketOwnershipControlsReq {
+                            ctx,
+                            bucket,
+                            ownership,
+                        };
+                        let re = engine.put_bucket_ownership_controls(req.clone()).await;
+                        let rm = model.put_bucket_ownership_controls(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
+            ModelOp::BucketTagging { u, b, action } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match action {
+                    0 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_tagging(req.clone()).await;
+                        let rm = model.get_bucket_tagging(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    1 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.delete_bucket_tagging(req.clone()).await;
+                        let rm = model.delete_bucket_tagging(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    _ => {
+                        let tags = sample_tags(Some(action - 2)).unwrap_or_default();
+                        let req = PutBucketTaggingReq { ctx, bucket, tags };
+                        let re = engine.put_bucket_tagging(req.clone()).await;
+                        let rm = model.put_bucket_tagging(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
+            ModelOp::ObjectTagging {
+                u,
+                b,
+                k,
+                ver_slot,
+                action,
+            } => {
+                let (ev, mv) = ids.pick_ver(ver_slot);
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                let key = KEY_POOL[k as usize].to_string();
+                match action {
+                    0 => {
+                        let re = engine
+                            .get_object_tagging(ObjectTaggingRef {
+                                ctx: ctx.clone(),
+                                bucket: bucket.clone(),
+                                key: key.clone(),
+                                version_id: ev,
+                            })
+                            .await;
+                        let rm = model
+                            .get_object_tagging(ObjectTaggingRef {
+                                ctx,
+                                bucket,
+                                key,
+                                version_id: mv,
+                            })
+                            .await;
+                        assert_eq!(
+                            re.map(|r| (r.version_id.is_some(), r.tags))
+                                .map_err(|e| e.code),
+                            rm.map(|r| (r.version_id.is_some(), r.tags))
+                                .map_err(|e| e.code),
+                        );
+                    }
+                    1 => {
+                        let re = engine
+                            .delete_object_tagging(ObjectTaggingRef {
+                                ctx: ctx.clone(),
+                                bucket: bucket.clone(),
+                                key: key.clone(),
+                                version_id: ev,
+                            })
+                            .await;
+                        let rm = model
+                            .delete_object_tagging(ObjectTaggingRef {
+                                ctx,
+                                bucket,
+                                key,
+                                version_id: mv,
+                            })
+                            .await;
+                        assert_eq!(
+                            re.map(|v| v.is_some()).map_err(|e| e.code),
+                            rm.map(|v| v.is_some()).map_err(|e| e.code),
+                        );
+                    }
+                    _ => {
+                        let tags = sample_tags(Some(action - 2)).unwrap_or_default();
+                        let re = engine
+                            .put_object_tagging(PutObjectTaggingReq {
+                                ctx: ctx.clone(),
+                                bucket: bucket.clone(),
+                                key: key.clone(),
+                                version_id: ev,
+                                tags: tags.clone(),
+                            })
+                            .await;
+                        let rm = model
+                            .put_object_tagging(PutObjectTaggingReq {
+                                ctx,
+                                bucket,
+                                key,
+                                version_id: mv,
+                                tags,
+                            })
+                            .await;
+                        assert_eq!(
+                            re.map(|v| v.is_some()).map_err(|e| e.code),
+                            rm.map(|v| v.is_some()).map_err(|e| e.code),
+                        );
+                    }
+                }
+            }
+            ModelOp::BucketCors { u, b, action } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match action {
+                    0 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_cors(req.clone()).await;
+                        let rm = model.get_bucket_cors(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    1 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.delete_bucket_cors(req.clone()).await;
+                        let rm = model.delete_bucket_cors(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    _ => {
+                        let cors = CorsConfiguration {
+                            rules: vec![CorsRule {
+                                id: Some("r1".into()),
+                                allowed_origins: vec!["https://*.example.com".into()],
+                                allowed_methods: vec!["GET".into(), "PUT".into()],
+                                allowed_headers: vec!["*".into()],
+                                expose_headers: vec!["ETag".into()],
+                                max_age_seconds: Some(60),
+                            }],
+                        };
+                        let req = PutBucketCorsReq { ctx, bucket, cors };
+                        let re = engine.put_bucket_cors(req.clone()).await;
+                        let rm = model.put_bucket_cors(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
+            ModelOp::BucketPolicy { u, b, action } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match action {
+                    0 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_policy(req.clone()).await;
+                        let rm = model.get_bucket_policy(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    1 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.delete_bucket_policy(req.clone()).await;
+                        let rm = model.delete_bucket_policy(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    2 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_policy_status(req.clone()).await;
+                        let rm = model.get_bucket_policy_status(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    _ => {
+                        let policy_json = sample_policy_json(&bucket, action - 3);
+                        let req = PutBucketPolicyReq {
+                            ctx,
+                            bucket,
+                            policy_json,
+                        };
+                        let re = engine.put_bucket_policy(req.clone()).await;
+                        let rm = model.put_bucket_policy(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
+            ModelOp::PublicAccessBlock { u, b, action, bits } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match action {
+                    0 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_public_access_block(req.clone()).await;
+                        let rm = model.get_public_access_block(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    1 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.delete_public_access_block(req.clone()).await;
+                        let rm = model.delete_public_access_block(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    _ => {
+                        let config = PublicAccessBlockConfig {
+                            block_public_acls: (bits & 1) != 0,
+                            ignore_public_acls: (bits & 2) != 0,
+                            block_public_policy: (bits & 4) != 0,
+                            restrict_public_buckets: (bits & 8) != 0,
+                        };
+                        let req = PutPublicAccessBlockReq {
+                            ctx,
+                            bucket,
+                            config,
+                        };
+                        let re = engine.put_public_access_block(req.clone()).await;
+                        let rm = model.put_public_access_block(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
             ModelOp::Compact => {
                 engine.compact().await.unwrap();
             }
@@ -1562,6 +1961,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 sys_meta: SystemMeta::default(),
                 user_meta: Vec::new(),
                 acl: None,
+                tags: None,
                 checksum_algorithm: Some(alg),
                 checksum_type: Some(ctype),
             })
@@ -1575,6 +1975,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 sys_meta: SystemMeta::default(),
                 user_meta: Vec::new(),
                 acl: None,
+                tags: None,
                 checksum_algorithm: Some(alg),
                 checksum_type: Some(ctype),
             })
@@ -1886,6 +2287,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                                 sys_meta: SystemMeta::default(),
                                 user_meta: Vec::new(),
                                 acl: None,
+                                tags: None,
                                 preconditions: Preconditions::default(),
                                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
                             },
@@ -1922,6 +2324,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                                 sys_meta: SystemMeta::default(),
                                 user_meta: Vec::new(),
                                 acl: None,
+                                tags: None,
                                 preconditions: Preconditions::default(),
                                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
                             },
@@ -1958,6 +2361,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                         sys_meta: SystemMeta::default(),
                         user_meta: Vec::new(),
                         acl: None,
+                        tags: None,
                         checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
                         checksum_type: None,
                     })
@@ -2127,6 +2531,7 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
                 sys_meta: SystemMeta::default(),
                 user_meta: Vec::new(),
                 acl: None,
+                tags: None,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
             },
@@ -2146,6 +2551,7 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
                 sys_meta: SystemMeta::default(),
                 user_meta: Vec::new(),
                 acl: None,
+                tags: None,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
             },

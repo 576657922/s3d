@@ -310,17 +310,23 @@ pub fn resolve_target_acl(
             resource_owner,
             bucket_owner,
         )),
-        AclSpec::Grants(grants) => Ok(AccessControlPolicy {
-            owner: resource_owner.clone(),
-            grants: grants.clone(),
-        }),
+        AclSpec::Grants(grants) => {
+            let mut grants = grants.clone();
+            grants.sort_by_key(|g| matches!(g.grantee, AclGrantee::CanonicalUser(_)));
+            Ok(AccessControlPolicy {
+                owner: resource_owner.clone(),
+                grants,
+            })
+        }
         AclSpec::Policy(pol) => {
             if pol.owner.user_id != resource_owner.user_id {
                 return Err(S3Error::new(S3ErrorCode::InvalidArgument, "Invalid id"));
             }
+            let mut grants = pol.grants.clone();
+            grants.sort_by_key(|g| matches!(g.grantee, AclGrantee::CanonicalUser(_)));
             Ok(AccessControlPolicy {
                 owner: resource_owner.clone(),
-                grants: pol.grants.clone(),
+                grants,
             })
         }
     }

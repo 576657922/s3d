@@ -1195,6 +1195,9 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "crc32c",
+ "hex",
+ "hmac 0.12.1",
  "http",
  "http-body",
  "http-body-util",
@@ -1209,6 +1212,7 @@ dependencies = [
  "s3d-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml",
@@ -1223,6 +1227,7 @@ dependencies = [
  "bytes",
  "httpdate",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

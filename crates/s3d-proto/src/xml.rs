@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use s3d_types::*;
 
 use crate::sigv4::format_iso8601_millis;
-use crate::uri::aws_uri_encode;
+use crate::uri::{aws_uri_encode, percent_decode_query_component};
 
 pub const S3_XML_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -1295,6 +1297,514 @@ where
         ));
     }
     Ok(out)
+}
+
+/// Parse `OwnershipControls` (`PUT /{b}?ownershipControls`) XML body (`FR-50`).
+pub fn parse_ownership_controls_xml(body: &[u8]) -> StoreResult<ObjectOwnership> {
+    if body.is_empty() || body.len() > 64 * 1024 {
+        return Err(malformed_xml());
+    }
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut saw_root = false;
+    let mut in_rule = false;
+    let mut cur_tag = String::new();
+    let mut cur_ownership: Option<ObjectOwnership> = None;
+    let mut rules: Vec<ObjectOwnership> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "OwnershipControls" if !saw_root => saw_root = true,
+                    "Rule" if saw_root && !in_rule => {
+                        in_rule = true;
+                        cur_ownership = None;
+                    }
+                    "ObjectOwnership" if in_rule && cur_tag.is_empty() => {
+                        cur_tag = local.to_string();
+                    }
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Empty(_)) => return Err(malformed_xml()),
+            Ok(Event::Text(t)) => {
+                if cur_tag == "ObjectOwnership" {
+                    let s = t.unescape().map_err(|_| malformed_xml())?;
+                    let parsed = ObjectOwnership::from_aws_str(&s).ok_or_else(malformed_xml)?;
+                    cur_ownership = Some(parsed);
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "ObjectOwnership" => cur_tag.clear(),
+                    "Rule" if in_rule => {
+                        let own = cur_ownership.take().ok_or_else(malformed_xml)?;
+                        rules.push(own);
+                        in_rule = false;
+                    }
+                    "OwnershipControls" => {}
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => return Err(malformed_xml()),
+        }
+        buf.clear();
+    }
+
+    if !saw_root || rules.len() != 1 {
+        return Err(malformed_xml());
+    }
+    Ok(rules[0])
+}
+
+/// Render `OwnershipControls` (`GET /{b}?ownershipControls`) XML response (`FR-50`).
+pub fn render_ownership_controls_xml(ownership: ObjectOwnership) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<OwnershipControls xmlns=\"{S3_XML_NS}\"><Rule><ObjectOwnership>{}</ObjectOwnership></Rule></OwnershipControls>",
+        ownership.as_aws_str()
+    )
+}
+
+/// Parse `<Tagging>` XML body (`PUT /{b}?tagging`, `PUT /{b}/{k}?tagging`, or `PostObject` `tagging` field).
+pub fn parse_tagging_xml(body: &[u8], max_tags: usize) -> StoreResult<BTreeMap<String, String>> {
+    if body.is_empty() || body.len() > 128 * 1024 {
+        return Err(malformed_xml());
+    }
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+
+    let mut saw_root = false;
+    let mut saw_tagset = false;
+    let mut in_tagset = false;
+    let mut in_tag = false;
+    let mut cur_tag: Option<String> = None;
+    let mut cur_key: Option<String> = None;
+    let mut cur_val: Option<String> = None;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "Tagging" if !saw_root => saw_root = true,
+                    "TagSet" if saw_root && !saw_tagset => {
+                        saw_tagset = true;
+                        in_tagset = true;
+                    }
+                    "Tag" if in_tagset && !in_tag => {
+                        in_tag = true;
+                        cur_key = None;
+                        cur_val = None;
+                    }
+                    "Key" if in_tag && cur_tag.is_none() && cur_key.is_none() => {
+                        cur_tag = Some("Key".to_string());
+                        cur_key = Some(String::new());
+                    }
+                    "Value" if in_tag && cur_tag.is_none() && cur_val.is_none() => {
+                        cur_tag = Some("Value".to_string());
+                        cur_val = Some(String::new());
+                    }
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "TagSet" if saw_root && !saw_tagset => {
+                        saw_tagset = true;
+                    }
+                    "Key" if in_tag && cur_tag.is_none() && cur_key.is_none() => {
+                        cur_key = Some(String::new());
+                    }
+                    "Value" if in_tag && cur_tag.is_none() && cur_val.is_none() => {
+                        cur_val = Some(String::new());
+                    }
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let txt = t.unescape().map_err(|_| malformed_xml())?;
+                match cur_tag.as_deref() {
+                    Some("Key") => {
+                        if let Some(k) = &mut cur_key {
+                            k.push_str(&txt);
+                        }
+                    }
+                    Some("Value") => {
+                        if let Some(v) = &mut cur_val {
+                            v.push_str(&txt);
+                        }
+                    }
+                    _ if txt.chars().all(|c| c.is_ascii_whitespace()) => {}
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "Key" | "Value" => cur_tag = None,
+                    "Tag" if in_tag => {
+                        let k = cur_key.take().ok_or_else(malformed_xml)?;
+                        let v = cur_val.take().ok_or_else(malformed_xml)?;
+                        pairs.push((k, v));
+                        in_tag = false;
+                    }
+                    "TagSet" if in_tagset => in_tagset = false,
+                    "Tagging" => {}
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => return Err(malformed_xml()),
+        }
+        buf.clear();
+    }
+
+    if !saw_root || !saw_tagset {
+        return Err(malformed_xml());
+    }
+    validate_tags(&pairs, max_tags)
+}
+
+/// Render `<Tagging>` XML response (`GET /{b}?tagging` / `GET /{b}/{k}?tagging`).
+pub fn render_tagging_xml(tags: &BTreeMap<String, String>) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"{S3_XML_NS}\"><TagSet>"
+    );
+    for (k, v) in tags {
+        xml.push_str(&format!(
+            "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+            xml_escape(k),
+            xml_escape(v)
+        ));
+    }
+    xml.push_str("</TagSet></Tagging>");
+    xml
+}
+
+/// Parse `x-amz-tagging` URL-encoded query header (`k1=v1&k2=v2`, missing `=` -> empty value).
+pub fn parse_tagging_header(raw: &str, max_tags: usize) -> StoreResult<BTreeMap<String, String>> {
+    if raw.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut pairs = Vec::new();
+    for part in raw.split('&') {
+        let (rk, rv) = match part.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (part, ""),
+        };
+        let k = percent_decode_query_component(rk).map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::InvalidTag,
+                "The TagKey you have provided is invalid",
+            )
+        })?;
+        let v = percent_decode_query_component(rv).map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::InvalidTag,
+                "The TagValue you have provided is invalid",
+            )
+        })?;
+        pairs.push((k, v));
+    }
+    validate_tags(&pairs, max_tags)
+}
+
+/// Parse `<CORSConfiguration>` XML body (`PUT /{b}?cors`).
+pub fn parse_cors_xml(body: &[u8]) -> StoreResult<CorsConfiguration> {
+    if body.is_empty() || body.len() > 64 * 1024 {
+        return Err(malformed_xml());
+    }
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut saw_root = false;
+    let mut in_rule = false;
+    let mut cur_tag: Option<String> = None;
+    let mut cur_rule = CorsRule {
+        id: None,
+        allowed_origins: Vec::new(),
+        allowed_methods: Vec::new(),
+        allowed_headers: Vec::new(),
+        expose_headers: Vec::new(),
+        max_age_seconds: None,
+    };
+    let mut rules = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "CORSConfiguration" if !saw_root => saw_root = true,
+                    "CORSRule" if saw_root && !in_rule => {
+                        in_rule = true;
+                        cur_rule = CorsRule {
+                            id: None,
+                            allowed_origins: Vec::new(),
+                            allowed_methods: Vec::new(),
+                            allowed_headers: Vec::new(),
+                            expose_headers: Vec::new(),
+                            max_age_seconds: None,
+                        };
+                    }
+                    "ID" | "AllowedOrigin" | "AllowedMethod" | "AllowedHeader" | "ExposeHeader"
+                    | "MaxAgeSeconds"
+                        if in_rule && cur_tag.is_none() =>
+                    {
+                        cur_tag = Some(local.to_string());
+                    }
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                if local == "ID" && in_rule && cur_tag.is_none() {
+                    cur_rule.id = Some(String::new());
+                } else {
+                    return Err(malformed_xml());
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let val = t.unescape().map_err(|_| malformed_xml())?.into_owned();
+                match cur_tag.as_deref() {
+                    Some("ID") => {
+                        if val.len() > 255 {
+                            return Err(malformed_xml());
+                        }
+                        cur_rule.id = Some(val);
+                    }
+                    Some("AllowedOrigin") => cur_rule.allowed_origins.push(val),
+                    Some("AllowedMethod") => {
+                        if !matches!(val.as_str(), "GET" | "PUT" | "POST" | "DELETE" | "HEAD") {
+                            return Err(S3Error::new(
+                                S3ErrorCode::InvalidRequest,
+                                format!("Found unsupported HTTP method in CORS config. Unsupported method is {val}"),
+                            ));
+                        }
+                        cur_rule.allowed_methods.push(val);
+                    }
+                    Some("AllowedHeader") => cur_rule.allowed_headers.push(val),
+                    Some("ExposeHeader") => cur_rule.expose_headers.push(val),
+                    Some("MaxAgeSeconds") => {
+                        let secs = val.parse::<u32>().map_err(|_| malformed_xml())?;
+                        cur_rule.max_age_seconds = Some(secs);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "ID" | "AllowedOrigin" | "AllowedMethod" | "AllowedHeader" | "ExposeHeader"
+                    | "MaxAgeSeconds" => {
+                        cur_tag = None;
+                    }
+                    "CORSRule" if in_rule => {
+                        if cur_rule.allowed_origins.is_empty() || cur_rule.allowed_methods.is_empty()
+                        {
+                            return Err(malformed_xml());
+                        }
+                        rules.push(std::mem::replace(
+                            &mut cur_rule,
+                            CorsRule {
+                                id: None,
+                                allowed_origins: Vec::new(),
+                                allowed_methods: Vec::new(),
+                                allowed_headers: Vec::new(),
+                                expose_headers: Vec::new(),
+                                max_age_seconds: None,
+                            },
+                        ));
+                        in_rule = false;
+                    }
+                    "CORSConfiguration" => {}
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => return Err(malformed_xml()),
+        }
+        buf.clear();
+    }
+
+    if !saw_root || rules.is_empty() || rules.len() > 100 {
+        return Err(malformed_xml());
+    }
+    Ok(CorsConfiguration { rules })
+}
+
+/// Render `<CORSConfiguration>` XML response (`GET /{b}?cors`).
+pub fn render_cors_xml(cors: &CorsConfiguration) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CORSConfiguration xmlns=\"{S3_XML_NS}\">"
+    );
+    for rule in &cors.rules {
+        xml.push_str("<CORSRule>");
+        if let Some(id) = &rule.id {
+            xml.push_str(&format!("<ID>{}</ID>", xml_escape(id)));
+        }
+        for o in &rule.allowed_origins {
+            xml.push_str(&format!("<AllowedOrigin>{}</AllowedOrigin>", xml_escape(o)));
+        }
+        for m in &rule.allowed_methods {
+            xml.push_str(&format!("<AllowedMethod>{}</AllowedMethod>", xml_escape(m)));
+        }
+        for h in &rule.allowed_headers {
+            xml.push_str(&format!("<AllowedHeader>{}</AllowedHeader>", xml_escape(h)));
+        }
+        for eh in &rule.expose_headers {
+            xml.push_str(&format!("<ExposeHeader>{}</ExposeHeader>", xml_escape(eh)));
+        }
+        if let Some(age) = rule.max_age_seconds {
+            xml.push_str(&format!("<MaxAgeSeconds>{age}</MaxAgeSeconds>"));
+        }
+        xml.push_str("</CORSRule>");
+    }
+    xml.push_str("</CORSConfiguration>");
+    xml
+}
+
+/// Render `<PolicyStatus>` XML response (`GET /{b}?policyStatus`).
+pub fn render_policy_status_xml(is_public: bool) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PolicyStatus xmlns=\"{S3_XML_NS}\"><IsPublic>{is_public}</IsPublic></PolicyStatus>"
+    )
+}
+
+/// Parse `<PublicAccessBlockConfiguration>` XML body (`PUT /{b}?publicAccessBlock`).
+pub fn parse_public_access_block_xml(body: &[u8]) -> StoreResult<PublicAccessBlockConfig> {
+    if body.is_empty() || body.len() > 64 * 1024 {
+        return Err(malformed_xml());
+    }
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut saw_root = false;
+    let mut cur_tag: Option<String> = None;
+    let mut cfg = PublicAccessBlockConfig::default();
+
+    let parse_bool = |s: &str| -> StoreResult<bool> {
+        if s.eq_ignore_ascii_case("true") {
+            Ok(true)
+        } else if s.eq_ignore_ascii_case("false") {
+            Ok(false)
+        } else {
+            Err(malformed_xml())
+        }
+    };
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "PublicAccessBlockConfiguration" if !saw_root => saw_root = true,
+                    "BlockPublicAcls"
+                    | "IgnorePublicAcls"
+                    | "BlockPublicPolicy"
+                    | "RestrictPublicBuckets"
+                        if saw_root && cur_tag.is_none() =>
+                    {
+                        cur_tag = Some(local.to_string());
+                    }
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                if local == "PublicAccessBlockConfiguration" && !saw_root {
+                    saw_root = true;
+                } else {
+                    return Err(malformed_xml());
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let val = t.unescape().map_err(|_| malformed_xml())?;
+                match cur_tag.as_deref() {
+                    Some("BlockPublicAcls") => cfg.block_public_acls = parse_bool(&val)?,
+                    Some("IgnorePublicAcls") => cfg.ignore_public_acls = parse_bool(&val)?,
+                    Some("BlockPublicPolicy") => cfg.block_public_policy = parse_bool(&val)?,
+                    Some("RestrictPublicBuckets") => {
+                        cfg.restrict_public_buckets = parse_bool(&val)?
+                    }
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "BlockPublicAcls"
+                    | "IgnorePublicAcls"
+                    | "BlockPublicPolicy"
+                    | "RestrictPublicBuckets" => {
+                        cur_tag = None;
+                    }
+                    "PublicAccessBlockConfiguration" => {}
+                    _ => return Err(malformed_xml()),
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => return Err(malformed_xml()),
+        }
+        buf.clear();
+    }
+
+    if !saw_root {
+        return Err(malformed_xml());
+    }
+    Ok(cfg)
+}
+
+/// Render `<PublicAccessBlockConfiguration>` XML response (`GET /{b}?publicAccessBlock`).
+pub fn render_public_access_block_xml(cfg: &PublicAccessBlockConfig) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PublicAccessBlockConfiguration xmlns=\"{S3_XML_NS}\"><BlockPublicAcls>{}</BlockPublicAcls><IgnorePublicAcls>{}</IgnorePublicAcls><BlockPublicPolicy>{}</BlockPublicPolicy><RestrictPublicBuckets>{}</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+        cfg.block_public_acls,
+        cfg.ignore_public_acls,
+        cfg.block_public_policy,
+        cfg.restrict_public_buckets,
+    )
+}
+
+/// Render `<PostResponse>` XML (`PostObject` with `success_action_status = 201`; no `xmlns`).
+pub fn render_post_response_xml(location: &str, bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PostResponse><Location>{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></PostResponse>",
+        xml_escape(location),
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(etag),
+    )
 }
 
 fn malformed_xml() -> S3Error {

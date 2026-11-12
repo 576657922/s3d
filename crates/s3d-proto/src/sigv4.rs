@@ -84,6 +84,18 @@ impl SigV4Verifier {
             .map(|acc| acc.owner.clone())
     }
 
+    pub(crate) fn lookup_account(&self, access_key: &str) -> Option<&AccountRecord> {
+        self.by_access_key.get(access_key)
+    }
+
+    pub(crate) fn derive_post_signing_key(
+        &self,
+        account: &AccountRecord,
+        date_yyyymmdd: &str,
+    ) -> [u8; 32] {
+        self.derive_signing_key(account, date_yyyymmdd)
+    }
+
     fn derive_signing_key(&self, account: &AccountRecord, date_yyyymmdd: &str) -> [u8; 32] {
         let cache_key = (account.access_key.clone(), date_yyyymmdd.to_string());
         if let Some(&cached) = self.key_cache.read().unwrap().get(&cache_key) {
@@ -621,7 +633,7 @@ fn decode_sig_hex(sig_hex: &str) -> StoreResult<[u8; 32]> {
     })
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
@@ -820,7 +832,7 @@ pub fn parse_http_or_rfc2822_date_ms(s: &str) -> Result<i64, ()> {
     Ok(utc_sec * 1000)
 }
 
-fn days_in_month(year: i64, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -888,7 +900,7 @@ pub fn format_iso8601_millis(epoch_ms: i64) -> String {
 }
 
 // Howard Hinnant civil calendar algorithms (exact, leap-year accurate)
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = y - if m <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;

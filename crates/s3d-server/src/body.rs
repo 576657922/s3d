@@ -296,3 +296,79 @@ pub async fn drain_empty_or_ignore(mut incoming: Incoming) {
         let _ = incoming.frame().await;
     }
 }
+
+/// Collect raw unverified HTTP `Incoming` frames up to `max_bytes` (used by HTML Form `PostObject`).
+pub async fn collect_raw_incoming_bounded(
+    mut incoming: Incoming,
+    max_bytes: u64,
+) -> StoreResult<Bytes> {
+    let mut out = BytesMut::new();
+    while let Some(frame_res) = incoming.frame().await {
+        let frame = frame_res.map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::IncompleteBody,
+                "Client disconnected while sending POST body.",
+            )
+        })?;
+        if let Ok(data) = frame.into_data() {
+            if out.len() as u64 + data.len() as u64 > max_bytes {
+                return Err(S3Error::new(
+                    S3ErrorCode::EntityTooLarge,
+                    "Your proposed upload exceeds the maximum allowed size",
+                ));
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out.freeze())
+}
+
+/// `VerifiedBodyStream` over an already-buffered `Bytes` slice (used by `PostObject`).
+pub struct PreVerifiedBytesStream {
+    data: Option<Bytes>,
+    verifier: Option<StreamingDigestVerifier>,
+}
+
+impl PreVerifiedBytesStream {
+    pub fn new(
+        data: Bytes,
+        expected_checksum: Option<(ChecksumAlgorithm, String)>,
+    ) -> Self {
+        let len = data.len() as u64;
+        let verifier = StreamingDigestVerifier::new(
+            Some(len),
+            None,
+            None,
+            expected_checksum.map(|(alg, val)| (alg, Some(val))),
+        );
+        Self {
+            data: Some(data),
+            verifier: Some(verifier),
+        }
+    }
+}
+
+impl VerifiedBodyStream for PreVerifiedBytesStream {
+    fn poll_next_chunk(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, BodyStreamError>> {
+        if let Some(chunk) = self.data.take() {
+            if !chunk.is_empty() {
+                self.verifier
+                    .as_mut()
+                    .expect("poll_next_chunk called after finish")
+                    .update(&chunk);
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+        }
+        Poll::Ready(Ok(None))
+    }
+
+    fn finish(&mut self) -> Result<VerifiedDigests, BodyStreamError> {
+        self.verifier
+            .take()
+            .expect("finish called multiple times on PreVerifiedBytesStream")
+            .finish()
+    }
+}

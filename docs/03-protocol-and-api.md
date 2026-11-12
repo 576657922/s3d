@@ -175,20 +175,55 @@ $$\text{CRC}(A \Vert B) = T^{8 \cdot \text{len}_B}\!\left(\text{CRC}(A)\right) \
 
 ---
 
-## 6. P1 / P2 协议扩展架构槽位（M2 / M4 细化锚点）
+## 6. P1 授权、标签、CORS 与表单上传精确规范（M2 细化落地）
 
-为保证 M0/M1 代码无需重构即可接入 M2/M4，协议层预先固定以下契约（具体规则集在进入 M2 前于本文档追加子表）：
+### 6.1 统一授权求值链（Bucket Policy + PublicAccessBlock + OwnershipControls + ACL，`PR-28`～`PR-33`）
 
-1. **统一授权求值器（`PR-28`～`PR-33`）**：
-   - 输入：`(CallerContext, S3Action, BucketMetaSnapshot, Option<ObjectMetaSnapshot>)`。
-   - M0/M1 模式：仅检查 `caller == resource_owner` 及 `x-amz-expected-bucket-owner`。
-   - M2 完整判定链：
-     1. 检查 `x-amz-expected-bucket-owner`（不符 → `403`）。
-     2. 加载桶 `PublicAccessBlock`（`IgnorePublicAcls` 过滤公开 ACL Grant；`RestrictPublicBuckets` 在策略为公开时屏蔽非桶所有者/非 AWS 服务主体）。
-     3. 求值 `BucketPolicy`：命中任何 `Effect: Deny` → **立即拒绝**（对桶/对象所有者同样生效）。
-     4. 若 `caller == resource_owner`（桶操作看桶主，对象操作看对象主；特例：桶主对桶内任何对象拥有 `s3:DeleteObject` 权限，`PR-31`）→ **放行**。
-     5. 若 `BucketPolicy` 命中 `Effect: Allow` → **放行**。
-     6. 若 `ObjectOwnership != BucketOwnerEnforced` 且对应桶/对象 ACL 命中授权权限（`READ` / `WRITE` / `READ_ACP` / `WRITE_ACP` / `FULL_CONTROL`）→ **放行**。
-     7. 默认 → `403 AccessDenied`。
-2. **Bucket Policy 校验器**：在 `PutBucketPolicy` 时解析 JSON AST（上限 20 KB），校验 `Principal`、`Action`、`Resource` ARN 与 `Condition` 运算符白名单（覆盖 `StringEquals`/`StringNotEquals`/`StringLike`、`IpAddress`/`NotIpAddress`、`Bool`、`Numeric*`、`Null` 等 `s3-tests` 53 个策略用例所需全集）；遇到未知运算符在写入时即返回 `400 MalformedPolicy`（第 12 节风险对策）。
-3. **`PostObject`（`multipart/form-data`）**：复用同一套流式分段与摘要器，表单字段须位于 `file` 字段之前；解析 Base64 `policy` JSON，逐项验证 `expiration` 与 `conditions`（精确匹配、`starts-with`、`content-length-range`）。
+对任意桶/对象操作 `(CallerContext, S3Action, ResourceArn, PolicyEvalContext)`，严格按以下 5 步顺序求值：
+
+1. **`x-amz-expected-bucket-owner` 核对**：与 `bucket.owner.user_id` 不一致 → `403 AccessDenied`。
+2. **Bucket Policy 显式 `Deny`**：若桶存在策略且任意匹配 `(Principal, Action, Resource, Condition)` 的 Statement 为 `Effect: "Deny"` → **立即 `403 AccessDenied`**（对桶主/对象主同样生效，且不受 `RestrictPublicBuckets` 屏蔽）。
+3. **Bucket Policy 显式 `Allow`**：若存在匹配 Statement 为 `Effect: "Allow"`：
+   - 若桶 `PublicAccessBlock.RestrictPublicBuckets == true` 且桶策略为公开策略（或命中公开 Statement），则**仅对桶主放行**，非桶主忽略该 `Allow`；
+   - 否则 → **放行**。
+4. **资源所有者与 ACL 求值**：
+   - **管理类子资源**（`?policy`、`?policyStatus`、`?publicAccessBlock`、`?ownershipControls`、`?tagging`、`?cors`、`?versioning`）：仅资源所有者（桶级看 `bucket.owner`；对象级 `?tagging` 看 `ver.owner`，`BucketOwnerEnforced` 下看 `bucket.owner`）放行，**ACL 不授予标签或策略类权限**。
+   - **数据与 ACL 子资源**：
+     - `BucketOwnerEnforced`：禁用桶/对象 ACL 授权，仅 `caller == bucket.owner` 放行。
+     - `BucketOwnerPreferred` / `ObjectWriter`：若 `PublicAccessBlock.IgnorePublicAcls == true`，求值时过滤 `AllUsers` 与 `AuthenticatedUsers` 两条公开组授权；桶主/对象主隐式保留 `READ_ACP`/`WRITE_ACP`（桶主保留桶全部管理权及对桶内任意对象的删除权 `PR-31`），`ListObjects*` 查桶 `READ`，`PutObject`/`PostObject`/`Multipart` 查桶 `WRITE`，`GetObject`/`HeadObject` 查对象 `READ`（**绝不**用桶 `READ` 替代对象 `READ`，亦**绝不**用对象 `WRITE` 替代桶 `WRITE`）。
+5. **缺失对象 `404` vs `403` 掩码规则**：当 `GetObject`/`HeadObject`/`GetObjectAcl`/`GetObjectTagging`/`GetObjectAttributes` 目标 key 不存在（或头版本为删除标记）时，以 `s3:ListBucket` + 条件上下文 `s3:prefix = <target_key>` 重新求值调用者对桶的列举权：有列举权返回 `404 NoSuchKey`（删除标记带 `x-amz-delete-marker: true`，非版本化空 key 带 `x-amz-delete-marker: false`），无列举权返回 `403 AccessDenied`。
+
+### 6.2 Bucket Policy 语法与条件运算符精确表
+
+- **容量上限**：原始 JSON ≤ 20 KiB（超出或语法非法 → `400 MalformedPolicy`；原样保存原始字符串供 `GET ?policy` 逐字节返回）。
+- **结构约束**：`Version` 支持 `"2012-10-17"` / `"2008-10-17"`；`Effect` 仅限 `"Allow"` / `"Deny"`；**`"Effect": "Allow"` 严禁搭配 `"NotPrincipal"`**（直接返回 `400 MalformedPolicy`）；`Resource` 必须匹配 `arn:aws:s3:::*`、`arn:aws:s3:::*/*`、`arn:aws:s3:::{bucket}` 或 `arn:aws:s3:::{bucket}/*`（指向其他具体桶名 → `400 MalformedPolicy`）。
+- **支持的 `Condition` 运算符白名单**（未知运算符在 `PutBucketPolicy` 阶段拒绝并报 `400 MalformedPolicy`；所有基础运算符均支持追加 `...IfExists` 后缀）：
+
+| 类别 | 运算符列表 | 求值规则 |
+| --- | --- | --- |
+| 字符串比较 | `StringEquals`, `StringNotEquals`, `StringEqualsIgnoreCase`, `StringNotEqualsIgnoreCase`, `StringLike`, `StringNotLike` | `StringLike` 支持 `*`（0+ 字符）与 `?`（单字符）；否定运算符在无 `IfExists` 且上下文缺省该键时求值为 `false` |
+| 数值比较 | `NumericEquals`, `NumericNotEquals`, `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`, `NumericGreaterThanEquals` | 解析 `f64`/`i64` 数值比较 |
+| 布尔与空值 | `Bool`, `Null` | `Null: {"k": "true"}` 当且仅当上下文不存在键 `k` 时为真 |
+| 网络地址 | `IpAddress`, `NotIpAddress` | IPv4 / IPv6 CIDR 网段匹配（对接 `aws:SourceIp`） |
+
+- **支持的上下文条件键**：`s3:ExistingObjectTag/<k>`、`s3:RequestObjectTag/<k>`、`s3:x-amz-acl`、`s3:x-amz-grant-full-control`（及 `-read`/`-write`/`-read-acp`/`-write-acp`）、`s3:x-amz-copy-source`（去前导 `/` 归一化）、`s3:x-amz-metadata-directive`（仅请求显式携带该头时存在）、`s3:prefix`、`s3:delimiter`、`aws:Referer`、`aws:SourceIp`。
+- **`?policyStatus` 与 `BlockPublicPolicy` 公开判定**：Statement 为 `Effect: "Allow"` 且 `Principal` 含 `"*"`（`"*"` 或 `{"AWS": "*"}`），且不含将访问收敛到固定非通配 IP/主体的限制条件时判定为公开策略；桶 `IsPublic = true` 当且仅当（未设 `IgnorePublicAcls` 且非 `BucketOwnerEnforced` 且桶 ACL 含 `AllUsers`/`AuthenticatedUsers`）或（未设 `RestrictPublicBuckets` 且桶策略含公开 Statement）。
+
+### 6.3 ACL、`?ownershipControls`、标签（`?tagging`）与 CORS（`?cors`）映射表
+
+| 子系统 | 核心规则与状态码 |
+| --- | --- |
+| **`?ownershipControls`** | `GET` 返回 `<OwnershipControls><Rule><ObjectOwnership>...</ObjectOwnership></Rule></OwnershipControls>`（若经 `DELETE` 删除则返回 `404 OwnershipControlsNotFoundError`；`DELETE` 本身幂等返回 `204`）。`PUT` 设为 `BucketOwnerEnforced` 前校验当前桶 ACL 必须为桶主默认私有 ACL，否则返回 `400 InvalidBucketAclWithObjectOwnership`。 |
+| **桶标签 vs 对象标签** | 标签统一按 `Key` 字典序（`BTreeMap`）存储与输出；单键 `1..=128` 字符、单值 `0..=256` 字符、禁止同集重复键（违规报 `400 InvalidTag`）。桶标签上限 50 个，无标签时 `GET /{b}?tagging` 返回 `404 NoSuchTagSet`；对象标签上限 10 个，无标签时 `GET /{b}/{k}?tagging` 返回 `200 OK` 空 `<TagSet/>`，`PUT` 返回 `200 OK`，`DELETE` 返回 `204 No Content`。`x-amz-tagging` 按 URL Query 解析（无 `=` 视为值 `""`）；非空标签集在 `GET`/`HEAD` 响应附加 `x-amz-tagging-count`。 |
+| **CORS 与 `OPTIONS`** | `OPTIONS` 预检**免认证**（忽略签名/预签名参数与桶私有策略）：缺 `Origin` 或非法/缺 `Access-Control-Request-Method` → `400 BadRequest`；无配置或无规则同时匹配 `Origin`、`Method` 及全部 `Access-Control-Request-Headers` → `403 Forbidden`。匹配规则 `<AllowedOrigin>` 为字面量 `"*"` 时返回 `Access-Control-Allow-Origin: *`，其余通配/精确规则回显请求 `Origin`。普通请求携带 `Origin` 时（无论是 `2xx` 还是 `403`/`404` 错误响应），按 `Access-Control-Request-Method`（若有）或实际 HTTP 方法匹配规则附加 CORS 响应头。 |
+
+### 6.4 HTML 表单上传 `PostObject`（`POST /{b}`）校验表
+
+1. **`multipart/form-data` 解析铁律**：仅当 part 的 `Content-Disposition` 中 `name` 大小写无关等于 `"file"` 时识别为文件流（忽略非 `file` 字段自带的 `filename="..."` 参数，并忽略 `file` 之后的任何字段）；在求值 `$key` 条件前先将 `key` 中的 `${filename}` 替换为 `file` 段的原始文件名（保留反斜杠 `\` 字面量不转义）。
+2. **表单签名双模式**：
+   - 全匿名：未携带 `AWSAccessKeyId` / `x-amz-credential` / `policy` / `signature` → 跳过表单策略，按桶 `s3:PutObject` 匿名权限判定。
+   - POST SigV2：`AWSAccessKeyId` + `policy` + `signature`（`Base64(HMAC-SHA1(secret, policy_b64))`）。
+   - POST SigV4：`x-amz-algorithm=AWS4-HMAC-SHA256` + `x-amz-credential` + `x-amz-date` + `policy` + `x-amz-signature`（`Hex(HMAC-SHA256(signing_key, policy_b64))`）。
+   - 缺字段 → `400 InvalidArgument`；未知 AK → `403 InvalidAccessKeyId`；签名不符 → `403 SignatureDoesNotMatch`。
+3. **Policy JSON 校验**：顶层键区分大小写，必须同时含 `"expiration"`（严格 `YYYY-MM-DDTHH:MM:SS[.sss]Z`，格式错误 → `400 InvalidPolicyDocument`，已过期 → `403 AccessDenied`）与 `"conditions"` 数组。条件支持 `{"field": "val"}`、`["eq", "$field", "val"]`、`["starts-with", "$field", "prefix"]`、`["content-length-range", min, max]`（操作符与字段名不区分大小写，字段值区分大小写）。除豁免字段（`file`、`policy`、签名字段、`x-ignore-*`、`x-amz-checksum-*`）外，表单字段与策略条件须双向覆盖且包含匹配的 `bucket` 条件（不满足 → `403 AccessDenied`；文件超 `max` → `400 EntityTooLarge`；低于 `min` → `400 EntityTooSmall`）。
+4. **成功响应**：携带非空 `success_action_redirect` / `redirect` 时返回 `303 See Other`（`Location` 追加 `bucket`、`key`、`etag` 查询参数）；否则按 `success_action_status` 返回 `200 OK`、`201 Created`（无 `xmlns` 的 `<PostResponse>` XML）或默认 `204 No Content`。

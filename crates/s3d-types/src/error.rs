@@ -6,12 +6,14 @@ pub enum S3ErrorCode {
     AccessDenied,
     AuthorizationHeaderMalformed,
     BadDigest,
+    BadRequest,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     ConditionalRequestConflict,
     EntityTooLarge,
     EntityTooSmall,
+    Forbidden,
     IncompleteBody,
     InternalError,
     InvalidAccessKeyId,
@@ -22,6 +24,7 @@ pub enum S3ErrorCode {
     InvalidLocationConstraint,
     InvalidPart,
     InvalidPartOrder,
+    InvalidPolicyDocument,
     InvalidRange,
     InvalidRequest,
     InvalidStorageClass,
@@ -39,6 +42,7 @@ pub enum S3ErrorCode {
     NoSuchBucketPolicy,
     NoSuchCorsConfiguration,
     NoSuchKey,
+    NoSuchPublicAccessBlockConfiguration,
     NoSuchTagSet,
     NoSuchUpload,
     NoSuchVersion,
@@ -62,6 +66,7 @@ impl S3ErrorCode {
             Self::AccessControlListNotSupported
             | Self::AuthorizationHeaderMalformed
             | Self::BadDigest
+            | Self::BadRequest
             | Self::EntityTooLarge
             | Self::EntityTooSmall
             | Self::IncompleteBody
@@ -72,6 +77,7 @@ impl S3ErrorCode {
             | Self::InvalidLocationConstraint
             | Self::InvalidPart
             | Self::InvalidPartOrder
+            | Self::InvalidPolicyDocument
             | Self::InvalidRequest
             | Self::InvalidStorageClass
             | Self::InvalidTag
@@ -87,6 +93,7 @@ impl S3ErrorCode {
             | Self::UnresolvableGrantByEmailAddress
             | Self::XAmzContentSHA256Mismatch => 400,
             Self::AccessDenied
+            | Self::Forbidden
             | Self::InvalidAccessKeyId
             | Self::RequestTimeTooSkewed
             | Self::SignatureDoesNotMatch => 403,
@@ -94,6 +101,7 @@ impl S3ErrorCode {
             | Self::NoSuchBucketPolicy
             | Self::NoSuchCorsConfiguration
             | Self::NoSuchKey
+            | Self::NoSuchPublicAccessBlockConfiguration
             | Self::NoSuchTagSet
             | Self::NoSuchUpload
             | Self::NoSuchVersion
@@ -118,12 +126,14 @@ impl S3ErrorCode {
             Self::AccessDenied => "AccessDenied",
             Self::AuthorizationHeaderMalformed => "AuthorizationHeaderMalformed",
             Self::BadDigest => "BadDigest",
+            Self::BadRequest => "BadRequest",
             Self::BucketAlreadyExists => "BucketAlreadyExists",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::ConditionalRequestConflict => "ConditionalRequestConflict",
             Self::EntityTooLarge => "EntityTooLarge",
             Self::EntityTooSmall => "EntityTooSmall",
+            Self::Forbidden => "Forbidden",
             Self::IncompleteBody => "IncompleteBody",
             Self::InternalError => "InternalError",
             Self::InvalidAccessKeyId => "InvalidAccessKeyId",
@@ -134,6 +144,7 @@ impl S3ErrorCode {
             Self::InvalidLocationConstraint => "InvalidLocationConstraint",
             Self::InvalidPart => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
+            Self::InvalidPolicyDocument => "InvalidPolicyDocument",
             Self::InvalidRange => "InvalidRange",
             Self::InvalidRequest => "InvalidRequest",
             Self::InvalidStorageClass => "InvalidStorageClass",
@@ -151,6 +162,7 @@ impl S3ErrorCode {
             Self::NoSuchBucketPolicy => "NoSuchBucketPolicy",
             Self::NoSuchCorsConfiguration => "NoSuchCorsConfiguration",
             Self::NoSuchKey => "NoSuchKey",
+            Self::NoSuchPublicAccessBlockConfiguration => "NoSuchPublicAccessBlockConfiguration",
             Self::NoSuchTagSet => "NoSuchTagSet",
             Self::NoSuchUpload => "NoSuchUpload",
             Self::NoSuchVersion => "NoSuchVersion",

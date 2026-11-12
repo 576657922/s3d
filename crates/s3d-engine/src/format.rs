@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use s3d_types::{
     AccessControlPolicy, ChecksumAlgorithm, ChecksumState, ChecksumType,
-    CompleteMultipartUploadResp, ObjectOwnership, OwnerInfo, SystemMeta, VersioningStatus,
+    CompleteMultipartUploadResp, CorsConfiguration, ObjectOwnership, OwnerInfo,
+    PublicAccessBlockConfig, SystemMeta, VersioningStatus,
 };
 
 pub const FORMAT_MAGIC: &[u8; 8] = b"S3DFMT01";
@@ -206,7 +209,8 @@ pub enum WalOp {
         acl: AccessControlPolicy,
         region: String,
         created_ms: i64,
-        ownership: ObjectOwnership,
+        #[serde(default)]
+        explicit_ownership: Option<ObjectOwnership>,
     },
     UpdateBucketVersioning {
         name: String,
@@ -215,6 +219,26 @@ pub enum WalOp {
     UpdateBucketAcl {
         name: String,
         acl: AccessControlPolicy,
+    },
+    UpdateBucketOwnershipControls {
+        name: String,
+        ownership: Option<ObjectOwnership>,
+    },
+    UpdateBucketTagging {
+        name: String,
+        tags: BTreeMap<String, String>,
+    },
+    UpdateBucketCors {
+        name: String,
+        cors: Option<CorsConfiguration>,
+    },
+    UpdateBucketPolicy {
+        name: String,
+        policy_json: Option<String>,
+    },
+    UpdatePublicAccessBlock {
+        name: String,
+        config: Option<PublicAccessBlockConfig>,
     },
     DeleteBucket {
         name: String,
@@ -232,6 +256,8 @@ pub enum WalOp {
         user_meta: Vec<(String, String)>,
         owner: OwnerInfo,
         acl: AccessControlPolicy,
+        #[serde(default)]
+        tags: BTreeMap<String, String>,
         last_modified_ms: i64,
         extents: Vec<Extent>,
         #[serde(default)]
@@ -242,6 +268,12 @@ pub enum WalOp {
         key: String,
         seq: u64,
         acl: AccessControlPolicy,
+    },
+    UpdateObjectTagging {
+        bucket: String,
+        key: String,
+        seq: u64,
+        tags: BTreeMap<String, String>,
     },
     DeleteVersion {
         bucket: String,
@@ -255,6 +287,8 @@ pub enum WalOp {
         initiator: OwnerInfo,
         owner: OwnerInfo,
         acl: AccessControlPolicy,
+        #[serde(default)]
+        tags: BTreeMap<String, String>,
         initiated_ms: i64,
         sys_meta: SystemMeta,
         user_meta: Vec<(String, String)>,
@@ -288,6 +322,8 @@ pub enum WalOp {
         user_meta: Vec<(String, String)>,
         owner: OwnerInfo,
         acl: AccessControlPolicy,
+        #[serde(default)]
+        tags: BTreeMap<String, String>,
         completed_ms: i64,
         extents: Vec<Extent>,
         parts: Vec<PartBoundaryInfo>,
@@ -318,9 +354,15 @@ impl WalOp {
             Self::UpdateBucketVersioning { .. } => 0x11,
             Self::DeleteBucket { .. } => 0x12,
             Self::UpdateBucketAcl { .. } => 0x13,
+            Self::UpdateBucketOwnershipControls { .. } => 0x14,
+            Self::UpdateBucketTagging { .. } => 0x15,
+            Self::UpdateBucketCors { .. } => 0x16,
+            Self::UpdateBucketPolicy { .. } => 0x17,
+            Self::UpdatePublicAccessBlock { .. } => 0x18,
             Self::PutVersion { .. } => 0x20,
             Self::DeleteVersion { .. } => 0x21,
             Self::UpdateObjectAcl { .. } => 0x22,
+            Self::UpdateObjectTagging { .. } => 0x23,
             Self::CreateMultipartUpload { .. } => 0x30,
             Self::PutUploadPart { .. } => 0x31,
             Self::CompleteMultipartUpload { .. } => 0x32,

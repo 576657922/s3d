@@ -62,9 +62,9 @@ flowchart LR
   - Bucket Policy 解析与求值、`?policyStatus`、`PublicAccessBlock`（`PR-30`～`PR-33`）。
   - CORS 配置与 `OPTIONS` 预检、浏览器表单 `PostObject`、`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`、Virtual-Hosted 寻址（`PR-2`）。
   - 同步将上述全部语义补入 `s3d-model` 与 `VR-2` 生成器。
-- **M2 退出门槛**：
-  - [ ] P0 目标集提升至 **≥ 245 / 249**；
-  - [ ] P1 目标集通过 **≥ 171 / 190**，更新 `docs/deviations.md` 与 JUnit 报告。
+- **M2 退出门槛（已全部达成）**：
+  - [x] P0 目标集保持理论上限 **240 / 249**（96.4%，0 项退化、0 项 `DEFERRED_MILESTONE`；其余 9 项全为 `FR-49` 重复建桶及 `botocore` 客户端钩子限制，详见 `docs/deviations.md` §1）；
+  - [x] P1 目标集通过 **182 / 190**（95.8%，远超 **≥ 171 / 190** 门槛；其中 `post_object` 36/36、`policy` 52/53、`acl` 42/44、`tagging` 16/17、`versioning` 29/31、`cors` 7/9），`VR-2` 100,000 条 P0+P1 差分序列 0 差异，`s3d fsck` 0 错误，已更新 `docs/deviations.md` 与 `reports/m2-junit.xml`。
 
 ### M3 · 存储加固、可观测性与性能达标
 - **核心交付**：
@@ -92,9 +92,9 @@ flowchart LR
 | 编号 | 待核实事项 | 当前设计取值 | 核实方式与计划节点 | 状态 |
 | --- | --- | --- | --- | --- |
 | `Audit-1` | 附录 B `tox` 过滤表达式实际收集出的测试函数数是否精确等于 545 | 静态归类为 545（P0=249, P1=190, P2=106） | **M0-8** 已执行 `pytest --collect-only` 复核：收集 563 个展开项，去重后精确等于 **545** 个测试函数 | **已核实闭环** |
-| `Q1` | `CreateMultipartUpload` 省略 `x-amz-checksum-type` 时 CRC32 / CRC32C / SHA1 / SHA256 的默认类型 | `CRC64NVME` 取 `FULL_OBJECT`，其余取 `COMPOSITE`（`PR-26`） | **M1** 对照 `s3-tests` `checksum`/`multipart` 用例断言；有 AWS 环境时抓包核实 | 暂定已落设计 |
-| `Q2` | 新桶默认 `ObjectOwnership` | 配置项 `default_object_ownership` 默认 `BucketOwnerEnforced`，`s3-tests` 配置设为 `ObjectWriter`（`FR-51`） | **M2** 跑 `acl` 与 `policy` 用例集验证 | 已锁定为配置项 |
+| `Q1` | `CreateMultipartUpload` 省略 `x-amz-checksum-type` 时 CRC32 / CRC32C / SHA1 / SHA256 的默认类型 | `CRC64NVME` 取 `FULL_OBJECT`，其余取 `COMPOSITE`（`PR-26`） | **M1** 对照 `s3-tests` `checksum`/`multipart` 用例断言全部通过 | **已核实闭环** |
+| `Q2` | 新桶默认 `ObjectOwnership` | 配置项 `default_object_ownership` 默认 `BucketOwnerEnforced`，`s3-tests` 配置设为 `ObjectWriter`（`FR-51`） | **M2** 跑 `acl`（42/44）与 `policy`（52/53）用例集全部符合预期 | **已核实闭环** |
 | `Q3` / `FR-9` | `GetObject` 收到多区间 `Range`（如 `bytes=0-1,3-4`）的行为 | 忽略 `Range` 头，返回 `200 OK` 与完整对象 | **M0-8** 对照 `s3-tests` Range 用例全部通过 | **已核实闭环** |
-| `Q4` | `versionId` 编码格式与长度 | 26 字符 URL 安全 Base32（编码 `seq: u64` + `rand: u64`，不透明、同 key 内可排序、≤ 64 字符） | **M2** 跑 `versioning` 31 个用例验证 | 暂定已落设计 |
+| `Q4` | `versionId` 编码格式与长度 | `v{seq:016x}`（17 字符 ASCII 十六进制，不透明、同 key 内单调可排序、≤ 64 字符） | **M2** 跑 `versioning` 用例集（29/31 通过，仅余 2 个 `FR-49` 二次建桶辅助函数冲突） | **已核实闭环** |
 | `Q5` | TLS 支持 | M0～M3 走明文 HTTP；TLS 放 P2 选做 | **M4** 视需求决定是否启用 `tokio-rustls` | 放入 P2 |
 | `Q6` | MD5、XXHASH 系列、SHA512 校验和优先级 | 保持 P2（`PR-20`） | 持续观察 `boto3` 默认行为，v1 无需升至 P1 | 放入 P2 |

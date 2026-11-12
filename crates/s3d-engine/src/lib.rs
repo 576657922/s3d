@@ -987,7 +987,7 @@ fn insert_version_chain(
         }
         VersioningStatus::Suspended => {
             chain.retain(|old| {
-                if old.version_id.as_deref() == Some("null") {
+                if old.version_id.as_deref().unwrap_or("null") == "null" {
                     reclaimed.extend(old.extents.iter().copied());
                     false
                 } else {
@@ -1015,7 +1015,7 @@ fn apply_wal_op(
             acl,
             region,
             created_ms,
-            ownership,
+            explicit_ownership,
         } => {
             catalog.buckets.insert(
                 name.clone(),
@@ -1026,7 +1026,11 @@ fn apply_wal_op(
                     region,
                     created_ms,
                     versioning: VersioningStatus::Unversioned,
-                    ownership,
+                    explicit_ownership,
+                    tags: BTreeMap::new(),
+                    cors: None,
+                    policy: None,
+                    public_access_block: None,
                     objects: BTreeMap::new(),
                     uploads: BTreeMap::new(),
                     completed_uploads: BTreeMap::new(),
@@ -1041,6 +1045,32 @@ fn apply_wal_op(
         WalOp::UpdateBucketAcl { name, acl } => {
             if let Some(b) = catalog.buckets.get_mut(&name) {
                 b.acl = acl;
+            }
+        }
+        WalOp::UpdateBucketOwnershipControls { name, ownership } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.explicit_ownership = ownership;
+            }
+        }
+        WalOp::UpdateBucketTagging { name, tags } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.tags = tags;
+            }
+        }
+        WalOp::UpdateBucketCors { name, cors } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.cors = cors;
+            }
+        }
+        WalOp::UpdateBucketPolicy { name, policy_json } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.policy =
+                    policy_json.and_then(|raw| BucketPolicyDoc::parse_and_validate(&raw, &name).ok());
+            }
+        }
+        WalOp::UpdatePublicAccessBlock { name, config } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.public_access_block = config;
             }
         }
         WalOp::DeleteBucket { name } => {
@@ -1059,6 +1089,7 @@ fn apply_wal_op(
             user_meta,
             owner,
             acl,
+            tags,
             last_modified_ms,
             extents,
             parts,
@@ -1078,6 +1109,7 @@ fn apply_wal_op(
                     user_meta,
                     owner,
                     acl,
+                    tags,
                     last_modified_ms,
                     extents: extents.into(),
                     parts: parts.map(Into::into),
@@ -1100,6 +1132,21 @@ fn apply_wal_op(
                 .and_then(|c| c.iter_mut().find(|v| v.seq == seq))
             {
                 v.acl = acl;
+            }
+        }
+        WalOp::UpdateObjectTagging {
+            bucket,
+            key,
+            seq,
+            tags,
+        } => {
+            if let Some(v) = catalog
+                .buckets
+                .get_mut(&bucket)
+                .and_then(|b| b.objects.get_mut(&key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == seq))
+            {
+                v.tags = tags;
             }
         }
         WalOp::DeleteVersion {
@@ -1132,6 +1179,7 @@ fn apply_wal_op(
             initiator,
             owner,
             acl,
+            tags,
             initiated_ms,
             sys_meta,
             user_meta,
@@ -1147,6 +1195,7 @@ fn apply_wal_op(
                         initiator,
                         owner,
                         acl,
+                        tags,
                         initiated_ms,
                         sys_meta,
                         user_meta,
@@ -1208,6 +1257,7 @@ fn apply_wal_op(
             user_meta,
             owner,
             acl,
+            tags,
             completed_ms,
             extents,
             parts,
@@ -1228,6 +1278,7 @@ fn apply_wal_op(
                     user_meta,
                     owner,
                     acl,
+                    tags,
                     last_modified_ms: completed_ms,
                     extents: extents.into(),
                     parts: Some(parts.into()),
@@ -1325,14 +1376,18 @@ fn lookup_bucket_checked<'a>(
     Ok(b)
 }
 
-fn require_bucket_owner<'a>(
+fn check_bucket_action<'a>(
     cat: &'a MemoryCatalog,
+    default_ownership: ObjectOwnership,
     ctx: &CallerContext,
     bucket_name: &str,
+    actions: &[S3Action],
+    acl_needed: Option<AclPermission>,
+    extra: &PolicyEvalExtra<'_>,
 ) -> StoreResult<&'a BucketEntry> {
     let b = lookup_bucket_checked(cat, ctx, bucket_name)?;
-    let caller = require_authenticated(ctx)?;
-    if caller.user_id != b.owner.user_id {
+    let view = b.auth_view(default_ownership);
+    if !authorize_bucket_action(&view, ctx, actions, acl_needed, extra) {
         return Err(
             S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(bucket_name)
         );
@@ -1340,80 +1395,94 @@ fn require_bucket_owner<'a>(
     Ok(b)
 }
 
-fn has_bucket_perm(bucket: &BucketEntry, ctx: &CallerContext, needed: AclPermission) -> bool {
-    let caller_is_owner = ctx.is_authenticated
-        && ctx
-            .caller
-            .as_ref()
-            .is_some_and(|c| c.user_id == bucket.owner.user_id);
-    if bucket.ownership == ObjectOwnership::BucketOwnerEnforced {
-        return caller_is_owner;
-    }
-    if matches!(needed, AclPermission::ReadAcp | AclPermission::WriteAcp) && caller_is_owner {
-        return true;
-    }
-    bucket
-        .acl
-        .allows(ctx.caller.as_ref(), ctx.is_authenticated, needed, false)
-}
-
-fn check_bucket_perm<'a>(
+fn check_bucket_write_object<'a>(
     cat: &'a MemoryCatalog,
+    default_ownership: ObjectOwnership,
     ctx: &CallerContext,
     bucket_name: &str,
-    needed: AclPermission,
+    key: &str,
+    req_tags: Option<&BTreeMap<String, String>>,
 ) -> StoreResult<&'a BucketEntry> {
     let b = lookup_bucket_checked(cat, ctx, bucket_name)?;
-    if !has_bucket_perm(b, ctx, needed) {
+    let view = b.auth_view(default_ownership);
+    let extra = PolicyEvalExtra {
+        request_object_tags: req_tags,
+        ..Default::default()
+    };
+    if req_tags.is_some_and(|t| !t.is_empty()) {
+        if let Some(pol) = view.policy {
+            let arn = format!("arn:aws:s3:::{bucket_name}/{key}");
+            if pol.evaluate(ctx, &[S3Action::PutObjectTagging], &arn, &extra)
+                == PolicyDecision::ExplicitDeny
+            {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                    .with_key(bucket_name, key));
+            }
+        }
+    }
+    if !authorize_object_action(
+        &view,
+        ctx,
+        key,
+        &[S3Action::PutObject],
+        Some(&b.owner),
+        Some((&b.acl, AclPermission::Write)),
+        true,
+        &extra,
+    ) {
         return Err(
-            S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(bucket_name)
+            S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_key(bucket_name, key)
         );
     }
     Ok(b)
-}
-
-fn has_object_perm(
-    bucket: &BucketEntry,
-    ver: &ObjectVersionEntry,
-    ctx: &CallerContext,
-    needed: AclPermission,
-) -> bool {
-    if bucket.ownership == ObjectOwnership::BucketOwnerEnforced {
-        return ctx.is_authenticated
-            && ctx
-                .caller
-                .as_ref()
-                .is_some_and(|c| c.user_id == bucket.owner.user_id);
-    }
-    let caller_is_obj_owner = ctx.is_authenticated
-        && ctx
-            .caller
-            .as_ref()
-            .is_some_and(|c| c.user_id == ver.owner.user_id);
-    if matches!(needed, AclPermission::ReadAcp | AclPermission::WriteAcp) && caller_is_obj_owner {
-        return true;
-    }
-    ver.acl
-        .allows(ctx.caller.as_ref(), ctx.is_authenticated, needed, false)
 }
 
 fn has_upload_perm(
     bucket: &BucketEntry,
+    default_ownership: ObjectOwnership,
+    key: &str,
     up: &MultipartUploadEntry,
     ctx: &CallerContext,
+    actions: &[S3Action],
     needed: AclPermission,
 ) -> bool {
+    let view = bucket.auth_view(default_ownership);
+    let arn = format!("arn:aws:s3:::{}/{key}", bucket.name);
+    let extra = PolicyEvalExtra::default();
+    if let Some(pol) = view.policy {
+        match pol.evaluate(ctx, actions, &arn, &extra) {
+            PolicyDecision::ExplicitDeny => return false,
+            PolicyDecision::ExplicitAllow {
+                via_public_statement,
+            } => {
+                if !(view.restrict_public_buckets()
+                    && via_public_statement
+                    && !view.is_caller_bucket_owner(ctx))
+                {
+                    return true;
+                }
+            }
+            PolicyDecision::ImplicitDeny => {}
+        }
+    }
     let is_initiator = ctx.is_authenticated
         && ctx
             .caller
             .as_ref()
             .is_some_and(|c| c.user_id == up.initiator.user_id);
-    let is_bucket_owner = ctx.is_authenticated
-        && ctx
-            .caller
-            .as_ref()
-            .is_some_and(|c| c.user_id == bucket.owner.user_id);
-    is_initiator || is_bucket_owner || has_bucket_perm(bucket, ctx, needed)
+    if is_initiator || view.is_caller_bucket_owner(ctx) {
+        return true;
+    }
+    authorize_object_action(
+        &view,
+        ctx,
+        key,
+        actions,
+        Some(&bucket.owner),
+        Some((&bucket.acl, needed)),
+        true,
+        &extra,
+    )
 }
 
 fn head_state_of(versions: Option<&Vec<ObjectVersionEntry>>) -> HeadState<'_> {
@@ -1654,6 +1723,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let ownership = req
             .object_ownership
             .unwrap_or(self.cfg.default_object_ownership);
+        let explicit_ownership = match req.object_ownership {
+            Some(own) => Some(own),
+            None if self.cfg.default_object_ownership == ObjectOwnership::BucketOwnerEnforced => {
+                Some(ObjectOwnership::BucketOwnerEnforced)
+            }
+            None => None,
+        };
         let acl = if ownership == ObjectOwnership::BucketOwnerEnforced {
             if let Some(spec) = &req.acl {
                 if !matches!(spec, AclSpec::Canned(CannedAcl::Private)) {
@@ -1678,7 +1754,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             acl: acl.clone(),
             region: self.cfg.region.clone(),
             created_ms: req.ctx.request_time_ms,
-            ownership,
+            explicit_ownership,
         };
         self.commit_wal(op).await?;
 
@@ -1692,7 +1768,11 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 region: self.cfg.region.clone(),
                 created_ms: req.ctx.request_time_ms,
                 versioning: VersioningStatus::Unversioned,
-                ownership,
+                explicit_ownership,
+                tags: BTreeMap::new(),
+                cors: None,
+                policy: None,
+                public_access_block: None,
                 objects: BTreeMap::new(),
                 uploads: BTreeMap::new(),
                 completed_uploads: BTreeMap::new(),
@@ -1711,14 +1791,22 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn head_bucket(&self, req: BucketRef) -> StoreResult<BucketMetaSnapshot> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::ListBucket],
+            Some(AclPermission::Read),
+            &PolicyEvalExtra::default(),
+        )?;
         Ok(BucketMetaSnapshot {
             name: b.name.clone(),
             owner: b.owner.clone(),
             region: b.region.clone(),
             created_ms: b.created_ms,
             versioning: b.versioning,
-            ownership: b.ownership,
+            ownership: b.effective_ownership(self.cfg.default_object_ownership),
         })
     }
 
@@ -1727,7 +1815,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, "").lock().await;
         {
             let cat = self.catalog.read().unwrap();
-            let b = require_bucket_owner(&cat, &req.ctx, &req.bucket)?;
+            let b = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::DeleteBucket],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
             if b.objects.values().any(|c| !c.is_empty()) {
                 return Err(S3Error::new(
                     S3ErrorCode::BucketNotEmpty,
@@ -1759,7 +1855,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn get_bucket_versioning(&self, req: BucketRef) -> StoreResult<VersioningStatus> {
         let cat = self.catalog.read().unwrap();
-        let b = require_bucket_owner(&cat, &req.ctx, &req.bucket)?;
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketVersioning],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
         Ok(b.versioning)
     }
 
@@ -1774,7 +1878,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, "").lock().await;
         {
             let cat = self.catalog.read().unwrap();
-            let _ = require_bucket_owner(&cat, &req.ctx, &req.bucket)?;
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketVersioning],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
         }
         self.commit_wal(WalOp::UpdateBucketVersioning {
             name: req.bucket.clone(),
@@ -1790,7 +1902,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn get_bucket_acl(&self, req: BucketRef) -> StoreResult<AccessControlPolicy> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::ReadAcp)?;
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketAcl],
+            Some(AclPermission::ReadAcp),
+            &PolicyEvalExtra::default(),
+        )?;
         Ok(b.acl.clone())
     }
 
@@ -1799,14 +1919,30 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, "").lock().await;
         let new_acl = {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::WriteAcp)?;
-            if b.ownership == ObjectOwnership::BucketOwnerEnforced {
+            let b = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketAcl],
+                Some(AclPermission::WriteAcp),
+                &PolicyEvalExtra::default(),
+            )?;
+            if b.effective_ownership(self.cfg.default_object_ownership)
+                == ObjectOwnership::BucketOwnerEnforced
+            {
                 return Err(S3Error::new(
                     S3ErrorCode::AccessControlListNotSupported,
                     "The bucket does not allow ACLs",
                 )
                 .with_bucket(&req.bucket));
             }
+            enforce_block_public_acl_spec(
+                b.auth_view(self.cfg.default_object_ownership)
+                    .block_public_acls(),
+                Some(&req.acl),
+            )
+            .map_err(|e| e.with_bucket(&req.bucket))?;
             resolve_target_acl(&b.owner, Some(&b.owner), &req.acl)?
         };
         self.commit_wal(WalOp::UpdateBucketAcl {
@@ -1825,13 +1961,20 @@ impl<D: Disk> ObjectStore for Engine<D> {
         validate_object_key(&req.bucket, &req.key)?;
         let cat = self.catalog.read().unwrap();
         let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
-        let ver = self.lookup_version_for_read_checked(
+        let actions: &[S3Action] = if req.version_id.is_some() {
+            &[S3Action::GetObjectVersionAcl, S3Action::GetObjectAcl]
+        } else {
+            &[S3Action::GetObjectAcl]
+        };
+        let ver = self.lookup_version_for_op_checked(
             b,
             &req.ctx,
             &req.bucket,
             &req.key,
             req.version_id.as_deref(),
-            AclPermission::ReadAcp,
+            actions,
+            Some(AclPermission::ReadAcp),
+            None,
         )?;
         Ok(GetObjectAclResp {
             version_id: ver.version_id.clone().filter(|v| v != "null"),
@@ -1843,24 +1986,39 @@ impl<D: Disk> ObjectStore for Engine<D> {
         validate_object_key(&req.bucket, &req.key)?;
         self.check_writable(false)?;
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let actions: &[S3Action] = if req.version_id.is_some() {
+            &[S3Action::PutObjectVersionAcl, S3Action::PutObjectAcl]
+        } else {
+            &[S3Action::PutObjectAcl]
+        };
         let (target_seq, new_acl, vid_out) = {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
-            let ver = self.lookup_version_for_read_checked(
+            let ver = self.lookup_version_for_op_checked(
                 b,
                 &req.ctx,
                 &req.bucket,
                 &req.key,
                 req.version_id.as_deref(),
-                AclPermission::WriteAcp,
+                actions,
+                Some(AclPermission::WriteAcp),
+                None,
             )?;
-            if b.ownership == ObjectOwnership::BucketOwnerEnforced {
+            if b.effective_ownership(self.cfg.default_object_ownership)
+                == ObjectOwnership::BucketOwnerEnforced
+            {
                 return Err(S3Error::new(
                     S3ErrorCode::AccessControlListNotSupported,
                     "The bucket does not allow ACLs",
                 )
                 .with_bucket(&req.bucket));
             }
+            enforce_block_public_acl_spec(
+                b.auth_view(self.cfg.default_object_ownership)
+                    .block_public_acls(),
+                Some(&req.acl),
+            )
+            .map_err(|e| e.with_key(&req.bucket, &req.key))?;
             let acl = resolve_target_acl(&ver.owner, Some(&b.owner), &req.acl)?;
             let vid = ver.version_id.clone().filter(|v| v != "null");
             (ver.seq, acl, vid)
@@ -1886,6 +2044,549 @@ impl<D: Disk> ObjectStore for Engine<D> {
         Ok(vid_out)
     }
 
+    async fn get_bucket_ownership_controls(
+        &self,
+        req: BucketRef,
+    ) -> StoreResult<ObjectOwnership> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketOwnershipControls],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        b.explicit_ownership.ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::OwnershipControlsNotFoundError,
+                "The bucket ownership controls were not found",
+            )
+            .with_bucket(&req.bucket)
+        })
+    }
+
+    async fn put_bucket_ownership_controls(
+        &self,
+        req: PutBucketOwnershipControlsReq,
+    ) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let b = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketOwnershipControls],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+            if req.ownership == ObjectOwnership::BucketOwnerEnforced
+                && !b.acl.is_default_private_for(&b.owner)
+            {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidBucketAclWithObjectOwnership,
+                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
+                )
+                .with_bucket(&req.bucket));
+            }
+        }
+        self.commit_wal(WalOp::UpdateBucketOwnershipControls {
+            name: req.bucket.clone(),
+            ownership: Some(req.ownership),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.explicit_ownership = Some(req.ownership);
+        }
+        Ok(())
+    }
+
+    async fn delete_bucket_ownership_controls(&self, req: BucketRef) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketOwnershipControls],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdateBucketOwnershipControls {
+            name: req.bucket.clone(),
+            ownership: None,
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.explicit_ownership = None;
+        }
+        Ok(())
+    }
+
+    async fn get_bucket_tagging(&self, req: BucketRef) -> StoreResult<BTreeMap<String, String>> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketTagging],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        if b.tags.is_empty() {
+            return Err(S3Error::new(
+                S3ErrorCode::NoSuchTagSet,
+                "The TagSet does not exist",
+            )
+            .with_bucket(&req.bucket));
+        }
+        Ok(b.tags.clone())
+    }
+
+    async fn put_bucket_tagging(&self, req: PutBucketTaggingReq) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketTagging],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdateBucketTagging {
+            name: req.bucket.clone(),
+            tags: req.tags.clone(),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.tags = req.tags;
+        }
+        Ok(())
+    }
+
+    async fn delete_bucket_tagging(&self, req: BucketRef) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketTagging],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdateBucketTagging {
+            name: req.bucket.clone(),
+            tags: BTreeMap::new(),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.tags.clear();
+        }
+        Ok(())
+    }
+
+    async fn get_object_tagging(&self, req: ObjectTaggingRef) -> StoreResult<GetObjectTaggingResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let cat = self.catalog.read().unwrap();
+        let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+        let actions: &[S3Action] = if req.version_id.is_some() {
+            &[S3Action::GetObjectVersionTagging, S3Action::GetObjectTagging]
+        } else {
+            &[S3Action::GetObjectTagging]
+        };
+        let ver = self.lookup_version_for_op_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            actions,
+            None,
+            None,
+        )?;
+        Ok(GetObjectTaggingResp {
+            version_id: ver.version_id.clone().filter(|v| v != "null"),
+            tags: ver.tags.clone(),
+        })
+    }
+
+    async fn put_object_tagging(&self, req: PutObjectTaggingReq) -> StoreResult<Option<String>> {
+        validate_object_key(&req.bucket, &req.key)?;
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let actions: &[S3Action] = if req.version_id.is_some() {
+            &[S3Action::PutObjectVersionTagging, S3Action::PutObjectTagging]
+        } else {
+            &[S3Action::PutObjectTagging]
+        };
+        let (target_seq, vid_out) = {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let ver = self.lookup_version_for_op_checked(
+                b,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                actions,
+                None,
+                Some(&req.tags),
+            )?;
+            (ver.seq, ver.version_id.clone().filter(|v| v != "null"))
+        };
+        self.commit_wal(WalOp::UpdateObjectTagging {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            seq: target_seq,
+            tags: req.tags.clone(),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(v) = cat
+            .buckets
+            .get_mut(&req.bucket)
+            .and_then(|b| b.objects.get_mut(&req.key))
+            .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+        {
+            v.tags = req.tags;
+        }
+        Ok(vid_out)
+    }
+
+    async fn delete_object_tagging(&self, req: ObjectTaggingRef) -> StoreResult<Option<String>> {
+        validate_object_key(&req.bucket, &req.key)?;
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let actions: &[S3Action] = if req.version_id.is_some() {
+            &[
+                S3Action::DeleteObjectVersionTagging,
+                S3Action::DeleteObjectTagging,
+            ]
+        } else {
+            &[S3Action::DeleteObjectTagging]
+        };
+        let (target_seq, vid_out) = {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let ver = self.lookup_version_for_op_checked(
+                b,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                actions,
+                None,
+                None,
+            )?;
+            (ver.seq, ver.version_id.clone().filter(|v| v != "null"))
+        };
+        self.commit_wal(WalOp::UpdateObjectTagging {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            seq: target_seq,
+            tags: BTreeMap::new(),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(v) = cat
+            .buckets
+            .get_mut(&req.bucket)
+            .and_then(|b| b.objects.get_mut(&req.key))
+            .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+        {
+            v.tags.clear();
+        }
+        Ok(vid_out)
+    }
+
+    async fn get_bucket_cors(&self, req: BucketRef) -> StoreResult<CorsConfiguration> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketCORS],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        b.cors.clone().ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchCorsConfiguration,
+                "The CORS configuration does not exist",
+            )
+            .with_bucket(&req.bucket)
+        })
+    }
+
+    async fn put_bucket_cors(&self, req: PutBucketCorsReq) -> StoreResult<()> {
+        req.cors.validate()?;
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketCORS],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdateBucketCors {
+            name: req.bucket.clone(),
+            cors: Some(req.cors.clone()),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.cors = Some(req.cors);
+        }
+        Ok(())
+    }
+
+    async fn delete_bucket_cors(&self, req: BucketRef) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketCORS],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdateBucketCors {
+            name: req.bucket.clone(),
+            cors: None,
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.cors = None;
+        }
+        Ok(())
+    }
+
+    async fn lookup_bucket_cors_unauth(
+        &self,
+        bucket: &str,
+    ) -> StoreResult<Option<CorsConfiguration>> {
+        let cat = self.catalog.read().unwrap();
+        let b = cat.buckets.get(bucket).ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchBucket,
+                "The specified bucket does not exist",
+            )
+            .with_bucket(bucket)
+        })?;
+        Ok(b.cors.clone())
+    }
+
+    async fn get_bucket_policy(&self, req: BucketRef) -> StoreResult<String> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketPolicy],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        let pol = b.policy.as_ref().ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchBucketPolicy,
+                "The bucket policy does not exist",
+            )
+            .with_bucket(&req.bucket)
+        })?;
+        Ok(pol.raw_json().to_string())
+    }
+
+    async fn put_bucket_policy(&self, req: PutBucketPolicyReq) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        let doc = {
+            let cat = self.catalog.read().unwrap();
+            let b = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketPolicy],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+            let doc = BucketPolicyDoc::parse_and_validate(&req.policy_json, &req.bucket)?;
+            if b.auth_view(self.cfg.default_object_ownership)
+                .block_public_policy()
+                && doc.is_public()
+            {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            }
+            doc
+        };
+        self.commit_wal(WalOp::UpdateBucketPolicy {
+            name: req.bucket.clone(),
+            policy_json: Some(req.policy_json),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.policy = Some(doc);
+        }
+        Ok(())
+    }
+
+    async fn delete_bucket_policy(&self, req: BucketRef) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::DeleteBucketPolicy],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdateBucketPolicy {
+            name: req.bucket.clone(),
+            policy_json: None,
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.policy = None;
+        }
+        Ok(())
+    }
+
+    async fn get_bucket_policy_status(&self, req: BucketRef) -> StoreResult<bool> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketPolicyStatus],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        Ok(b.auth_view(self.cfg.default_object_ownership)
+            .compute_is_public())
+    }
+
+    async fn get_public_access_block(&self, req: BucketRef) -> StoreResult<PublicAccessBlockConfig> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketPublicAccessBlock],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        b.public_access_block.ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchPublicAccessBlockConfiguration,
+                "The public access block configuration was not found",
+            )
+            .with_bucket(&req.bucket)
+        })
+    }
+
+    async fn put_public_access_block(&self, req: PutPublicAccessBlockReq) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketPublicAccessBlock],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdatePublicAccessBlock {
+            name: req.bucket.clone(),
+            config: Some(req.config),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.public_access_block = Some(req.config);
+        }
+        Ok(())
+    }
+
+    async fn delete_public_access_block(&self, req: BucketRef) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketPublicAccessBlock],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        self.commit_wal(WalOp::UpdatePublicAccessBlock {
+            name: req.bucket.clone(),
+            config: None,
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.public_access_block = None;
+        }
+        Ok(())
+    }
+
     async fn put_object<S: VerifiedBodyStream>(
         &self,
         req: PutObjectReq,
@@ -1897,9 +2598,22 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let b = check_bucket_write_object(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.tags.as_ref(),
+            )?;
+            enforce_block_public_acl_spec(
+                b.auth_view(self.cfg.default_object_ownership)
+                    .block_public_acls(),
+                req.acl.as_ref(),
+            )
+            .map_err(|e| e.with_key(&req.bucket, &req.key))?;
             let _ = resolve_object_owner_and_acl(
-                b.ownership,
+                b.effective_ownership(self.cfg.default_object_ownership),
                 &b.owner,
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
@@ -1958,9 +2672,22 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
         let (versioning, obj_owner, obj_acl) = {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let b = check_bucket_write_object(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.tags.as_ref(),
+            )?;
+            enforce_block_public_acl_spec(
+                b.auth_view(self.cfg.default_object_ownership)
+                    .block_public_acls(),
+                req.acl.as_ref(),
+            )
+            .map_err(|e| e.with_key(&req.bucket, &req.key))?;
             let (owner, acl) = resolve_object_owner_and_acl(
-                b.ownership,
+                b.effective_ownership(self.cfg.default_object_ownership),
                 &b.owner,
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
@@ -1977,6 +2704,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             VersioningStatus::Suspended => Some("null".to_string()),
             VersioningStatus::Enabled => Some(format!("v{seq:016x}")),
         };
+        let obj_tags = req.tags.unwrap_or_default();
 
         let op = WalOp::PutVersion {
             bucket: req.bucket.clone(),
@@ -1991,6 +2719,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             user_meta: req.user_meta.clone(),
             owner: obj_owner.clone(),
             acl: obj_acl.clone(),
+            tags: obj_tags.clone(),
             last_modified_ms: req.ctx.request_time_ms,
             extents: extents.clone(),
             parts: None,
@@ -2017,6 +2746,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     user_meta: req.user_meta,
                     owner: obj_owner,
                     acl: obj_acl,
+                    tags: obj_tags,
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: extents.clone().into(),
                     parts: None,
@@ -2051,13 +2781,24 @@ impl<D: Disk> ObjectStore for Engine<D> {
         validate_object_key(&req.bucket, &req.key)?;
         let cat = self.catalog.read().unwrap();
         let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
-        let ver = self.lookup_version_for_read_checked(
+        let actions: &[S3Action] = if req.version_id.is_some() {
+            &[
+                S3Action::GetObjectVersionAttributes,
+                S3Action::GetObjectAttributes,
+                S3Action::GetObject,
+            ]
+        } else {
+            &[S3Action::GetObjectAttributes, S3Action::GetObject]
+        };
+        let ver = self.lookup_version_for_op_checked(
             b,
             &req.ctx,
             &req.bucket,
             &req.key,
             req.version_id.as_deref(),
-            AclPermission::Read,
+            actions,
+            None,
+            None,
         )?;
 
         let object_parts = if req.attrs.object_parts {
@@ -2112,7 +2853,44 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
         let (versioning, dm_owner) = {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let view = b.auth_view(self.cfg.default_object_ownership);
+            let actions: &[S3Action] = if req.version_id.is_some() {
+                &[S3Action::DeleteObjectVersion, S3Action::DeleteObject]
+            } else {
+                &[S3Action::DeleteObject]
+            };
+            let existing_tags = match &req.version_id {
+                None => b
+                    .objects
+                    .get(&req.key)
+                    .and_then(|c| c.first())
+                    .filter(|v| !v.is_delete_marker)
+                    .map(|v| &v.tags),
+                Some(vid) => b.objects.get(&req.key).and_then(|c| {
+                    c.iter()
+                        .find(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
+                        .filter(|v| !v.is_delete_marker)
+                        .map(|v| &v.tags)
+                }),
+            };
+            let extra = PolicyEvalExtra {
+                existing_object_tags: existing_tags,
+                ..Default::default()
+            };
+            if !authorize_object_action(
+                &view,
+                &req.ctx,
+                &req.key,
+                actions,
+                Some(&b.owner),
+                Some((&b.acl, AclPermission::Write)),
+                true,
+                &extra,
+            ) {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                    .with_key(&req.bucket, &req.key));
+            }
             let dm_owner = req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone());
             let head = head_state_of(b.objects.get(&req.key));
             evaluate_delete_preconditions(req.if_match.as_deref(), &req.bucket, &req.key, head)?;
@@ -2207,6 +2985,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     user_meta: Vec::new(),
                     owner: dm_owner.clone(),
                     acl: dm_acl.clone(),
+                    tags: BTreeMap::new(),
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: Vec::new(),
                     parts: None,
@@ -2223,7 +3002,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         let chain = b.objects.entry(req.key).or_default();
                         if versioning == VersioningStatus::Suspended {
                             chain.retain(|old| {
-                                if old.version_id.as_deref() == Some("null") {
+                                if old.version_id.as_deref().unwrap_or("null") == "null" {
                                     reclaimed.extend(old.extents.iter().copied());
                                     false
                                 } else {
@@ -2244,6 +3023,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                                 user_meta: Vec::new(),
                                 owner: dm_owner,
                                 acl: dm_acl,
+                                tags: BTreeMap::new(),
                                 last_modified_ms: req.ctx.request_time_ms,
                                 extents: Arc::new([]),
                                 parts: None,
@@ -2271,7 +3051,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         self.check_writable(false)?;
         {
             let cat = self.catalog.read().unwrap();
-            let _ = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let _ = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
         }
 
         let mut deleted = Vec::new();
@@ -2322,6 +3102,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             && req.src_version_id.is_none()
             && !req.replace_metadata
             && req.acl.is_none()
+            && req.tagging_directive == TaggingDirective::Copy
         {
             return Err(S3Error::new(
                 S3ErrorCode::InvalidRequest,
@@ -2331,7 +3112,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         self.check_writable(true)?;
 
         // 1. Lock-free snapshot read of source metadata & pin its segments
-        let (src_ver, src_pins) = {
+        let (src_ver, src_pins, dst_tags) = {
             let cat = self.catalog.read().unwrap();
             let src_b = lookup_bucket_checked(&cat, &req.ctx, &req.src_bucket)?;
             let found = self
@@ -2343,9 +3124,31 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     req.src_version_id.as_deref(),
                 )?
                 .clone();
-            let dst_b = check_bucket_perm(&cat, &req.ctx, &req.dst_bucket, AclPermission::Write)?;
+            let dst_tags = match req.tagging_directive {
+                TaggingDirective::Copy => found.tags.clone(),
+                TaggingDirective::Replace => req.tags.clone().unwrap_or_default(),
+            };
+            let req_tags_for_auth = match req.tagging_directive {
+                TaggingDirective::Copy => (!found.tags.is_empty()).then_some(&dst_tags),
+                TaggingDirective::Replace => req.tags.as_ref(),
+            };
+            let dst_b = check_bucket_write_object(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.dst_bucket,
+                &req.dst_key,
+                req_tags_for_auth,
+            )?;
+            enforce_block_public_acl_spec(
+                dst_b
+                    .auth_view(self.cfg.default_object_ownership)
+                    .block_public_acls(),
+                req.acl.as_ref(),
+            )
+            .map_err(|e| e.with_key(&req.dst_bucket, &req.dst_key))?;
             let _ = resolve_object_owner_and_acl(
-                dst_b.ownership,
+                dst_b.effective_ownership(self.cfg.default_object_ownership),
                 &dst_b.owner,
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
@@ -2364,7 +3167,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             )?;
 
             let pins = self.pin_extents(&found.extents)?;
-            (found, pins)
+            (found, pins, dst_tags)
         };
 
         // 2. Copy blocks sequentially into active segment (maintaining strict 1-to-1 block ownership!)
@@ -2405,11 +3208,29 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         // 3. Commit under destination key lock
         let _kl = self.key_stripe(&req.dst_bucket, &req.dst_key).lock().await;
+        let req_tags_for_auth = match req.tagging_directive {
+            TaggingDirective::Copy => (!src_ver.tags.is_empty()).then_some(&dst_tags),
+            TaggingDirective::Replace => req.tags.as_ref(),
+        };
         let (dst_versioning, dst_owner, dst_acl) = {
             let cat = self.catalog.read().unwrap();
-            let dst_b = check_bucket_perm(&cat, &req.ctx, &req.dst_bucket, AclPermission::Write)?;
+            let dst_b = check_bucket_write_object(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.dst_bucket,
+                &req.dst_key,
+                req_tags_for_auth,
+            )?;
+            enforce_block_public_acl_spec(
+                dst_b
+                    .auth_view(self.cfg.default_object_ownership)
+                    .block_public_acls(),
+                req.acl.as_ref(),
+            )
+            .map_err(|e| e.with_key(&req.dst_bucket, &req.dst_key))?;
             let (owner, acl) = resolve_object_owner_and_acl(
-                dst_b.ownership,
+                dst_b.effective_ownership(self.cfg.default_object_ownership),
                 &dst_b.owner,
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
@@ -2457,6 +3278,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             user_meta: user_meta.clone(),
             owner: dst_owner.clone(),
             acl: dst_acl.clone(),
+            tags: dst_tags.clone(),
             last_modified_ms: req.ctx.request_time_ms,
             extents: new_extents.clone(),
             parts: None,
@@ -2482,6 +3304,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     user_meta,
                     owner: dst_owner,
                     acl: dst_acl,
+                    tags: dst_tags,
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: new_extents.clone().into(),
                     parts: None,
@@ -2522,10 +3345,23 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
         let (initiator, obj_owner, obj_acl) = {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let b = check_bucket_write_object(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.tags.as_ref(),
+            )?;
+            enforce_block_public_acl_spec(
+                b.auth_view(self.cfg.default_object_ownership)
+                    .block_public_acls(),
+                req.acl.as_ref(),
+            )
+            .map_err(|e| e.with_key(&req.bucket, &req.key))?;
             let initiator = req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone());
             let (obj_owner, obj_acl) = resolve_object_owner_and_acl(
-                b.ownership,
+                b.effective_ownership(self.cfg.default_object_ownership),
                 &b.owner,
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
@@ -2538,6 +3374,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         rand::thread_rng().fill_bytes(&mut entropy);
         // [FR-24] >= 128-bit random entropy UploadId
         let upload_id = format!("mp{seq:016x}{}", hex::encode(entropy));
+        let up_tags = req.tags.unwrap_or_default();
 
         self.commit_wal(WalOp::CreateMultipartUpload {
             bucket: req.bucket.clone(),
@@ -2546,6 +3383,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             initiator: initiator.clone(),
             owner: obj_owner.clone(),
             acl: obj_acl.clone(),
+            tags: up_tags.clone(),
             initiated_ms: req.ctx.request_time_ms,
             sys_meta: req.sys_meta.clone(),
             user_meta: req.user_meta.clone(),
@@ -2568,6 +3406,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         initiator,
                         owner: obj_owner,
                         acl: obj_acl,
+                        tags: up_tags,
                         initiated_ms: req.ctx.request_time_ms,
                         sys_meta: req.sys_meta,
                         user_meta: req.user_meta,
@@ -2606,7 +3445,17 @@ impl<D: Disk> ObjectStore for Engine<D> {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
             let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
-                if has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                let view = b.auth_view(self.cfg.default_object_ownership);
+                if authorize_object_action(
+                    &view,
+                    &req.ctx,
+                    &req.key,
+                    &[S3Action::PutObject],
+                    Some(&b.owner),
+                    Some((&b.acl, AclPermission::Write)),
+                    true,
+                    &PolicyEvalExtra::default(),
+                ) {
                     return Err(S3Error::new(
                         S3ErrorCode::NoSuchUpload,
                         "The specified upload does not exist.",
@@ -2618,7 +3467,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         .with_bucket(&req.bucket),
                 );
             };
-            if !has_upload_perm(b, up, &req.ctx, AclPermission::Write) {
+            if !has_upload_perm(
+                b,
+                self.cfg.default_object_ownership,
+                &req.key,
+                up,
+                &req.ctx,
+                &[S3Action::PutObject],
+                AclPermission::Write,
+            ) {
                 return Err(
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                         .with_bucket(&req.bucket),
@@ -2718,7 +3575,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 )
                 .with_upload(&req.bucket, &req.key, &req.upload_id));
             };
-            if !has_upload_perm(b, up, &req.ctx, AclPermission::Write) {
+            if !has_upload_perm(
+                b,
+                self.cfg.default_object_ownership,
+                &req.key,
+                up,
+                &req.ctx,
+                &[S3Action::PutObject],
+                AclPermission::Write,
+            ) {
                 return Err(
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                         .with_bucket(&req.bucket),
@@ -2798,7 +3663,17 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .uploads
                 .get(&(req.dst_key.clone(), req.upload_id.clone()))
             else {
-                if has_bucket_perm(dst_b, &req.ctx, AclPermission::Write) {
+                let view = dst_b.auth_view(self.cfg.default_object_ownership);
+                if authorize_object_action(
+                    &view,
+                    &req.ctx,
+                    &req.dst_key,
+                    &[S3Action::PutObject],
+                    Some(&dst_b.owner),
+                    Some((&dst_b.acl, AclPermission::Write)),
+                    true,
+                    &PolicyEvalExtra::default(),
+                ) {
                     return Err(S3Error::new(
                         S3ErrorCode::NoSuchUpload,
                         "The specified upload does not exist.",
@@ -2810,7 +3685,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         .with_bucket(&req.dst_bucket),
                 );
             };
-            if !has_upload_perm(dst_b, up, &req.ctx, AclPermission::Write) {
+            if !has_upload_perm(
+                dst_b,
+                self.cfg.default_object_ownership,
+                &req.dst_key,
+                up,
+                &req.ctx,
+                &[S3Action::PutObject],
+                AclPermission::Write,
+            ) {
                 return Err(
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                         .with_bucket(&req.dst_bucket),
@@ -2973,7 +3856,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 )
                 .with_upload(&req.dst_bucket, &req.dst_key, &req.upload_id));
             };
-            if !has_upload_perm(dst_b, up, &req.ctx, AclPermission::Write) {
+            if !has_upload_perm(
+                dst_b,
+                self.cfg.default_object_ownership,
+                &req.dst_key,
+                up,
+                &req.ctx,
+                &[S3Action::PutObject],
+                AclPermission::Write,
+            ) {
                 return Err(
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                         .with_bucket(&req.dst_bucket),
@@ -3060,7 +3951,17 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .completed_uploads
                 .get(&(req.key.clone(), req.upload_id.clone()))
             {
-                if !has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                let view = b.auth_view(self.cfg.default_object_ownership);
+                if !authorize_object_action(
+                    &view,
+                    &req.ctx,
+                    &req.key,
+                    &[S3Action::PutObject],
+                    Some(&b.owner),
+                    Some((&b.acl, AclPermission::Write)),
+                    true,
+                    &PolicyEvalExtra::default(),
+                ) {
                     return Err(
                         S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                             .with_bucket(&req.bucket),
@@ -3078,7 +3979,17 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .get(&(req.key.clone(), req.upload_id.clone()))
                 .cloned()
             else {
-                if has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                let view = b.auth_view(self.cfg.default_object_ownership);
+                if authorize_object_action(
+                    &view,
+                    &req.ctx,
+                    &req.key,
+                    &[S3Action::PutObject],
+                    Some(&b.owner),
+                    Some((&b.acl, AclPermission::Write)),
+                    true,
+                    &PolicyEvalExtra::default(),
+                ) {
                     return Err(S3Error::new(
                         S3ErrorCode::NoSuchUpload,
                         "The specified upload does not exist.",
@@ -3090,7 +4001,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         .with_bucket(&req.bucket),
                 );
             };
-            if !has_upload_perm(b, &up, &req.ctx, AclPermission::Write) {
+            if !has_upload_perm(
+                b,
+                self.cfg.default_object_ownership,
+                &req.key,
+                &up,
+                &req.ctx,
+                &[S3Action::PutObject],
+                AclPermission::Write,
+            ) {
                 return Err(
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                         .with_bucket(&req.bucket),
@@ -3298,6 +4217,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             user_meta: up.user_meta.clone(),
             owner: up.owner.clone(),
             acl: up.acl.clone(),
+            tags: up.tags.clone(),
             completed_ms: req.ctx.request_time_ms,
             extents: combined_extents.clone(),
             parts: boundaries.clone(),
@@ -3323,6 +4243,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     user_meta: up.user_meta,
                     owner: up.owner,
                     acl: up.acl,
+                    tags: up.tags,
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: combined_extents.into(),
                     parts: Some(boundaries.into()),
@@ -3357,7 +4278,17 @@ impl<D: Disk> ObjectStore for Engine<D> {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
             let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
-                if has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                let view = b.auth_view(self.cfg.default_object_ownership);
+                if authorize_object_action(
+                    &view,
+                    &req.ctx,
+                    &req.key,
+                    &[S3Action::AbortMultipartUpload],
+                    Some(&b.owner),
+                    Some((&b.acl, AclPermission::Write)),
+                    true,
+                    &PolicyEvalExtra::default(),
+                ) {
                     return Err(S3Error::new(
                         S3ErrorCode::NoSuchUpload,
                         "The specified upload does not exist.",
@@ -3369,7 +4300,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         .with_bucket(&req.bucket),
                 );
             };
-            if !has_upload_perm(b, up, &req.ctx, AclPermission::Write) {
+            if !has_upload_perm(
+                b,
+                self.cfg.default_object_ownership,
+                &req.key,
+                up,
+                &req.ctx,
+                &[S3Action::AbortMultipartUpload],
+                AclPermission::Write,
+            ) {
                 return Err(
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                         .with_bucket(&req.bucket),
@@ -3406,7 +4345,17 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let cat = self.catalog.read().unwrap();
         let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
         let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
-            if has_bucket_perm(b, &req.ctx, AclPermission::Read) {
+            let view = b.auth_view(self.cfg.default_object_ownership);
+            if authorize_object_action(
+                &view,
+                &req.ctx,
+                &req.key,
+                &[S3Action::ListMultipartUploadParts],
+                Some(&b.owner),
+                Some((&b.acl, AclPermission::Read)),
+                true,
+                &PolicyEvalExtra::default(),
+            ) {
                 return Err(S3Error::new(
                     S3ErrorCode::NoSuchUpload,
                     "The specified upload does not exist.",
@@ -3418,7 +4367,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     .with_bucket(&req.bucket),
             );
         };
-        if !has_upload_perm(b, up, &req.ctx, AclPermission::Read) {
+        if !has_upload_perm(
+            b,
+            self.cfg.default_object_ownership,
+            &req.key,
+            up,
+            &req.ctx,
+            &[S3Action::ListMultipartUploadParts],
+            AclPermission::Read,
+        ) {
             return Err(
                 S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                     .with_bucket(&req.bucket),
@@ -3473,7 +4430,20 @@ impl<D: Disk> ObjectStore for Engine<D> {
         req: ListMultipartUploadsReq,
     ) -> StoreResult<ListMultipartUploadsResp> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
+        let extra = PolicyEvalExtra {
+            prefix: Some(&req.prefix),
+            delimiter: req.delimiter.as_deref(),
+            ..Default::default()
+        };
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::ListBucketMultipartUploads],
+            Some(AclPermission::Read),
+            &extra,
+        )?;
         let max_u = req.max_uploads.min(1000);
         let km = req.key_marker.clone().unwrap_or_default();
         let um = req.upload_id_marker.clone().unwrap_or_default();
@@ -3560,7 +4530,20 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn list_objects_v1(&self, req: ListObjectsV1Req) -> StoreResult<ListObjectsV1Resp> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
+        let extra = PolicyEvalExtra {
+            prefix: Some(&req.prefix),
+            delimiter: req.delimiter.as_deref(),
+            ..Default::default()
+        };
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::ListBucket],
+            Some(AclPermission::Read),
+            &extra,
+        )?;
         let max_keys = req.max_keys.min(1000);
         let marker_str = req.marker.clone().unwrap_or_default();
         let (items, is_truncated) = collect_visible_items(
@@ -3617,7 +4600,20 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn list_objects_v2(&self, req: ListObjectsV2Req) -> StoreResult<ListObjectsV2Resp> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
+        let extra = PolicyEvalExtra {
+            prefix: Some(&req.prefix),
+            delimiter: req.delimiter.as_deref(),
+            ..Default::default()
+        };
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::ListBucket],
+            Some(AclPermission::Read),
+            &extra,
+        )?;
         let max_keys = req.max_keys.min(1000);
         let token_after = match &req.continuation_token {
             Some(tok) if !tok.is_empty() => Some(decode_token(&req.bucket, tok)?),
@@ -3690,7 +4686,20 @@ impl<D: Disk> ObjectStore for Engine<D> {
         req: ListObjectVersionsReq,
     ) -> StoreResult<ListObjectVersionsResp> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
+        let extra = PolicyEvalExtra {
+            prefix: Some(&req.prefix),
+            delimiter: req.delimiter.as_deref(),
+            ..Default::default()
+        };
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::ListBucketVersions],
+            Some(AclPermission::Read),
+            &extra,
+        )?;
         let max_keys = req.max_keys.min(1000);
         let km = req.key_marker.clone().unwrap_or_default();
         let vm = req.version_id_marker.clone().unwrap_or_default();
@@ -3845,7 +4854,8 @@ impl<D: Disk> Engine<D> {
                 let Some(head) = b.objects.get(key).and_then(|c| c.first()) else {
                     return Err(
                         S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
-                            .with_key(bucket_name, key),
+                            .with_key(bucket_name, key)
+                            .with_header("x-amz-delete-marker", "false"),
                     );
                 };
                 if head.is_delete_marker {
@@ -3884,18 +4894,37 @@ impl<D: Disk> Engine<D> {
         }
     }
 
-    fn lookup_version_for_read_checked<'a>(
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_version_for_op_checked<'a>(
         &self,
         b: &'a BucketEntry,
         ctx: &CallerContext,
         bucket_name: &str,
         key: &str,
         version_id: Option<&str>,
-        needed: AclPermission,
+        actions: &[S3Action],
+        acl_needed: Option<AclPermission>,
+        req_tags: Option<&BTreeMap<String, String>>,
     ) -> StoreResult<&'a ObjectVersionEntry> {
+        let view = b.auth_view(self.cfg.default_object_ownership);
         match self.lookup_version_for_read(b, bucket_name, key, version_id) {
             Ok(ver) => {
-                if !has_object_perm(b, ver, ctx, needed) {
+                let extra = PolicyEvalExtra {
+                    existing_object_tags: Some(&ver.tags),
+                    request_object_tags: req_tags,
+                    ..Default::default()
+                };
+                let acl_grant = acl_needed.map(|perm| (&ver.acl, perm));
+                if !authorize_object_action(
+                    &view,
+                    ctx,
+                    key,
+                    actions,
+                    Some(&ver.owner),
+                    acl_grant,
+                    false,
+                    &extra,
+                ) {
                     return Err(
                         S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                             .with_key(bucket_name, key),
@@ -3904,7 +4933,7 @@ impl<D: Disk> Engine<D> {
                 Ok(ver)
             }
             Err(err) => {
-                if has_bucket_perm(b, ctx, AclPermission::Read) {
+                if can_reveal_missing_key(&view, ctx, key, version_id.is_some()) {
                     Err(err)
                 } else {
                     Err(
@@ -3924,6 +4953,12 @@ impl<D: Disk> Engine<D> {
         key: &str,
         version_id: Option<&str>,
     ) -> StoreResult<&'a ObjectVersionEntry> {
+        let view = b.auth_view(self.cfg.default_object_ownership);
+        let actions: &[S3Action] = if version_id.is_some() {
+            &[S3Action::GetObjectVersion, S3Action::GetObject]
+        } else {
+            &[S3Action::GetObject]
+        };
         let ver = match version_id {
             None => b
                 .objects
@@ -3936,7 +4971,7 @@ impl<D: Disk> Engine<D> {
             }),
         };
         let Some(ver) = ver else {
-            if has_bucket_perm(b, ctx, AclPermission::Read) {
+            if can_reveal_missing_key(&view, ctx, key, version_id.is_some()) {
                 return Err(
                     S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
                         .with_key(bucket_name, key),
@@ -3947,7 +4982,7 @@ impl<D: Disk> Engine<D> {
             );
         };
         if ver.is_delete_marker {
-            if !has_bucket_perm(b, ctx, AclPermission::Read) {
+            if !can_reveal_missing_key(&view, ctx, key, true) {
                 return Err(
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                         .with_key(bucket_name, key),
@@ -3958,7 +4993,20 @@ impl<D: Disk> Engine<D> {
                 "The source of a copy request may not specifically refer to a delete marker by version id.",
             ));
         }
-        if !has_object_perm(b, ver, ctx, AclPermission::Read) {
+        let extra = PolicyEvalExtra {
+            existing_object_tags: Some(&ver.tags),
+            ..Default::default()
+        };
+        if !authorize_object_action(
+            &view,
+            ctx,
+            key,
+            actions,
+            Some(&ver.owner),
+            Some((&ver.acl, AclPermission::Read)),
+            false,
+            &extra,
+        ) {
             return Err(
                 S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_key(bucket_name, key)
             );
@@ -3980,17 +5028,24 @@ impl<D: Disk> Engine<D> {
         }
 
         // Snapshot version metadata and pin segments while holding brief catalog read lock (8.6)
+        let actions: &[S3Action] = if req.version_id.is_some() {
+            &[S3Action::GetObjectVersion, S3Action::GetObject]
+        } else {
+            &[S3Action::GetObject]
+        };
         let (ver, pins) = {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
             let found = self
-                .lookup_version_for_read_checked(
+                .lookup_version_for_op_checked(
                     b,
                     &req.ctx,
                     &req.bucket,
                     &req.key,
                     req.version_id.as_deref(),
-                    AclPermission::Read,
+                    actions,
+                    Some(AclPermission::Read),
+                    None,
                 )?
                 .clone();
 
@@ -4118,6 +5173,7 @@ impl<D: Disk> Engine<D> {
             user_meta: ver.user_meta,
             checksum,
             parts_count,
+            tags_count: ver.tags.len(),
         };
         Ok((meta, reader))
     }
