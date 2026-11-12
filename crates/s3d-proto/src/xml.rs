@@ -10,7 +10,7 @@ use crate::uri::{aws_uri_encode, percent_decode_query_component};
 pub const S3_XML_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// Reject DTD / XXE constructs unconditionally (`NFR-8`).
-fn check_no_dtd_or_entity(raw_xml: &[u8]) -> StoreResult<()> {
+pub(crate) fn check_no_dtd_or_entity(raw_xml: &[u8]) -> StoreResult<()> {
     // Case-insensitive scan for `<!DOCTYPE` or `<!ENTITY`
     let upper: Vec<u8> = raw_xml.iter().map(|b| b.to_ascii_uppercase()).collect();
     if upper.windows(9).any(|w| w == b"<!DOCTYPE") || upper.windows(8).any(|w| w == b"<!ENTITY") {
@@ -1022,7 +1022,7 @@ pub fn render_acl_xml(policy: &AccessControlPolicy) -> String {
     xml
 }
 
-fn is_valid_acl_group_uri(uri: &str) -> bool {
+pub(crate) fn is_valid_acl_group_uri(uri: &str) -> bool {
     matches!(
         uri,
         GROUP_ALL_USERS | GROUP_AUTHENTICATED_USERS | GROUP_LOG_DELIVERY
@@ -1813,7 +1813,7 @@ pub fn render_post_response_xml(location: &str, bucket: &str, key: &str, etag: &
     )
 }
 
-fn malformed_xml() -> S3Error {
+pub(crate) fn malformed_xml() -> S3Error {
     S3Error::new(
         S3ErrorCode::MalformedXML,
         "The XML you provided was not well-formed or did not validate against our published schema",

@@ -32,6 +32,8 @@ pub struct ParsedPostObject {
     pub success_redirect: Option<String>,
     pub success_status: u16,
     pub x_amz_acl_raw: Option<String>,
+    pub raw_sse: RawSseHeaders,
+    pub raw_lock: RawUploadObjectLockHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -635,12 +637,7 @@ pub fn parse_and_verify_post_object(
                     } else {
                         get_field(&fields, field_lower)
                     };
-                    let Some(actual) = actual_opt else {
-                        return Err(S3Error::new(
-                            S3ErrorCode::AccessDenied,
-                            "Invalid according to Policy: Policy Condition failed",
-                        ));
-                    };
+                    let actual = actual_opt.unwrap_or("");
                     if !actual.starts_with(prefix) {
                         return Err(S3Error::new(
                             S3ErrorCode::AccessDenied,
@@ -791,6 +788,27 @@ pub fn parse_and_verify_post_object(
         _ => 204,
     };
 
+    let raw_sse = RawSseHeaders {
+        sse_algorithm: get_field(&fields, "x-amz-server-side-encryption").map(str::to_string),
+        sse_kms_key_id: get_field(&fields, "x-amz-server-side-encryption-aws-kms-key-id")
+            .map(str::to_string),
+        sse_customer_algorithm: get_field(&fields, "x-amz-server-side-encryption-customer-algorithm")
+            .map(str::to_string),
+        sse_customer_key_b64: get_field(&fields, "x-amz-server-side-encryption-customer-key")
+            .map(str::to_string),
+        sse_customer_key_md5_b64: get_field(
+            &fields,
+            "x-amz-server-side-encryption-customer-key-md5",
+        )
+        .map(str::to_string),
+    };
+    let raw_lock = RawUploadObjectLockHeaders {
+        mode: get_field(&fields, "x-amz-object-lock-mode").map(str::to_string),
+        retain_until_date: get_field(&fields, "x-amz-object-lock-retain-until-date")
+            .map(str::to_string),
+        legal_hold: get_field(&fields, "x-amz-object-lock-legal-hold").map(str::to_string),
+    };
+
     Ok(ParsedPostObject {
         caller,
         is_authenticated,
@@ -804,5 +822,7 @@ pub fn parse_and_verify_post_object(
         success_redirect,
         success_status,
         x_amz_acl_raw,
+        raw_sse,
+        raw_lock,
     })
 }

@@ -302,6 +302,51 @@ enum ModelOp {
         action: u8, // 0=get, 1=delete, 2=put
         bits: u8,
     },
+    BucketEncryption {
+        u: u8,
+        b: u8,
+        action: u8, // 0=get, 1=delete, 2=put
+    },
+    BucketLifecycle {
+        u: u8,
+        b: u8,
+        action: u8, // 0=get, 1=delete, 2=put
+    },
+    LifecycleTick,
+    BucketObjectLock {
+        u: u8,
+        b: u8,
+        put: bool,
+    },
+    ObjectRetention {
+        u: u8,
+        b: u8,
+        k: u8,
+        ver_slot: Option<u8>,
+        action: u8, // 0=get, 1=put_gov, 2=put_comp
+        bypass: bool,
+    },
+    ObjectLegalHold {
+        u: u8,
+        b: u8,
+        k: u8,
+        ver_slot: Option<u8>,
+        action: u8, // 0=get, 1=on, 2=off
+    },
+    BucketLogging {
+        u: u8,
+        b: u8,
+        tb: u8,
+        enable: Option<bool>, // None=get, Some(false)=disable, Some(true)=enable
+    },
+    SsePutGet {
+        u: u8,
+        b: u8,
+        k: u8,
+        sse_kind: u8, // 0=SSE-S3, 1=SSE-C keyA, 2=SSE-C keyB
+        read_kind: u8, // 0=none, 1=SSE-C keyA, 2=SSE-C keyB
+        size: usize,
+    },
     Compact,
 }
 
@@ -618,6 +663,60 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                 action,
                 bits,
             }),
+        2 => (user_strategy(), 0u8..2, 0u8..3)
+            .prop_map(|(u, b, action)| ModelOp::BucketEncryption { u, b, action }),
+        2 => (user_strategy(), 0u8..2, 0u8..3)
+            .prop_map(|(u, b, action)| ModelOp::BucketLifecycle { u, b, action }),
+        1 => Just(ModelOp::LifecycleTick),
+        2 => (user_strategy(), 0u8..2, any::<bool>())
+            .prop_map(|(u, b, put)| ModelOp::BucketObjectLock { u, b, put }),
+        2 => (
+            user_strategy(),
+            0u8..2,
+            0u8..4,
+            opt_ver_slot(),
+            0u8..3,
+            any::<bool>(),
+        )
+            .prop_map(|(u, b, k, ver_slot, action, bypass)| ModelOp::ObjectRetention {
+                u,
+                b,
+                k,
+                ver_slot,
+                action,
+                bypass,
+            }),
+        2 => (user_strategy(), 0u8..2, 0u8..4, opt_ver_slot(), 0u8..3)
+            .prop_map(|(u, b, k, ver_slot, action)| ModelOp::ObjectLegalHold {
+                u,
+                b,
+                k,
+                ver_slot,
+                action,
+            }),
+        2 => (
+            user_strategy(),
+            0u8..2,
+            0u8..2,
+            prop_oneof![Just(None), Just(Some(false)), Just(Some(true))],
+        )
+            .prop_map(|(u, b, tb, enable)| ModelOp::BucketLogging { u, b, tb, enable }),
+        3 => (
+            user_strategy(),
+            0u8..2,
+            0u8..4,
+            0u8..3,
+            0u8..3,
+            prop_oneof![Just(0usize), Just(37), Just(4096), Just(9001)],
+        )
+            .prop_map(|(u, b, k, sse_kind, read_kind, size)| ModelOp::SsePutGet {
+                u,
+                b,
+                k,
+                sse_kind,
+                read_kind,
+                size,
+            }),
         1 => Just(ModelOp::Compact),
     ]
 }
@@ -741,6 +840,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     location_constraint: None,
                     object_ownership: ownership,
                     acl: canned_acl.map(|i| AclSpec::Canned(CANNED_ACL_POOL[i as usize])),
+                    object_lock_enabled: false,
                 };
                 let re = engine.create_bucket(req.clone()).await.map(|r| (r.name, r.ownership));
                 let rm = model.create_bucket(req).await.map(|r| (r.name, r.ownership));
@@ -810,6 +910,8 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     tags: sample_tags(tag_slot),
                     preconditions: cond,
                     max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                    raw_sse: RawSseHeaders::default(),
+                    raw_lock: RawUploadObjectLockHeaders::default(),
                 };
                 let make_stream = || {
                     let s = InMemoryVerifiedStream::from_bytes(Bytes::from(payload.clone()), alg);
@@ -856,6 +958,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         part_number: part_num,
                         preconditions: Preconditions::default(),
                         checksum_mode_enabled: true,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 let rm = model
@@ -868,6 +971,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         part_number: part_num,
                         preconditions: Preconditions::default(),
                         checksum_mode_enabled: true,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 match (re, rm) {
@@ -903,6 +1007,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         part_number: None,
                         preconditions: Preconditions::default(),
                         checksum_mode_enabled: true,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 let rm = model
@@ -915,6 +1020,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         part_number: None,
                         preconditions: Preconditions::default(),
                         checksum_mode_enabled: true,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 match (re, rm) {
@@ -948,6 +1054,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         attrs,
                         max_parts: 100,
                         part_number_marker: 0,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 let rm = model
@@ -959,6 +1066,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         attrs,
                         max_parts: 100,
                         part_number_marker: 0,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 match (re, rm) {
@@ -992,6 +1100,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         key: KEY_POOL[k as usize].to_string(),
                         version_id: ev.clone(),
                         if_match: if_match.clone(),
+                        bypass_governance: false,
                     })
                     .await;
                 let rm = model
@@ -1001,6 +1110,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         key: KEY_POOL[k as usize].to_string(),
                         version_id: mv,
                         if_match,
+                        bypass_governance: false,
                     })
                     .await;
                 match (re, rm) {
@@ -1038,6 +1148,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         bucket: BUCKET_POOL[b as usize].to_string(),
                         quiet,
                         items: e_items,
+                        bypass_governance: false,
                     })
                     .await;
                 let rm = model
@@ -1046,6 +1157,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         bucket: BUCKET_POOL[b as usize].to_string(),
                         quiet,
                         items: m_items,
+                        bypass_governance: false,
                     })
                     .await;
                 match (re, rm) {
@@ -1108,6 +1220,9 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         tags: tags.clone(),
                         src_preconditions: Preconditions::default(),
                         dst_preconditions: Preconditions::default(),
+                        raw_copy_src_sse: RawCopySourceSseHeaders::default(),
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
                     })
                     .await;
                 let rm = model
@@ -1126,6 +1241,9 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         tags,
                         src_preconditions: Preconditions::default(),
                         dst_preconditions: Preconditions::default(),
+                        raw_copy_src_sse: RawCopySourceSseHeaders::default(),
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
                     })
                     .await;
                 match (re, rm) {
@@ -1281,6 +1399,8 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     tags: sample_tags(tag_slot),
                     checksum_algorithm: alg,
                     checksum_type: ctype,
+                    raw_sse: RawSseHeaders::default(),
+                    raw_lock: RawUploadObjectLockHeaders::default(),
                 };
                 let re = engine.create_multipart_upload(req.clone()).await;
                 let rm = model.create_multipart_upload(req).await;
@@ -1313,6 +1433,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                             upload_id: e_uid.clone(),
                             part_number: part_num,
                             max_bytes_limit: MAX_PART_SIZE_BYTES,
+                            raw_sse: RawSseHeaders::default(),
                         },
                         InMemoryVerifiedStream::from_bytes(Bytes::from(payload.clone()), None),
                     )
@@ -1326,6 +1447,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                             upload_id: m_uid.clone(),
                             part_number: part_num,
                             max_bytes_limit: MAX_PART_SIZE_BYTES,
+                            raw_sse: RawSseHeaders::default(),
                         },
                         InMemoryVerifiedStream::from_bytes(Bytes::from(payload), None),
                     )
@@ -1371,6 +1493,8 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         dst_key: key.clone(),
                         upload_id: e_uid.clone(),
                         part_number: part_num,
+                        raw_copy_src_sse: RawCopySourceSseHeaders::default(),
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 let rm = model
@@ -1385,6 +1509,8 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         dst_key: key,
                         upload_id: m_uid,
                         part_number: part_num,
+                        raw_copy_src_sse: RawCopySourceSseHeaders::default(),
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 match (re, rm) {
@@ -1529,6 +1655,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         expected_checksum: None,
                         expected_object_size: None,
                         preconditions: cond.clone(),
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 let rm = model
@@ -1541,6 +1668,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         expected_checksum: None,
                         expected_object_size: None,
                         preconditions: cond,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await;
                 match (re, rm) {
@@ -1897,6 +2025,438 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     }
                 }
             }
+            ModelOp::BucketEncryption { u, b, action } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match action {
+                    0 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_encryption(req.clone()).await;
+                        let rm = model.get_bucket_encryption(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    1 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.delete_bucket_encryption(req.clone()).await;
+                        let rm = model.delete_bucket_encryption(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    _ => {
+                        let req = PutBucketEncryptionReq {
+                            ctx,
+                            bucket,
+                            config: BucketEncryptionConfig {
+                                sse_algorithm: "AES256".into(),
+                                bucket_key_enabled: Some(false),
+                            },
+                        };
+                        let re = engine.put_bucket_encryption(req.clone()).await;
+                        let rm = model.put_bucket_encryption(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
+            ModelOp::BucketLifecycle { u, b, action } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match action {
+                    0 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_lifecycle_configuration(req.clone()).await;
+                        let rm = model.get_bucket_lifecycle_configuration(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    1 => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.delete_bucket_lifecycle(req.clone()).await;
+                        let rm = model.delete_bucket_lifecycle(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    _ => {
+                        let config = LifecycleConfiguration {
+                            rules: vec![LifecycleRule {
+                                id: "r-exp".into(),
+                                status: LifecycleRuleStatus::Enabled,
+                                scope: LifecycleRuleScope::Filter(LifecycleFilter::Prefix(
+                                    "dir/".into(),
+                                )),
+                                expiration: Some(LifecycleExpiration {
+                                    days: Some(1),
+                                    date_us: None,
+                                    expired_object_delete_marker: None,
+                                }),
+                                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                                    noncurrent_days: 1,
+                                    newer_noncurrent_versions: Some(1),
+                                }),
+                                abort_incomplete_multipart_upload: Some(
+                                    AbortIncompleteMultipartUpload {
+                                        days_after_initiation: 1,
+                                    },
+                                ),
+                            }],
+                        };
+                        let req = PutBucketLifecycleReq {
+                            ctx,
+                            bucket,
+                            config,
+                        };
+                        let re = engine
+                            .put_bucket_lifecycle_configuration(req.clone())
+                            .await;
+                        let rm = model.put_bucket_lifecycle_configuration(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
+            ModelOp::LifecycleTick => {
+                clock_ms += 3_000;
+                engine.run_lifecycle_tick(clock_ms, Some(2)).await.unwrap();
+                model.run_lifecycle_tick(clock_ms, Some(2));
+                // Sync any newly inserted delete marker version IDs into IdBijection
+                for bname in &BUCKET_POOL[0..2] {
+                    let ctx = test_caller(0, clock_ms);
+                    let req = ListObjectVersionsReq {
+                        ctx,
+                        bucket: (*bname).to_string(),
+                        prefix: String::new(),
+                        delimiter: None,
+                        key_marker: None,
+                        version_id_marker: None,
+                        max_keys: 1000,
+                    };
+                    if let (Ok(le), Ok(lm)) = (
+                        engine.list_object_versions(req.clone()).await,
+                        model.list_object_versions(req).await,
+                    ) {
+                        assert_eq!(le.entries.len(), lm.entries.len());
+                        for (ve, vm) in le.entries.iter().zip(lm.entries.iter()) {
+                            assert_eq!(ve.key, vm.key);
+                            assert_eq!(ve.is_delete_marker, vm.is_delete_marker);
+                            if vm.version_id != "null" && !ids.m2e_ver.contains_key(&vm.version_id) {
+                                ids.record_ver_pair(
+                                    &Some(ve.version_id.clone()),
+                                    &Some(vm.version_id.clone()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            ModelOp::BucketObjectLock { u, b, put } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                if put {
+                    let req = PutObjectLockConfigurationReq {
+                        ctx,
+                        bucket,
+                        config: ObjectLockConfiguration {
+                            default_retention: Some(DefaultRetention {
+                                mode: ObjectLockMode::Governance,
+                                period: DefaultRetentionPeriod::Days(1),
+                            }),
+                        },
+                    };
+                    let re = engine.put_object_lock_configuration(req.clone()).await;
+                    let rm = model.put_object_lock_configuration(req).await;
+                    assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                } else {
+                    let req = BucketRef { ctx, bucket };
+                    let re = engine.get_object_lock_configuration(req.clone()).await;
+                    let rm = model.get_object_lock_configuration(req).await;
+                    assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                }
+            }
+            ModelOp::ObjectRetention {
+                u,
+                b,
+                k,
+                ver_slot,
+                action,
+                bypass,
+            } => {
+                let (ev, mv) = ids.pick_ver(ver_slot);
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                let key = KEY_POOL[k as usize].to_string();
+                if action == 0 {
+                    let re = engine
+                        .get_object_retention(ObjectLockRef {
+                            ctx: ctx.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: ev,
+                        })
+                        .await;
+                    let rm = model
+                        .get_object_retention(ObjectLockRef {
+                            ctx,
+                            bucket,
+                            key,
+                            version_id: mv,
+                        })
+                        .await;
+                    assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                } else {
+                    let mode = if action == 1 {
+                        ObjectLockMode::Governance
+                    } else {
+                        ObjectLockMode::Compliance
+                    };
+                    let retention = ObjectRetention {
+                        mode,
+                        retain_until_us: (clock_ms + 60_000) * 1000,
+                    };
+                    let re = engine
+                        .put_object_retention(PutObjectRetentionReq {
+                            ctx: ctx.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: ev,
+                            retention,
+                            bypass_governance: bypass,
+                        })
+                        .await;
+                    let rm = model
+                        .put_object_retention(PutObjectRetentionReq {
+                            ctx,
+                            bucket,
+                            key,
+                            version_id: mv,
+                            retention,
+                            bypass_governance: bypass,
+                        })
+                        .await;
+                    assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                }
+            }
+            ModelOp::ObjectLegalHold {
+                u,
+                b,
+                k,
+                ver_slot,
+                action,
+            } => {
+                let (ev, mv) = ids.pick_ver(ver_slot);
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                let key = KEY_POOL[k as usize].to_string();
+                if action == 0 {
+                    let re = engine
+                        .get_object_legal_hold(ObjectLockRef {
+                            ctx: ctx.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: ev,
+                        })
+                        .await;
+                    let rm = model
+                        .get_object_legal_hold(ObjectLockRef {
+                            ctx,
+                            bucket,
+                            key,
+                            version_id: mv,
+                        })
+                        .await;
+                    assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                } else {
+                    let status = if action == 1 {
+                        LegalHoldStatus::On
+                    } else {
+                        LegalHoldStatus::Off
+                    };
+                    let re = engine
+                        .put_object_legal_hold(PutObjectLegalHoldReq {
+                            ctx: ctx.clone(),
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: ev,
+                            status,
+                        })
+                        .await;
+                    let rm = model
+                        .put_object_legal_hold(PutObjectLegalHoldReq {
+                            ctx,
+                            bucket,
+                            key,
+                            version_id: mv,
+                            status,
+                        })
+                        .await;
+                    assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                }
+            }
+            ModelOp::BucketLogging { u, b, tb, enable } => {
+                let ctx = test_caller(u, clock_ms);
+                let bucket = BUCKET_POOL[b as usize].to_string();
+                match enable {
+                    None => {
+                        let req = BucketRef { ctx, bucket };
+                        let re = engine.get_bucket_logging(req.clone()).await;
+                        let rm = model.get_bucket_logging(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                    Some(en) => {
+                        let status = if en {
+                            BucketLoggingStatus {
+                                logging_enabled: Some(LoggingEnabled {
+                                    target_bucket: BUCKET_POOL[tb as usize].to_string(),
+                                    target_prefix: "logs/".into(),
+                                    target_grants: Vec::new(),
+                                    target_object_key_format: None,
+                                }),
+                            }
+                        } else {
+                            BucketLoggingStatus::default()
+                        };
+                        let req = PutBucketLoggingReq {
+                            ctx,
+                            bucket,
+                            status,
+                        };
+                        let re = engine.put_bucket_logging(req.clone()).await;
+                        let rm = model.put_bucket_logging(req).await;
+                        assert_eq!(re.map_err(|e| e.code), rm.map_err(|e| e.code));
+                    }
+                }
+            }
+            ModelOp::SsePutGet {
+                u,
+                b,
+                k,
+                sse_kind,
+                read_kind,
+                size,
+            } => {
+                let write_sse = match sse_kind {
+                    0 => RawSseHeaders {
+                        sse_algorithm: Some("AES256".into()),
+                        ..Default::default()
+                    },
+                    1 => RawSseHeaders {
+                        sse_customer_algorithm: Some("AES256".into()),
+                        sse_customer_key_b64: Some(
+                            "pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".into(),
+                        ),
+                        sse_customer_key_md5_b64: Some("DWygnHRtgiJ77HCm+1rvHw==".into()),
+                        ..Default::default()
+                    },
+                    _ => RawSseHeaders {
+                        sse_customer_algorithm: Some("AES256".into()),
+                        sse_customer_key_b64: Some(
+                            "6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=".into(),
+                        ),
+                        sse_customer_key_md5_b64: Some("arxBvwY2V4SiOne6yppVPQ==".into()),
+                        ..Default::default()
+                    },
+                };
+                let read_sse = match read_kind {
+                    0 => RawSseHeaders::default(),
+                    1 => RawSseHeaders {
+                        sse_customer_algorithm: Some("AES256".into()),
+                        sse_customer_key_b64: Some(
+                            "pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".into(),
+                        ),
+                        sse_customer_key_md5_b64: Some("DWygnHRtgiJ77HCm+1rvHw==".into()),
+                        ..Default::default()
+                    },
+                    _ => RawSseHeaders {
+                        sse_customer_algorithm: Some("AES256".into()),
+                        sse_customer_key_b64: Some(
+                            "6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=".into(),
+                        ),
+                        sse_customer_key_md5_b64: Some("arxBvwY2V4SiOne6yppVPQ==".into()),
+                        ..Default::default()
+                    },
+                };
+                let mut put_ctx = test_caller(u, clock_ms);
+                put_ctx.policy_ctx.x_amz_server_side_encryption =
+                    write_sse.sse_algorithm.clone();
+                put_ctx.policy_ctx.x_amz_sse_customer_algorithm =
+                    write_sse.sse_customer_algorithm.clone();
+                let payload: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+                let put_req = PutObjectReq {
+                    ctx: put_ctx,
+                    bucket: BUCKET_POOL[b as usize].to_string(),
+                    key: KEY_POOL[k as usize].to_string(),
+                    sys_meta: SystemMeta::default(),
+                    user_meta: Vec::new(),
+                    acl: None,
+                    tags: None,
+                    preconditions: Preconditions::default(),
+                    max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                    raw_sse: write_sse,
+                    raw_lock: RawUploadObjectLockHeaders::default(),
+                };
+                let re = engine
+                    .put_object(
+                        put_req.clone(),
+                        InMemoryVerifiedStream::from_bytes(Bytes::from(payload.clone()), None),
+                    )
+                    .await;
+                let rm = model
+                    .put_object(
+                        put_req,
+                        InMemoryVerifiedStream::from_bytes(Bytes::from(payload), None),
+                    )
+                    .await;
+                match (re, rm) {
+                    (Ok(ae), Ok(am)) => {
+                        assert_eq!(ae.etag, am.etag);
+                        assert_eq!(ae.sse, am.sse);
+                        assert_eq!(ae.expiration_header, am.expiration_header);
+                        ids.record_ver_pair(&ae.version_id, &am.version_id);
+
+                        let mut get_ctx = test_caller(u, clock_ms + 1);
+                        get_ctx.policy_ctx.x_amz_sse_customer_algorithm =
+                            read_sse.sse_customer_algorithm.clone();
+                        let ge = engine
+                            .get_object(GetObjectReq {
+                                ctx: get_ctx.clone(),
+                                bucket: BUCKET_POOL[b as usize].to_string(),
+                                key: KEY_POOL[k as usize].to_string(),
+                                version_id: ae.version_id,
+                                range: None,
+                                part_number: None,
+                                preconditions: Preconditions::default(),
+                                checksum_mode_enabled: true,
+                                raw_sse: read_sse.clone(),
+                            })
+                            .await;
+                        let gm = model
+                            .get_object(GetObjectReq {
+                                ctx: get_ctx,
+                                bucket: BUCKET_POOL[b as usize].to_string(),
+                                key: KEY_POOL[k as usize].to_string(),
+                                version_id: am.version_id,
+                                range: None,
+                                part_number: None,
+                                preconditions: Preconditions::default(),
+                                checksum_mode_enabled: true,
+                                raw_sse: read_sse,
+                            })
+                            .await;
+                        match (ge, gm) {
+                            (Ok(oe), Ok(om)) => {
+                                assert_eq!(oe.meta.sse, om.meta.sse);
+                                assert_eq!(oe.meta.expiration_header, om.meta.expiration_header);
+                                assert_eq!(
+                                    read_all(oe.reader).await.unwrap(),
+                                    read_all(om.reader).await.unwrap()
+                                );
+                            }
+                            (Err(ee), Err(em)) => assert_eq!(ee.code, em.code),
+                            (l, r) => panic!(
+                                "SsePutGet read mismatch: {:?} vs {:?}",
+                                l.map(|x| x.meta).map_err(|e| e.code),
+                                r.map(|x| x.meta).map_err(|e| e.code)
+                            ),
+                        }
+                    }
+                    (Err(ee), Err(em)) => assert_eq!(ee.code, em.code),
+                    (l, r) => panic!("SsePutGet write mismatch: {l:?} vs {r:?}"),
+                }
+            }
             ModelOp::Compact => {
                 engine.compact().await.unwrap();
             }
@@ -1936,6 +2496,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
             location_constraint: None,
             object_ownership: None,
             acl: None,
+            object_lock_enabled: false,
         };
         if store_kind == 0 {
             engine.create_bucket(req_b).await.unwrap();
@@ -1963,6 +2524,8 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 tags: None,
                 checksum_algorithm: Some(alg),
                 checksum_type: Some(ctype),
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             })
             .await
             .unwrap();
@@ -1977,6 +2540,8 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 tags: None,
                 checksum_algorithm: Some(alg),
                 checksum_type: Some(ctype),
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             })
             .await
             .unwrap();
@@ -1996,6 +2561,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                         upload_id: ce.upload_id.clone(),
                         part_number: pn,
                         max_bytes_limit: MAX_PART_SIZE_BYTES,
+                        raw_sse: RawSseHeaders::default(),
                     },
                     InMemoryVerifiedStream::from_bytes(data.clone(), Some(alg)),
                 )
@@ -2010,6 +2576,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                         upload_id: cm.upload_id.clone(),
                         part_number: pn,
                         max_bytes_limit: MAX_PART_SIZE_BYTES,
+                        raw_sse: RawSseHeaders::default(),
                     },
                     InMemoryVerifiedStream::from_bytes(data, Some(alg)),
                 )
@@ -2039,6 +2606,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 expected_checksum: None,
                 expected_object_size: Some(MIN_PART_SIZE_BYTES + 321),
                 preconditions: Preconditions::default(),
+                raw_sse: RawSseHeaders::default(),
             })
             .await
             .unwrap();
@@ -2052,6 +2620,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 expected_checksum: None,
                 expected_object_size: Some(MIN_PART_SIZE_BYTES + 321),
                 preconditions: Preconditions::default(),
+                raw_sse: RawSseHeaders::default(),
             })
             .await
             .unwrap();
@@ -2069,6 +2638,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 part_number: Some(2),
                 preconditions: Preconditions::default(),
                 checksum_mode_enabled: true,
+                raw_sse: RawSseHeaders::default(),
             })
             .await
             .unwrap();
@@ -2082,6 +2652,7 @@ async fn vr2_multipart_5mib_boundary_differential() {
                 part_number: Some(2),
                 preconditions: Preconditions::default(),
                 checksum_mode_enabled: true,
+                raw_sse: RawSseHeaders::default(),
             })
             .await
             .unwrap();
@@ -2177,6 +2748,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                     location_constraint: None,
                     object_ownership: None,
                     acl: None,
+                    object_lock_enabled: false,
                 })
                 .await
                 .unwrap();
@@ -2187,6 +2759,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                     location_constraint: None,
                     object_ownership: None,
                     acl: None,
+                    object_lock_enabled: false,
                 })
                 .await
                 .unwrap();
@@ -2213,6 +2786,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                     part_number: None,
                     preconditions: Preconditions::default(),
                     checksum_mode_enabled: true,
+                    raw_sse: RawSseHeaders::default(),
                 })
                 .await;
             match (expected, res) {
@@ -2238,6 +2812,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                     part_number: None,
                     preconditions: Preconditions::default(),
                     checksum_mode_enabled: true,
+                    raw_sse: RawSseHeaders::default(),
                 })
                 .await;
             match (expected, res) {
@@ -2261,6 +2836,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                     part_number: None,
                     preconditions: Preconditions::default(),
                     checksum_mode_enabled: true,
+                    raw_sse: RawSseHeaders::default(),
                 })
                 .await
                 .unwrap_or_else(|e| panic!("confirmed version ({k}, {vid}) lost: {e}"));
@@ -2290,6 +2866,8 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                                 tags: None,
                                 preconditions: Preconditions::default(),
                                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                                raw_sse: RawSseHeaders::default(),
+                                raw_lock: RawUploadObjectLockHeaders::default(),
                             },
                             InMemoryVerifiedStream::from_bytes(Bytes::from(data.clone()), None),
                         )
@@ -2304,6 +2882,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                             key: key.clone(),
                             version_id: None,
                             if_match: None,
+                            bypass_governance: false,
                         })
                         .await
                         .unwrap();
@@ -2327,6 +2906,8 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                                 tags: None,
                                 preconditions: Preconditions::default(),
                                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                                raw_sse: RawSseHeaders::default(),
+                                raw_lock: RawUploadObjectLockHeaders::default(),
                             },
                             InMemoryVerifiedStream::from_bytes(Bytes::from(data.clone()), None),
                         )
@@ -2345,6 +2926,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                             key: key.clone(),
                             version_id: None,
                             if_match: None,
+                            bypass_governance: false,
                         })
                         .await
                         .unwrap();
@@ -2364,6 +2946,8 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                         tags: None,
                         checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
                         checksum_type: None,
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
                     })
                     .await
                     .unwrap();
@@ -2378,6 +2962,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                             upload_id: init.upload_id.clone(),
                             part_number: 1,
                             max_bytes_limit: MAX_PART_SIZE_BYTES,
+                            raw_sse: RawSseHeaders::default(),
                         },
                         InMemoryVerifiedStream::from_bytes(
                             Bytes::from(pdata.clone()),
@@ -2401,6 +2986,7 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                             expected_checksum: None,
                             expected_object_size: None,
                             preconditions: Preconditions::default(),
+                            raw_sse: RawSseHeaders::default(),
                         })
                         .await
                         .unwrap();
@@ -2571,6 +3157,7 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
             location_constraint: None,
             object_ownership: None,
             acl: None,
+            object_lock_enabled: false,
         })
         .await
         .unwrap();
@@ -2587,6 +3174,8 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
                 tags: None,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(Bytes::from_static(b"durable-v1"), None),
         )
@@ -2607,6 +3196,8 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
                 tags: None,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(Bytes::from_static(b"uncommitted"), None),
         )
@@ -2624,6 +3215,7 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
             key: "good".into(),
             version_id: None,
             if_match: None,
+            bypass_governance: false,
         })
         .await
         .unwrap_err();
@@ -2641,6 +3233,7 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
                 part_number: None,
                 preconditions: Preconditions::default(),
                 checksum_mode_enabled: false,
+                raw_sse: RawSseHeaders::default(),
             })
             .await
             .unwrap_err()
@@ -2657,8 +3250,528 @@ async fn fsync_eio_triggers_immediate_read_only_circuit_breaker() {
             part_number: None,
             preconditions: Preconditions::default(),
             checksum_mode_enabled: false,
+            raw_sse: RawSseHeaders::default(),
         })
         .await
         .unwrap();
     assert_eq!(&read_all(good.reader).await.unwrap()[..], b"durable-v1");
+}
+
+/// Milestone M4 (`VR-2` + `VR-3` + `NFR-13`) end-to-end verification of all 4 P2 domains
+/// across `Engine` vs `ModelStore` parity, `write_checkpoint()`, WAL tail replay, `power_cut()`,
+/// zero-SSE-C-key-on-disk audit, and `run_fsck()`.
+#[tokio::test]
+async fn vr2_vr3_p2_encryption_lock_lifecycle_logging_checkpoint_crash() {
+    use base64::Engine as _;
+
+    let mut disk = FaultDisk::new();
+    let cfg = EngineConfig {
+        segment_size: 8 * 1024 * 1024,
+        wal_file_size: 64 * 1024,
+        max_block_payload: 64 * 1024,
+        default_object_ownership: ObjectOwnership::ObjectWriter,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(disk.clone(), cfg.clone()).unwrap();
+    let model = ModelStore::new(ModelConfig {
+        default_object_ownership: ObjectOwnership::ObjectWriter,
+        ..ModelConfig::default()
+    });
+
+    let t0 = 1_762_900_000_000i64;
+    let ctx = test_caller(0, t0);
+
+    // 1. Create Object-Lock-enabled source bucket + logging target bucket on both Engine & ModelStore
+    for bkt_req in [
+        CreateBucketReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            location_constraint: None,
+            object_ownership: None,
+            acl: None,
+            object_lock_enabled: true,
+        },
+        CreateBucketReq {
+            ctx: ctx.clone(),
+            bucket: "p2-logs".into(),
+            location_constraint: None,
+            object_ownership: None,
+            acl: None,
+            object_lock_enabled: false,
+        },
+    ] {
+        engine.create_bucket(bkt_req.clone()).await.unwrap();
+        model.create_bucket(bkt_req).await.unwrap();
+    }
+
+    // Object Lock automatically enables Versioning and blocks suspending Versioning (409 InvalidBucketState)
+    assert_eq!(
+        engine
+            .get_bucket_versioning(BucketRef {
+                ctx: ctx.clone(),
+                bucket: "p2-main".into(),
+            })
+            .await
+            .unwrap(),
+        VersioningStatus::Enabled
+    );
+    let susp_req = PutBucketVersioningReq {
+        ctx: ctx.clone(),
+        bucket: "p2-main".into(),
+        status: VersioningStatus::Suspended,
+    };
+    assert_eq!(
+        engine.put_bucket_versioning(susp_req.clone()).await.unwrap_err().code,
+        S3ErrorCode::InvalidBucketState
+    );
+    assert_eq!(
+        model.put_bucket_versioning(susp_req).await.unwrap_err().code,
+        S3ErrorCode::InvalidBucketState
+    );
+
+    // Configure default GOVERNANCE retention (1 day), bucket SSE-S3 encryption, Lifecycle, and Bucket Logging
+    let lock_cfg_req = PutObjectLockConfigurationReq {
+        ctx: ctx.clone(),
+        bucket: "p2-main".into(),
+        config: ObjectLockConfiguration {
+            default_retention: Some(DefaultRetention {
+                mode: ObjectLockMode::Governance,
+                period: DefaultRetentionPeriod::Days(1),
+            }),
+        },
+    };
+    engine
+        .put_object_lock_configuration(lock_cfg_req.clone())
+        .await
+        .unwrap();
+    model.put_object_lock_configuration(lock_cfg_req).await.unwrap();
+
+    let enc_req = PutBucketEncryptionReq {
+        ctx: ctx.clone(),
+        bucket: "p2-main".into(),
+        config: BucketEncryptionConfig {
+            sse_algorithm: "AES256".into(),
+            bucket_key_enabled: Some(true),
+        },
+    };
+    engine.put_bucket_encryption(enc_req.clone()).await.unwrap();
+    model.put_bucket_encryption(enc_req).await.unwrap();
+
+    let lc_req = PutBucketLifecycleReq {
+        ctx: ctx.clone(),
+        bucket: "p2-main".into(),
+        config: LifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                id: "exp-logs".into(),
+                status: LifecycleRuleStatus::Enabled,
+                scope: LifecycleRuleScope::Filter(LifecycleFilter::Prefix("lc/".into())),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    date_us: None,
+                    expired_object_delete_marker: None,
+                }),
+                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_days: 1,
+                    newer_noncurrent_versions: None,
+                }),
+                abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
+                    days_after_initiation: 1,
+                }),
+            }],
+        },
+    };
+    engine
+        .put_bucket_lifecycle_configuration(lc_req.clone())
+        .await
+        .unwrap();
+    model
+        .put_bucket_lifecycle_configuration(lc_req)
+        .await
+        .unwrap();
+
+    let log_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"logging.s3.amazonaws.com"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::p2-logs/access/*","Condition":{"ArnLike":{"aws:SourceArn":"arn:aws:s3:::p2-main"},"StringEquals":{"aws:SourceAccount":"0123456789abcdef"}}}]}"#;
+    let pol_req = PutBucketPolicyReq {
+        ctx: ctx.clone(),
+        bucket: "p2-logs".into(),
+        policy_json: log_policy.into(),
+    };
+    engine.put_bucket_policy(pol_req.clone()).await.unwrap();
+    model.put_bucket_policy(pol_req).await.unwrap();
+
+    let put_log_req = PutBucketLoggingReq {
+        ctx: ctx.clone(),
+        bucket: "p2-main".into(),
+        status: BucketLoggingStatus {
+            logging_enabled: Some(LoggingEnabled {
+                target_bucket: "p2-logs".into(),
+                target_prefix: "access/".into(),
+                target_grants: Vec::new(),
+                target_object_key_format: Some(TargetObjectKeyFormat::PartitionedPrefix(
+                    PartitionDateSource::EventTime,
+                )),
+            }),
+        },
+    };
+    engine.put_bucket_logging(put_log_req.clone()).await.unwrap();
+    model.put_bucket_logging(put_log_req).await.unwrap();
+
+    // 2. Upload unaligned SSE-C multipart object (part 1 = 5 MiB + 3 bytes, part 2 = 777 bytes)
+    let raw_customer_key = [0xA7u8; 32];
+    let ssec_key_b64 = base64::engine::general_purpose::STANDARD.encode(raw_customer_key);
+    let ssec_md5_b64 = {
+        use md5::{Digest as _, Md5};
+        base64::engine::general_purpose::STANDARD.encode(Md5::digest(raw_customer_key))
+    };
+    let ssec_hdrs = RawSseHeaders {
+        sse_customer_algorithm: Some("AES256".into()),
+        sse_customer_key_b64: Some(ssec_key_b64.clone()),
+        sse_customer_key_md5_b64: Some(ssec_md5_b64.clone()),
+        ..Default::default()
+    };
+
+    let p1_len = MIN_PART_SIZE_BYTES as usize + 3;
+    let p2_len = 777usize;
+    let p1_data: Vec<u8> = (0..p1_len).map(|i| (i * 13 + 5) as u8).collect();
+    let p2_data: Vec<u8> = (0..p2_len).map(|i| (i * 29 + 11) as u8).collect();
+    let mut full_expected = p1_data.clone();
+    full_expected.extend_from_slice(&p2_data);
+
+    let init_e = engine
+        .create_multipart_upload(CreateMultipartUploadReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            sys_meta: SystemMeta::default(),
+            user_meta: Vec::new(),
+            acl: None,
+            tags: None,
+            checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
+            checksum_type: Some(ChecksumType::Composite),
+            raw_sse: ssec_hdrs.clone(),
+            raw_lock: RawUploadObjectLockHeaders {
+                mode: Some("GOVERNANCE".into()),
+                retain_until_date: Some("2099-01-01T00:00:00Z".into()),
+                legal_hold: Some("ON".into()),
+            },
+        })
+        .await
+        .unwrap();
+    let init_m = model
+        .create_multipart_upload(CreateMultipartUploadReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            sys_meta: SystemMeta::default(),
+            user_meta: Vec::new(),
+            acl: None,
+            tags: None,
+            checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
+            checksum_type: Some(ChecksumType::Composite),
+            raw_sse: ssec_hdrs.clone(),
+            raw_lock: RawUploadObjectLockHeaders {
+                mode: Some("GOVERNANCE".into()),
+                retain_until_date: Some("2099-01-01T00:00:00Z".into()),
+                legal_hold: Some("ON".into()),
+            },
+        })
+        .await
+        .unwrap();
+
+    let mut e_parts = Vec::new();
+    let mut m_parts = Vec::new();
+    for (pn, bytes) in [(1u32, p1_data), (2u32, p2_data)] {
+        let pe = engine
+            .upload_part(
+                UploadPartReq {
+                    ctx: ctx.clone(),
+                    bucket: "p2-main".into(),
+                    key: "lc/ssec-mpu".into(),
+                    upload_id: init_e.upload_id.clone(),
+                    part_number: pn,
+                    max_bytes_limit: MAX_PART_SIZE_BYTES,
+                    raw_sse: ssec_hdrs.clone(),
+                },
+                InMemoryVerifiedStream::from_bytes(Bytes::from(bytes.clone()), Some(ChecksumAlgorithm::Crc32c)),
+            )
+            .await
+            .unwrap();
+        let pm = model
+            .upload_part(
+                UploadPartReq {
+                    ctx: ctx.clone(),
+                    bucket: "p2-main".into(),
+                    key: "lc/ssec-mpu".into(),
+                    upload_id: init_m.upload_id.clone(),
+                    part_number: pn,
+                    max_bytes_limit: MAX_PART_SIZE_BYTES,
+                    raw_sse: ssec_hdrs.clone(),
+                },
+                InMemoryVerifiedStream::from_bytes(Bytes::from(bytes), Some(ChecksumAlgorithm::Crc32c)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pe.etag, pm.etag);
+        assert_eq!(pe.sse, pm.sse);
+        e_parts.push(CompletePartSpec {
+            part_number: pn,
+            etag: pe.etag,
+            checksum: pe.checksum.map(|c| (c.algorithm, c.value_b64)),
+        });
+        m_parts.push(CompletePartSpec {
+            part_number: pn,
+            etag: pm.etag,
+            checksum: pm.checksum.map(|c| (c.algorithm, c.value_b64)),
+        });
+    }
+
+    let comp_e = engine
+        .complete_multipart_upload(CompleteMultipartUploadReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            upload_id: init_e.upload_id,
+            parts: e_parts,
+            expected_checksum: None,
+            expected_object_size: None,
+            preconditions: Preconditions::default(),
+            raw_sse: ssec_hdrs.clone(),
+        })
+        .await
+        .unwrap();
+    let comp_m = model
+        .complete_multipart_upload(CompleteMultipartUploadReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            upload_id: init_m.upload_id,
+            parts: m_parts,
+            expected_checksum: None,
+            expected_object_size: None,
+            preconditions: Preconditions::default(),
+            raw_sse: ssec_hdrs.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(comp_e.etag, comp_m.etag);
+    assert_eq!(comp_e.sse, comp_m.sse);
+    assert_eq!(comp_e.expiration_header, comp_m.expiration_header);
+    assert!(comp_e.expiration_header.as_deref().unwrap().contains("rule-id=\"exp-logs\""));
+
+    // Also upload a default-encrypted SSE-S3 object before checkpoint + another after checkpoint
+    engine
+        .put_object(
+            PutObjectReq {
+                ctx: ctx.clone(),
+                bucket: "p2-main".into(),
+                key: "lc/default-sses3".into(),
+                sys_meta: SystemMeta::default(),
+                user_meta: Vec::new(),
+                acl: None,
+                tags: None,
+                preconditions: Preconditions::default(),
+                max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
+            },
+            InMemoryVerifiedStream::from_bytes(Bytes::from_static(b"secret-sse-s3-payload"), None),
+        )
+        .await
+        .unwrap();
+    model
+        .put_object(
+            PutObjectReq {
+                ctx: ctx.clone(),
+                bucket: "p2-main".into(),
+                key: "lc/default-sses3".into(),
+                sys_meta: SystemMeta::default(),
+                user_meta: Vec::new(),
+                acl: None,
+                tags: None,
+                preconditions: Preconditions::default(),
+                max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
+            },
+            InMemoryVerifiedStream::from_bytes(Bytes::from_static(b"secret-sse-s3-payload"), None),
+        )
+        .await
+        .unwrap();
+
+    // Write checkpoint, then mutate LegalHold in post-checkpoint WAL tail, then simulate power loss!
+    engine.write_checkpoint().await.unwrap();
+    let ssec_vid_e = comp_e.version_id.clone().unwrap();
+    let ssec_vid_m = comp_m.version_id.clone().unwrap();
+
+    // WORM protection: deleting locked version with LegalHold::On fails even with bypass_governance = true!
+    assert_eq!(
+        engine
+            .delete_object(DeleteObjectReq {
+                ctx: ctx.clone(),
+                bucket: "p2-main".into(),
+                key: "lc/ssec-mpu".into(),
+                version_id: Some(ssec_vid_e.clone()),
+                if_match: None,
+                bypass_governance: true,
+            })
+            .await
+            .unwrap_err()
+            .code,
+        S3ErrorCode::AccessDenied
+    );
+    // Turn LegalHold OFF in post-checkpoint WAL tail
+    engine
+        .put_object_legal_hold(PutObjectLegalHoldReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            version_id: Some(ssec_vid_e.clone()),
+            status: LegalHoldStatus::Off,
+        })
+        .await
+        .unwrap();
+    model
+        .put_object_legal_hold(PutObjectLegalHoldReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            version_id: Some(ssec_vid_m.clone()),
+            status: LegalHoldStatus::Off,
+        })
+        .await
+        .unwrap();
+
+    drop(engine);
+    let mut rng = StdRng::seed_from_u64(0x4D34_2026);
+    disk = disk.power_cut(&mut rng);
+
+    // 3. Audit every file on disk: raw 32-byte SSE-C key AND plaintext `secret-sse-s3-payload` MUST NOT appear!
+    for dir in ["wal", "ckpt", "seg"] {
+        if let Ok(files) = disk.read_dir(dir) {
+            for fname in files {
+                let f = disk.open(&format!("{dir}/{fname}"), OpenOpts::read_only()).unwrap();
+                let mut raw = vec![0u8; f.len().unwrap() as usize];
+                f.read_exact_at(0, &mut raw).unwrap();
+                assert!(
+                    !raw.windows(32).any(|w| w == raw_customer_key),
+                    "CRITICAL: raw SSE-C customer key leaked into {dir}/{fname}!"
+                );
+                assert!(
+                    !raw.windows(b"secret-sse-s3-payload".len())
+                        .any(|w| w == b"secret-sse-s3-payload"),
+                    "CRITICAL: SSE-S3 plaintext was stored unencrypted in {dir}/{fname}!"
+                );
+            }
+        }
+    }
+
+    let fsck_rep = run_fsck(disk.clone());
+    assert_eq!(fsck_rep.status, "ok", "fsck errors: {:?}", fsck_rep.errors);
+
+    // 4. Recover Engine from checkpoint + WAL tail and verify cross-part Range read, ?partNumber=2,
+    //    Bucket Logging, Lifecycle tick parity, and GOVERNANCE bypass delete!
+    let recovered = Engine::open(disk.clone(), cfg).unwrap();
+    assert_eq!(
+        recovered
+            .get_bucket_logging(BucketRef {
+                ctx: ctx.clone(),
+                bucket: "p2-main".into(),
+            })
+            .await
+            .unwrap()
+            .logging_enabled
+            .unwrap()
+            .target_bucket,
+        "p2-logs"
+    );
+    assert_eq!(
+        recovered
+            .get_object_legal_hold(ObjectLockRef {
+                ctx: ctx.clone(),
+                bucket: "p2-main".into(),
+                key: "lc/ssec-mpu".into(),
+                version_id: Some(ssec_vid_e.clone()),
+            })
+            .await
+            .unwrap(),
+        LegalHoldStatus::Off
+    );
+
+    // Cross-part unaligned Range read spanning part 1 -> part 2 boundary!
+    let r_start = (p1_len - 37) as u64;
+    let r_end = (p1_len + 49) as u64;
+    let rng_got = recovered
+        .get_object(GetObjectReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            version_id: Some(ssec_vid_e.clone()),
+            range: Some(ByteRangeSpec::FromTo {
+                start: r_start,
+                end: r_end,
+            }),
+            part_number: None,
+            preconditions: Preconditions::default(),
+            checksum_mode_enabled: false,
+            raw_sse: ssec_hdrs.clone(),
+        })
+        .await
+        .unwrap();
+    let rng_bytes = read_all(rng_got.reader).await.unwrap();
+    assert_eq!(
+        &rng_bytes[..],
+        &full_expected[(r_start as usize)..=(r_end as usize)]
+    );
+
+    // Run lifecycle tick after 1 debug day (2s): current versions get DeleteMarkers, WORM-locked noncurrent versions survive!
+    recovered.run_lifecycle_tick(t0 + 3_000, Some(2)).await.unwrap();
+    model.run_lifecycle_tick(t0 + 3_000, Some(2));
+    match recovered
+        .get_object(GetObjectReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/default-sses3".into(),
+            version_id: None,
+            range: None,
+            part_number: None,
+            preconditions: Preconditions::default(),
+            checksum_mode_enabled: false,
+            raw_sse: RawSseHeaders::default(),
+        })
+        .await
+    {
+        Err(e) => assert_eq!(e.code, S3ErrorCode::NoSuchKey),
+        Ok(_) => panic!("expected NoSuchKey after lifecycle expiration inserted delete marker"),
+    }
+
+    // Delete GOVERNANCE-locked version without bypass -> 403 AccessDenied; WITH bypass -> 204!
+    assert_eq!(
+        recovered
+            .delete_object(DeleteObjectReq {
+                ctx: ctx.clone(),
+                bucket: "p2-main".into(),
+                key: "lc/ssec-mpu".into(),
+                version_id: Some(ssec_vid_e.clone()),
+                if_match: None,
+                bypass_governance: false,
+            })
+            .await
+            .unwrap_err()
+            .code,
+        S3ErrorCode::AccessDenied
+    );
+    recovered
+        .delete_object(DeleteObjectReq {
+            ctx: ctx.clone(),
+            bucket: "p2-main".into(),
+            key: "lc/ssec-mpu".into(),
+            version_id: Some(ssec_vid_e),
+            if_match: None,
+            bypass_governance: true,
+        })
+        .await
+        .unwrap();
+
+    drop(recovered);
+    let final_fsck = run_fsck(disk);
+    assert_eq!(final_fsck.status, "ok", "final fsck errors: {:?}", final_fsck.errors);
 }

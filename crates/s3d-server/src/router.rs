@@ -22,10 +22,6 @@ use crate::metrics::ServerMetrics;
 const MAX_HEADER_SECTION_BYTES: usize = 8192; // PR-19
 
 const UNIMPLEMENTED_BUCKET_SUBRESOURCES: &[&str] = &[
-    "lifecycle",
-    "encryption",
-    "object-lock",
-    "logging",
     "website",
     "replication",
     "notification",
@@ -38,8 +34,6 @@ const UNIMPLEMENTED_BUCKET_SUBRESOURCES: &[&str] = &[
 ];
 
 const UNIMPLEMENTED_OBJECT_SUBRESOURCES: &[&str] = &[
-    "retention",
-    "legal-hold",
     "select",
     "restore",
     "torrent",
@@ -788,6 +782,238 @@ async fn handle_bucket_target<S: ObjectStore>(
         }
     }
 
+    if has_query_key(query, "object-lock") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetObjectLockConfiguration";
+                drain_empty_or_ignore(incoming).await;
+                let cfg = state
+                    .store
+                    .get_object_lock_configuration(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_object_lock_configuration_xml(&cfg),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutObjectLockConfiguration";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let config = parse_object_lock_configuration_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_object_lock_configuration(PutObjectLockConfigurationReq {
+                        ctx,
+                        bucket,
+                        config,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "lifecycle") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketLifecycleConfiguration";
+                drain_empty_or_ignore(incoming).await;
+                let cfg = state
+                    .store
+                    .get_bucket_lifecycle_configuration(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_lifecycle_configuration_xml(&cfg),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketLifecycleConfiguration";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    2 * 1024 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let config = parse_lifecycle_configuration_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_bucket_lifecycle_configuration(PutBucketLifecycleReq {
+                        ctx,
+                        bucket,
+                        config,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeleteBucketLifecycle";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .delete_bucket_lifecycle(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "encryption") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketEncryption";
+                drain_empty_or_ignore(incoming).await;
+                let cfg = state
+                    .store
+                    .get_bucket_encryption(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_bucket_encryption_xml(&cfg),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketEncryption";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let config = parse_bucket_encryption_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_bucket_encryption(PutBucketEncryptionReq {
+                        ctx,
+                        bucket,
+                        config,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            Method::DELETE => {
+                *op_name = "DeleteBucketEncryption";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .delete_bucket_encryption(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "logging") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketLogging";
+                drain_empty_or_ignore(incoming).await;
+                let status = state
+                    .store
+                    .get_bucket_logging(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_bucket_logging_xml(&status),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketLogging";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let status = parse_bucket_logging_xml(
+                    &raw_xml,
+                    |uid| state.auth.lookup_by_user_id(uid),
+                    |em| state.auth.lookup_by_email(em),
+                )?;
+                state
+                    .store
+                    .put_bucket_logging(PutBucketLoggingReq {
+                        ctx,
+                        bucket,
+                        status,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
     if has_query_key(query, "acl") {
         match *method {
             Method::GET => {
@@ -1060,6 +1286,7 @@ async fn handle_bucket_target<S: ObjectStore>(
         )?;
         let (raw_xml, _) = stream.collect_bounded().await?;
         let (quiet, items) = parse_delete_objects_xml(&raw_xml)?;
+        let bypass_governance = parse_bypass_governance_header(headers);
         let resp = state
             .store
             .delete_objects(DeleteObjectsReq {
@@ -1067,6 +1294,7 @@ async fn handle_bucket_target<S: ObjectStore>(
                 bucket,
                 quiet,
                 items,
+                bypass_governance,
             })
             .await?;
         return Ok(xml_response(
@@ -1080,6 +1308,7 @@ async fn handle_bucket_target<S: ObjectStore>(
             *op_name = "CreateBucket";
             let acl = parse_acl_headers(headers, &state.auth)?;
             let object_ownership = parse_object_ownership_header(headers)?;
+            let object_lock_enabled = parse_bucket_object_lock_enabled_header(headers)?;
             let expected_md5 = parse_optional_md5(headers)?;
             let header_csum = parse_header_checksum(headers)?;
 
@@ -1103,6 +1332,7 @@ async fn handle_bucket_target<S: ObjectStore>(
                     location_constraint,
                     object_ownership,
                     acl,
+                    object_lock_enabled,
                 })
                 .await?;
 
@@ -1323,6 +1553,128 @@ async fn handle_object_target<S: ObjectStore>(
         }
     }
 
+    // 0aa. `GET/PUT /{b}/{k}?retention` (`PR-35`)
+    if has_query_key(query, "retention") {
+        let version_id = get_query_param(query, "versionId").map(str::to_string);
+        match *method {
+            Method::GET => {
+                *op_name = "GetObjectRetention";
+                drain_empty_or_ignore(incoming).await;
+                let ret = state
+                    .store
+                    .get_object_retention(ObjectLockRef {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                    })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_object_retention_xml(&ret),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutObjectRetention";
+                let bypass_governance = parse_bypass_governance_header(headers);
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let retention = parse_object_retention_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_object_retention(PutObjectRetentionReq {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                        retention,
+                        bypass_governance,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "The specified method is not allowed against this resource.",
+                ));
+            }
+        }
+    }
+
+    // 0ab. `GET/PUT /{b}/{k}?legal-hold` (`PR-36`)
+    if has_query_key(query, "legal-hold") {
+        let version_id = get_query_param(query, "versionId").map(str::to_string);
+        match *method {
+            Method::GET => {
+                *op_name = "GetObjectLegalHold";
+                drain_empty_or_ignore(incoming).await;
+                let status = state
+                    .store
+                    .get_object_legal_hold(ObjectLockRef {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                    })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_object_legal_hold_xml(status),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutObjectLegalHold";
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let status = parse_object_legal_hold_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_object_legal_hold(PutObjectLegalHoldReq {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                        status,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "The specified method is not allowed against this resource.",
+                ));
+            }
+        }
+    }
+
     // 0b. `GET/PUT /{b}/{k}?acl` (`PR-32`)
     if has_query_key(query, "acl") {
         let version_id = get_query_param(query, "versionId").map(str::to_string);
@@ -1429,6 +1781,7 @@ async fn handle_object_target<S: ObjectStore>(
         let max_parts = parse_optional_max_parts_header(headers)?;
         let part_number_marker = parse_optional_part_marker_header(headers)?;
         let version_id = get_query_param(query, "versionId").map(str::to_string);
+        let raw_sse = extract_raw_sse_headers(headers)?;
 
         let resp = state
             .store
@@ -1440,6 +1793,7 @@ async fn handle_object_target<S: ObjectStore>(
                 attrs,
                 max_parts,
                 part_number_marker,
+                raw_sse,
             })
             .await?;
 
@@ -1456,6 +1810,7 @@ async fn handle_object_target<S: ObjectStore>(
             && vid != "null" {
                 builder = builder.header("x-amz-version-id", vid);
             }
+        builder = apply_sse_builder(builder, &resp.sse);
         return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
     }
 
@@ -1475,6 +1830,8 @@ async fn handle_object_target<S: ObjectStore>(
         let sys_meta = extract_system_meta(headers);
         let user_meta = extract_user_meta(headers)?;
         let tags = parse_optional_object_tagging_header(headers)?;
+        let raw_sse = extract_raw_sse_headers(headers)?;
+        let raw_lock = extract_raw_upload_lock_headers(headers)?;
         let checksum_algorithm = match headers.get("x-amz-checksum-algorithm") {
             Some(hv) => {
                 let s = hv
@@ -1528,6 +1885,8 @@ async fn handle_object_target<S: ObjectStore>(
                 tags,
                 checksum_algorithm,
                 checksum_type,
+                raw_sse,
+                raw_lock,
             })
             .await?;
 
@@ -1542,6 +1901,7 @@ async fn handle_object_target<S: ObjectStore>(
         if let Some(ct) = resp.checksum_type {
             builder = builder.header("x-amz-checksum-type", ct.as_aws_str());
         }
+        builder = apply_sse_builder(builder, &resp.sse);
         return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
     }
 
@@ -1585,6 +1945,8 @@ async fn handle_object_target<S: ObjectStore>(
                         None => None,
                     };
                     let src_preconditions = extract_copy_source_preconditions(headers)?;
+                    let raw_copy_src_sse = extract_raw_copy_source_sse_headers(headers)?;
+                    let raw_sse = extract_raw_sse_headers(headers)?;
 
                     let resp = state
                         .store
@@ -1599,6 +1961,8 @@ async fn handle_object_target<S: ObjectStore>(
                             dst_key: key,
                             upload_id,
                             part_number,
+                            raw_copy_src_sse,
+                            raw_sse,
                         })
                         .await?;
 
@@ -1611,6 +1975,7 @@ async fn handle_object_target<S: ObjectStore>(
                         && sv != "null" {
                             builder = builder.header("x-amz-copy-source-version-id", sv);
                         }
+                    builder = apply_sse_builder(builder, &resp.sse);
                     Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap())
                 } else {
                     *op_name = "UploadPart";
@@ -1633,6 +1998,7 @@ async fn handle_object_target<S: ObjectStore>(
 
                     let expected_md5 = parse_optional_md5(headers)?;
                     let header_csum = parse_header_checksum(headers)?;
+                    let raw_sse = extract_raw_sse_headers(headers)?;
                     let effective_expected_len = if is_http_chunked && !is_streaming_aws_chunked {
                         headers
                             .get("x-amz-decoded-content-length")
@@ -1661,6 +2027,7 @@ async fn handle_object_target<S: ObjectStore>(
                                 upload_id,
                                 part_number,
                                 max_bytes_limit: MAX_PART_SIZE_BYTES,
+                                raw_sse,
                             },
                             stream,
                         )
@@ -1673,6 +2040,7 @@ async fn handle_object_target<S: ObjectStore>(
                     if let Some(csum) = &resp.checksum {
                         builder = builder.header(csum.algorithm.header_name(), &csum.value_b64);
                     }
+                    builder = apply_sse_builder(builder, &resp.sse);
                     Ok(builder.body(S3ResponseBody::empty()).unwrap())
                 }
             }
@@ -1701,6 +2069,7 @@ async fn handle_object_target<S: ObjectStore>(
                 let expected_checksum = parse_complete_mp_checksum_header(headers)?;
                 let preconditions = extract_write_preconditions(headers);
                 let expected_md5 = parse_optional_md5(headers)?;
+                let raw_sse = extract_raw_sse_headers(headers)?;
 
                 // Note: Do NOT pass `x-amz-checksum-*` into `HyperVerifiedBodyStream` here,
                 // because on `CompleteMultipartUpload` `x-amz-checksum-*` specifies the target
@@ -1727,6 +2096,7 @@ async fn handle_object_target<S: ObjectStore>(
                         expected_checksum,
                         expected_object_size,
                         preconditions,
+                        raw_sse,
                     })
                     .await?;
 
@@ -1752,6 +2122,10 @@ async fn handle_object_target<S: ObjectStore>(
                     builder = builder
                         .header(csum.algorithm.header_name(), &csum.value_b64)
                         .header("x-amz-checksum-type", csum.checksum_type.as_aws_str());
+                }
+                builder = apply_sse_builder(builder, &resp.sse);
+                if let Some(exp) = &resp.expiration_header {
+                    builder = builder.header("x-amz-expiration", exp);
                 }
                 Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap())
             }
@@ -1850,6 +2224,9 @@ async fn handle_object_target<S: ObjectStore>(
                 let user_meta = extract_user_meta(headers)?;
                 let src_preconditions = extract_copy_source_preconditions(headers)?;
                 let dst_preconditions = extract_write_preconditions(headers);
+                let raw_copy_src_sse = extract_raw_copy_source_sse_headers(headers)?;
+                let raw_sse = extract_raw_sse_headers(headers)?;
+                let raw_lock = extract_raw_upload_lock_headers(headers)?;
 
                 let resp = state
                     .store
@@ -1868,6 +2245,9 @@ async fn handle_object_target<S: ObjectStore>(
                         tags,
                         src_preconditions,
                         dst_preconditions,
+                        raw_copy_src_sse,
+                        raw_sse,
+                        raw_lock,
                     })
                     .await?;
 
@@ -1883,6 +2263,10 @@ async fn handle_object_target<S: ObjectStore>(
                     && dv != "null" {
                         builder = builder.header("x-amz-version-id", dv);
                     }
+                builder = apply_sse_builder(builder, &resp.sse);
+                if let Some(exp) = &resp.expiration_header {
+                    builder = builder.header("x-amz-expiration", exp);
+                }
                 return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
             }
 
@@ -1911,6 +2295,8 @@ async fn handle_object_target<S: ObjectStore>(
             let user_meta = extract_user_meta(headers)?;
             let tags = parse_optional_object_tagging_header(headers)?;
             let preconditions = extract_write_preconditions(headers);
+            let raw_sse = extract_raw_sse_headers(headers)?;
+            let raw_lock = extract_raw_upload_lock_headers(headers)?;
             let max_put = MAX_SINGLE_PUT_BYTES.min(state.cfg.max_object_size);
 
             let effective_expected_len = if is_http_chunked && !is_streaming_aws_chunked {
@@ -1944,6 +2330,8 @@ async fn handle_object_target<S: ObjectStore>(
                         tags,
                         preconditions,
                         max_bytes_limit: max_put,
+                        raw_sse,
+                        raw_lock,
                     },
                     stream,
                 )
@@ -1962,6 +2350,10 @@ async fn handle_object_target<S: ObjectStore>(
                 && vid != "null" {
                     builder = builder.header("x-amz-version-id", vid);
                 }
+            builder = apply_sse_builder(builder, &resp.sse);
+            if let Some(exp) = &resp.expiration_header {
+                builder = builder.header("x-amz-expiration", exp);
+            }
             Ok(builder.body(S3ResponseBody::empty()).unwrap())
         }
         Method::GET | Method::HEAD => {
@@ -2010,6 +2402,7 @@ async fn handle_object_target<S: ObjectStore>(
                 .get("x-amz-checksum-mode")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("ENABLED"));
+            let raw_sse = extract_raw_sse_headers(headers)?;
 
             let get_req = GetObjectReq {
                 ctx,
@@ -2020,6 +2413,7 @@ async fn handle_object_target<S: ObjectStore>(
                 part_number,
                 preconditions,
                 checksum_mode_enabled,
+                raw_sse,
             };
 
             if is_head {
@@ -2043,6 +2437,7 @@ async fn handle_object_target<S: ObjectStore>(
             drain_empty_or_ignore(incoming).await;
             let version_id = get_query_param(query, "versionId").map(str::to_string);
             let if_match = parse_etag_list_header(headers, "if-match");
+            let bypass_governance = parse_bypass_governance_header(headers);
 
             let resp = state
                 .store
@@ -2052,6 +2447,7 @@ async fn handle_object_target<S: ObjectStore>(
                     key,
                     version_id,
                     if_match,
+                    bypass_governance,
                 })
                 .await?;
 
@@ -2164,6 +2560,21 @@ fn build_object_read_response<R>(
     if let Some(csum) = &meta.checksum {
         insert_header_latin1_safe(hdrs, csum.algorithm.header_name(), &csum.value_b64);
         insert_header_latin1_safe(hdrs, "x-amz-checksum-type", csum.checksum_type.as_aws_str());
+    }
+    apply_sse_hdr_map(hdrs, &meta.sse);
+    if let Some(ret) = &meta.retention {
+        insert_header_latin1_safe(hdrs, "x-amz-object-lock-mode", ret.mode.as_aws_str());
+        insert_header_latin1_safe(
+            hdrs,
+            "x-amz-object-lock-retain-until-date",
+            &format_iso8601_utc_us(ret.retain_until_us),
+        );
+    }
+    if let Some(lh) = &meta.legal_hold {
+        insert_header_latin1_safe(hdrs, "x-amz-object-lock-legal-hold", lh.as_aws_str());
+    }
+    if let Some(exp) = &meta.expiration_header {
+        insert_header_latin1_safe(hdrs, "x-amz-expiration", exp);
     }
 
     if let Some(v) = overrides
@@ -2951,6 +3362,8 @@ async fn handle_post_object<S: ObjectStore>(
         source_ip: peer_ip,
         referer,
         x_amz_acl: parsed.x_amz_acl_raw.clone(),
+        x_amz_server_side_encryption: parsed.raw_sse.sse_algorithm.clone(),
+        x_amz_sse_customer_algorithm: parsed.raw_sse.sse_customer_algorithm.clone(),
         ..Default::default()
     };
     let ctx = CallerContext {
@@ -2976,6 +3389,8 @@ async fn handle_post_object<S: ObjectStore>(
                 tags: parsed.tags,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: max_put,
+                raw_sse: parsed.raw_sse,
+                raw_lock: parsed.raw_lock,
             },
             stream,
         )
@@ -3008,6 +3423,10 @@ async fn handle_post_object<S: ObjectStore>(
             && vid != "null" {
                 builder = builder.header("x-amz-version-id", vid);
             }
+        builder = apply_sse_builder(builder, &put_resp.sse);
+        if let Some(exp) = &put_resp.expiration_header {
+            builder = builder.header("x-amz-expiration", exp);
+        }
         return Ok(builder.body(S3ResponseBody::empty()).unwrap());
     }
 
@@ -3029,6 +3448,10 @@ async fn handle_post_object<S: ObjectStore>(
                 &put_resp.checksum.value_b64,
             );
         }
+        builder = apply_sse_builder(builder, &put_resp.sse);
+        if let Some(exp) = &put_resp.expiration_header {
+            builder = builder.header("x-amz-expiration", exp);
+        }
         return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
     }
 
@@ -3048,5 +3471,139 @@ async fn handle_post_object<S: ObjectStore>(
             &put_resp.checksum.value_b64,
         );
     }
+    builder = apply_sse_builder(builder, &put_resp.sse);
+    if let Some(exp) = &put_resp.expiration_header {
+        builder = builder.header("x-amz-expiration", exp);
+    }
     Ok(builder.body(S3ResponseBody::empty()).unwrap())
+}
+
+fn opt_trimmed_ascii_hdr(headers: &HeaderMap, name: &str) -> StoreResult<Option<String>> {
+    match headers.get(name) {
+        None => Ok(None),
+        Some(hv) => {
+            let s = hv
+                .to_str()
+                .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, format!("Invalid {name}")))?;
+            Ok(Some(s.trim().to_string()))
+        }
+    }
+}
+
+fn extract_raw_sse_headers(headers: &HeaderMap) -> StoreResult<RawSseHeaders> {
+    Ok(RawSseHeaders {
+        sse_algorithm: opt_trimmed_ascii_hdr(headers, "x-amz-server-side-encryption")?,
+        sse_kms_key_id: opt_trimmed_ascii_hdr(
+            headers,
+            "x-amz-server-side-encryption-aws-kms-key-id",
+        )?,
+        sse_customer_algorithm: opt_trimmed_ascii_hdr(
+            headers,
+            "x-amz-server-side-encryption-customer-algorithm",
+        )?,
+        sse_customer_key_b64: opt_trimmed_ascii_hdr(
+            headers,
+            "x-amz-server-side-encryption-customer-key",
+        )?,
+        sse_customer_key_md5_b64: opt_trimmed_ascii_hdr(
+            headers,
+            "x-amz-server-side-encryption-customer-key-md5",
+        )?,
+    })
+}
+
+fn extract_raw_copy_source_sse_headers(
+    headers: &HeaderMap,
+) -> StoreResult<RawCopySourceSseHeaders> {
+    Ok(RawCopySourceSseHeaders {
+        sse_customer_algorithm: opt_trimmed_ascii_hdr(
+            headers,
+            "x-amz-copy-source-server-side-encryption-customer-algorithm",
+        )?,
+        sse_customer_key_b64: opt_trimmed_ascii_hdr(
+            headers,
+            "x-amz-copy-source-server-side-encryption-customer-key",
+        )?,
+        sse_customer_key_md5_b64: opt_trimmed_ascii_hdr(
+            headers,
+            "x-amz-copy-source-server-side-encryption-customer-key-md5",
+        )?,
+    })
+}
+
+fn extract_raw_upload_lock_headers(headers: &HeaderMap) -> StoreResult<RawUploadObjectLockHeaders> {
+    Ok(RawUploadObjectLockHeaders {
+        mode: opt_trimmed_ascii_hdr(headers, "x-amz-object-lock-mode")?,
+        retain_until_date: opt_trimmed_ascii_hdr(headers, "x-amz-object-lock-retain-until-date")?,
+        legal_hold: opt_trimmed_ascii_hdr(headers, "x-amz-object-lock-legal-hold")?,
+    })
+}
+
+fn parse_bypass_governance_header(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-amz-bypass-governance-retention")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("true"))
+}
+
+fn parse_bucket_object_lock_enabled_header(headers: &HeaderMap) -> StoreResult<bool> {
+    let Some(hv) = headers.get("x-amz-bucket-object-lock-enabled") else {
+        return Ok(false);
+    };
+    let s = hv
+        .to_str()
+        .map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Invalid x-amz-bucket-object-lock-enabled header",
+            )
+        })?
+        .trim();
+    if s.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if s.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "Invalid x-amz-bucket-object-lock-enabled value",
+        ))
+    }
+}
+
+fn apply_sse_builder(
+    builder: http::response::Builder,
+    sse: &SseResponseHeaders,
+) -> http::response::Builder {
+    match sse {
+        SseResponseHeaders::None => builder,
+        SseResponseHeaders::SseS3 => builder.header("x-amz-server-side-encryption", "AES256"),
+        SseResponseHeaders::SseC { key_md5_b64 } => builder
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header(
+                "x-amz-server-side-encryption-customer-key-MD5",
+                key_md5_b64.as_str(),
+            ),
+    }
+}
+
+fn apply_sse_hdr_map(hdrs: &mut HeaderMap, sse: &SseResponseHeaders) {
+    match sse {
+        SseResponseHeaders::None => {}
+        SseResponseHeaders::SseS3 => {
+            insert_header_latin1_safe(hdrs, "x-amz-server-side-encryption", "AES256");
+        }
+        SseResponseHeaders::SseC { key_md5_b64 } => {
+            insert_header_latin1_safe(
+                hdrs,
+                "x-amz-server-side-encryption-customer-algorithm",
+                "AES256",
+            );
+            insert_header_latin1_safe(
+                hdrs,
+                "x-amz-server-side-encryption-customer-key-md5",
+                key_md5_b64,
+            );
+        }
+    }
 }

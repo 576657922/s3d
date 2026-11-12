@@ -28,7 +28,8 @@ use s3d_engine::{Engine, EngineConfig};
 use s3d_model::InMemoryVerifiedStream;
 use s3d_types::{
     CallerContext, CreateBucketReq, ObjectOwnership, ObjectStore, OwnerInfo, Preconditions,
-    PutObjectReq, RequestPolicyContext, SystemMeta, MAX_SINGLE_PUT_BYTES,
+    PutObjectReq, RawSseHeaders, RawUploadObjectLockHeaders, RequestPolicyContext, SystemMeta,
+    MAX_SINGLE_PUT_BYTES,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1226,6 +1227,7 @@ async fn run_nfr4_and_nfr6_gates(
                 location_constraint: None,
                 object_ownership: None,
                 acl: None,
+                object_lock_enabled: false,
             })
             .await
             .unwrap();
@@ -1255,6 +1257,8 @@ async fn run_nfr4_and_nfr6_gates(
                                 tags: None,
                                 preconditions: Preconditions::default(),
                                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                                raw_sse: RawSseHeaders::default(),
+                                raw_lock: RawUploadObjectLockHeaders::default(),
                             },
                             InMemoryVerifiedStream::from_bytes(Bytes::new(), None),
                         )

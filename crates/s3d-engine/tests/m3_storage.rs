@@ -60,6 +60,7 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
             location_constraint: None,
             object_ownership: None,
             acl: None,
+            object_lock_enabled: false,
         })
         .await
         .unwrap();
@@ -91,6 +92,8 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
                     tags: Some(BTreeMap::from([("k".into(), "v".into())])),
                     preconditions: Preconditions::default(),
                     max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                    raw_sse: RawSseHeaders::default(),
+                    raw_lock: RawUploadObjectLockHeaders::default(),
                 },
                 InMemoryVerifiedStream::from_bytes(
                     Bytes::from(payload),
@@ -129,6 +132,7 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
                 key: entry.key.clone(),
                 version_id: Some(entry.version_id.clone()),
                 if_match: None,
+                bypass_governance: false,
             })
             .await
             .unwrap();
@@ -158,6 +162,8 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
             tags: None,
             checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
             checksum_type: Some(ChecksumType::Composite),
+            raw_sse: RawSseHeaders::default(),
+            raw_lock: RawUploadObjectLockHeaders::default(),
         })
         .await
         .unwrap();
@@ -170,6 +176,7 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
                 upload_id: mp.upload_id.clone(),
                 part_number: 1,
                 max_bytes_limit: MAX_PART_SIZE_BYTES,
+                raw_sse: RawSseHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(
                 Bytes::from(vec![0xAB; 5 * 1024 * 1024]),
@@ -187,6 +194,7 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
                 upload_id: mp.upload_id.clone(),
                 part_number: 2,
                 max_bytes_limit: MAX_PART_SIZE_BYTES,
+                raw_sse: RawSseHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(
                 Bytes::from(vec![0xCD; 1234]),
@@ -216,6 +224,7 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
             preconditions: Preconditions::default(),
             expected_object_size: None,
             expected_checksum: None,
+            raw_sse: RawSseHeaders::default(),
         })
         .await
         .unwrap();
@@ -232,6 +241,8 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
             tags: None,
             checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
             checksum_type: Some(ChecksumType::Composite),
+            raw_sse: RawSseHeaders::default(),
+            raw_lock: RawUploadObjectLockHeaders::default(),
         })
         .await
         .unwrap();
@@ -244,6 +255,7 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
                 upload_id: open_mp.upload_id.clone(),
                 part_number: 1,
                 max_bytes_limit: MAX_PART_SIZE_BYTES,
+                raw_sse: RawSseHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(
                 Bytes::from(vec![0x55; 4096]),
@@ -280,6 +292,7 @@ async fn checkpoint_wal_pruning_gc_and_crash_recovery() {
             part_number: None,
             preconditions: Preconditions::default(),
             checksum_mode_enabled: true,
+            raw_sse: RawSseHeaders::default(),
         })
         .await
         .unwrap();
@@ -302,6 +315,7 @@ async fn corrupt_latest_checkpoint_refuses_startup_st8() {
             location_constraint: None,
             object_ownership: None,
             acl: None,
+            object_lock_enabled: false,
         })
         .await
         .unwrap();
@@ -328,6 +342,8 @@ async fn corrupt_latest_checkpoint_refuses_startup_st8() {
                 tags: None,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(Bytes::from_static(b"hello-st8"), None),
         )
@@ -377,6 +393,7 @@ async fn fsck_detects_segment_wal_and_missing_file_corruptions_nfr13() {
             location_constraint: None,
             object_ownership: None,
             acl: None,
+            object_lock_enabled: false,
         })
         .await
         .unwrap();
@@ -393,6 +410,8 @@ async fn fsck_detects_segment_wal_and_missing_file_corruptions_nfr13() {
                     tags: None,
                     preconditions: Preconditions::default(),
                     max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                    raw_sse: RawSseHeaders::default(),
+                    raw_lock: RawUploadObjectLockHeaders::default(),
                 },
                 InMemoryVerifiedStream::from_bytes(
                     Bytes::from(vec![0x42; 1024]),
@@ -476,6 +495,7 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
             location_constraint: None,
             object_ownership: None,
             acl: None,
+            object_lock_enabled: false,
         })
         .await
         .unwrap();
@@ -493,6 +513,8 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
                     tags: None,
                     preconditions: Preconditions::default(),
                     max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                    raw_sse: RawSseHeaders::default(),
+                    raw_lock: RawUploadObjectLockHeaders::default(),
                 },
                 InMemoryVerifiedStream::from_bytes(Bytes::from(vec![0x33; 1500]), None),
             )
@@ -516,6 +538,8 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
                 tags: None,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(Bytes::from_static(b"nope"), None),
         )
@@ -532,6 +556,7 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
             location_constraint: None,
             object_ownership: None,
             acl: None,
+            object_lock_enabled: false,
         })
         .await
         .err()
@@ -549,6 +574,7 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
             part_number: None,
             preconditions: Preconditions::default(),
             checksum_mode_enabled: false,
+            raw_sse: RawSseHeaders::default(),
         })
         .await
         .unwrap();
@@ -577,6 +603,7 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
             key: "k-0".into(),
             version_id: None,
             if_match: None,
+            bypass_governance: false,
         })
         .await
         .unwrap();
@@ -597,6 +624,7 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
                     etag_if_match: None,
                 },
             ],
+            bypass_governance: false,
         })
         .await
         .unwrap();
@@ -620,6 +648,8 @@ async fn low_disk_space_returns_503_slowdown_while_reads_deletes_and_gc_succeed_
                 tags: None,
                 preconditions: Preconditions::default(),
                 max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             },
             InMemoryVerifiedStream::from_bytes(Bytes::from_static(b"ok"), None),
         )

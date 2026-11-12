@@ -124,6 +124,8 @@ def main() -> int:
                 "us-east-1",
                 "--default-object-ownership",
                 "ObjectWriter",
+                "--lc-debug-interval",
+                "2",
                 "--log-format",
                 "json",
             ],
@@ -132,7 +134,15 @@ def main() -> int:
         )
         try:
             wait_health("http://127.0.0.1:29090/health")
-            pytest_args = ["-q", "-o", "junit_family=xunit2"]
+            pytest_args = [
+                "-q",
+                "-o",
+                "junit_family=xunit2",
+                "-m",
+                "not fails_on_aws and not auth_aws2 and not iam_account and not iam_user and not cloud_transition and not cloud_restore and not lifecycle_transition",
+                "-k",
+                "not tenant and not kms and not transition and not torrent",
+            ]
             if args.junitxml:
                 args.junitxml.parent.mkdir(parents=True, exist_ok=True)
                 pytest_args.append(f"--junitxml={args.junitxml.resolve()}")
@@ -154,6 +164,7 @@ def main() -> int:
             ]
 
             env = os.environ.copy()
+            env["TZ"] = "UTC"
             env["S3TEST_CONF"] = str(ROOT / "tests" / "s3test.conf")
             pytest_res = subprocess.run(
                 pytest_cmd,

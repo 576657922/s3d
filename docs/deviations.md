@@ -15,10 +15,10 @@
 | 级别 | 领域数 | 目标用例数 | 门槛要求 | 当前通过数 | 当前登记偏差数 | 最近更新里程碑 |
 | --- | --- | --- | --- | --- | --- | --- |
 | **M0 子集（bucket + object_core）** | 2 | 55 | M0 ≥ 44 | **52 / 55**（M0 首跑 48/55，M1 消除全部 4 项延后） | 3 | M1 |
-| **P0** | 10 | 249 | M1 ≥ 237 / M2 ≥ 245\* | **240 / 249**（96.4%，0 项 `DEFERRED_MILESTONE`） | 9 | **M3 零退化复核\***（`reports/m3-junit.xml`） |
-| **P1** | 6 | 190 | M2 ≥ 171 | **182 / 190**（95.8%，0 项 `DEFERRED_MILESTONE`） | 8 | **M3 零退化复核**（`reports/m3-junit.xml`） |
-| **P2** | 4 | 106 | M4 ≥ 85（选做） | —（待 M4 首跑） | 0 | 初始化 |
-| **合计** | **20** | **545** | — | **422 / 439**（已启用） | **17** | **M3** |
+| **P0** | 10 | 249 | M1 ≥ 237 / M2 ≥ 245\* | **240 / 249**（96.4%，0 项 `DEFERRED_MILESTONE`） | 9 | **M4 零退化复核\***（`reports/m4-junit.xml`） |
+| **P1** | 6 | 190 | M2 ≥ 171 | **182 / 190**（95.8%，0 项 `DEFERRED_MILESTONE`） | 8 | **M4 零退化复核**（`reports/m4-junit.xml`） |
+| **P2** | 4 | 106 | M4 ≥ 85（选做） | **104 / 106**（98.1%，`object_lock` 39/39、`lifecycle` 20/20、`encryption` 41/41、`logging` 4/6） | 2 | **M4**（`reports/m4-junit.xml`） |
+| **合计** | **20** | **545** | — | **526 / 545**（96.5%，全集启用，0 项 `DEFERRED_MILESTONE`） | **19** | **M4** |
 
 > **\*P0 理论上限核实说明（`240 / 249` vs 规格书 §11 事前估算 `245 / 249`）**：
 > 规格书编制阶段预估 M1 有约 12 个 P0 用例因依赖 `?acl`/`?versioning` 延后至 M2 消除后余 ~4 项上游分歧（即 `245 / 249`）。实测核实 P0 中所有依赖 `?acl` 的用例早在 M1 即已全部通过，剩余 **9 个未通过 P0 用例 100% 为客户端或规格书硬性分歧**，服务端不存在任何未实现功能：
@@ -55,6 +55,8 @@
 | `s3tests/functional/test_s3.py::test_cors_presigned_put_object_v2` | `cors` | P1 | `PR-6` | `INTENTIONAL_LIMIT` | 使用 `get_v2_client()` 发送 SigV2 `Authorization: AWS ...` 创建测试桶成功 | 返回 `400 InvalidArgument`（拒绝已淘汰的 SigV2 Header 签名） | 同上（`test_s3.py:7122`，已标 `@pytest.mark.fails_on_rgw`，漏标 `auth_aws2`；对应 SigV4 版本 `test_cors_presigned_get_object_v4` / `put_object_v4` 均已通过） | M2 |
 | `s3tests/functional/test_s3.py::test_bucket_policy_set_condition_operator_end_with_IfExists` | `policy` | P1 | `PR-30` | `AWS_DIVERGENCE` | 桶拥有者 `client` 设置仅含 `Effect: Allow` 的 `StringLikeIfExists` 策略后，桶拥有者自身不匹配的 `get_object` 返回 `403` | 桶拥有者无 `ExplicitDeny` 时凭默认所有者 ACL 正常读取返回 `200 OK` | 上游已标 `@pytest.mark.fails_on_rgw` 并注释 `# TODO: remove this fails_on_rgw when I fix it`（`test_s3.py:11898`）：AWS S3 IAM/Policy 评估规则明确规定 `Allow` 语句条件不满足仅产生 `ImplicitDeny`，不会覆盖同账号桶/对象拥有者自身的 `FULL_CONTROL` ACL（仅 `ExplicitDeny` 才会拒绝桶拥有者） | M2 |
 | `s3tests/functional/test_s3.py::test_bucket_policy_put_obj_request_obj_tag` | `tagging` | P1 | `PR-30` | `AWS_DIVERGENCE` | `alt_client.put_object` 携带 `x-amz-tagging: security=public` 命中 `s3:RequestObjectTag/security` Allow 策略返回 `200` | 返回 `403 AccessDenied`（因请求根本未携带 `x-amz-tagging` 头） | 上游已标 `@pytest.mark.fails_on_rgw` 并注释 `# TODO: remove this fails_on_rgw when I fix it`（`test_s3.py:13192`）：第 13214 行误将注入 `x-amz-tagging` 头的事件注册在 `client.meta.events` 而非 `alt_client.meta.events`，导致 `alt_client.put_object` 实际发出无标签请求 | M2 |
+| `s3tests/functional/test_s3.py::test_put_bucket_logging` | `logging` | P2 | `PutBucketLogging` | `AWS_DIVERGENCE` | 写入含 `<TargetGrants>` 的日志配置后，`GetBucketLogging` 响应自动丢弃 `TargetGrants`（`logging_enabled.pop('TargetGrants')`） | 按 AWS S3 规范原样持久化并在 `GetBucketLogging` 中返回 `<TargetGrants>` | 上游 `test_s3.py:15605` 明确注释 `# with target grant (not implemented in RGW)` 并在第 15625 行执行 `logging_enabled.pop('TargetGrants')` 以适配 Ceph RGW 未实现 `TargetGrants` 的限制；真实 AWS S3 `PutBucketLogging` / `GetBucketLogging` 官方 API 规范完整保存并返回 `TargetGrants`（用例前段最小配置、`SimplePrefix`、`PartitionedPrefix` 在 `s3d` 均全部通过） | M4 |
+| `s3tests/functional/test_s3.py::test_put_bucket_logging_errors` | `logging` | P2 | `PutBucketLogging` | `AWS_DIVERGENCE` | 目标日志桶不存在时返回 `NoSuchKey`；后续调用 `put_bucket_request_payment`（`?requestPayment`）返回 `200 OK` | 目标日志桶不存在时按 AWS S3 规范返回 `400 InvalidTargetBucketForLogging`；`?requestPayment` 按规格书返回 `501 NotImplemented` | 两处均偏离 AWS S3 与规格书：① `test_s3.py:16550` 断言不存在的 `TargetBucket` 返回 Ceph RGW 特有错误码 `NoSuchKey`，而 AWS S3 `PutBucketLogging` 官方文档明确规定目标桶不存在返回 `400 InvalidTargetBucketForLogging`；② 第 16613 行调用 `put_bucket_request_payment`，而《需求规格书》第 5 节第 234 行强制规定 `?requestPayment` 一律返回 `501 NotImplemented` | M4 |
 
 ---
 

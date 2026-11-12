@@ -41,11 +41,11 @@ struct ModelPartBoundary {
     part_number: u32,
     size: u64,
     checksum: Option<(ChecksumAlgorithm, String)>,
+    sse_iv: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone)]
 struct ModelVersion {
-    #[allow(dead_code)]
     seq: u64,
     version_id: Option<String>,
     is_delete_marker: bool,
@@ -59,6 +59,9 @@ struct ModelVersion {
     tags: BTreeMap<String, String>,
     last_modified_ms: i64,
     parts: Option<Vec<ModelPartBoundary>>,
+    sse: SseStoredMeta,
+    retention: Option<ObjectRetention>,
+    legal_hold: Option<LegalHoldStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,7 @@ struct ModelUploadPart {
     data: Bytes,
     md5: [u8; 16],
     checksum: Option<(ChecksumAlgorithm, String)>,
+    sse_iv: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +86,9 @@ struct ModelMultipartUpload {
     tags: BTreeMap<String, String>,
     checksum_algorithm: Option<ChecksumAlgorithm>,
     checksum_type: Option<ChecksumType>,
+    sse: SseStoredMeta,
+    retention: Option<ObjectRetention>,
+    legal_hold: Option<LegalHoldStatus>,
     parts: BTreeMap<u32, ModelUploadPart>,
 }
 
@@ -98,6 +105,11 @@ struct ModelBucket {
     cors: Option<CorsConfiguration>,
     policy: Option<BucketPolicyDoc>,
     public_access_block: Option<PublicAccessBlockConfig>,
+    object_lock_enabled: bool,
+    object_lock_config: Option<ObjectLockConfiguration>,
+    lifecycle: Option<LifecycleConfiguration>,
+    encryption: Option<BucketEncryptionConfig>,
+    logging: Option<BucketLoggingStatus>,
     objects: BTreeMap<String, Vec<ModelVersion>>, // key -> newest-first versions
     uploads: BTreeMap<(String, String), ModelMultipartUpload>, // (key, upload_id) -> upload
     completed_uploads: BTreeMap<(String, String), (i64, CompleteMultipartUploadResp)>,
@@ -128,6 +140,7 @@ struct ModelState {
 
 pub struct ModelStore {
     cfg: ModelConfig,
+    sse_s3_master_key: [u8; 32],
     state: Mutex<ModelState>,
 }
 
@@ -141,9 +154,79 @@ impl ModelStore {
     pub fn new(cfg: ModelConfig) -> Self {
         Self {
             cfg,
+            sse_s3_master_key: derive_sse_s3_master_key(b"s3d-model-uuid01"),
             state: Mutex::new(ModelState::default()),
         }
     }
+}
+
+fn model_make_iv(seq: u64, sub: u32) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[0..8].copy_from_slice(&seq.to_be_bytes());
+    iv[8..12].copy_from_slice(&sub.to_be_bytes());
+    iv[12..16].copy_from_slice(&0xA55A_33C3u32.to_be_bytes());
+    iv
+}
+
+fn decrypt_model_version_slice(
+    ver: &ModelVersion,
+    key_iv: Option<([u8; 32], [u8; 16])>,
+    start: u64,
+    end_excl: u64,
+) -> Bytes {
+    if start >= end_excl {
+        return Bytes::new();
+    }
+    let Some((key, ver_iv)) = key_iv else {
+        return ver.data.slice(start as usize..end_excl as usize);
+    };
+    let mut out = ver.data[start as usize..end_excl as usize].to_vec();
+    if let Some(parts) = &ver.parts {
+        let cipher = Aes256Cipher::new(&key);
+        let mut p_off = 0u64;
+        for p in parts {
+            let p_end = p_off + p.size;
+            let ov_s = start.max(p_off);
+            let ov_e = end_excl.min(p_end);
+            if ov_s < ov_e {
+                let dst_s = (ov_s - start) as usize;
+                let dst_e = (ov_e - start) as usize;
+                let p_iv = p.sse_iv.unwrap_or(ver_iv);
+                aes256_ctr_xor_with_cipher(&cipher, &p_iv, ov_s - p_off, &mut out[dst_s..dst_e]);
+            }
+            p_off = p_end;
+            if p_off >= end_excl {
+                break;
+            }
+        }
+    } else {
+        aes256_ctr_xor(&key, &ver_iv, start, &mut out);
+    }
+    Bytes::from(out)
+}
+
+fn can_bypass_governance_model(
+    bucket: &ModelBucket,
+    default_ownership: ObjectOwnership,
+    ctx: &CallerContext,
+    key: &str,
+    existing_tags: Option<&BTreeMap<String, String>>,
+) -> bool {
+    let view = bucket.auth_view(default_ownership);
+    let extra = PolicyEvalExtra {
+        existing_object_tags: existing_tags,
+        ..Default::default()
+    };
+    authorize_object_action(
+        &view,
+        ctx,
+        key,
+        &[S3Action::BypassGovernanceRetention],
+        Some(&bucket.owner),
+        None,
+        true,
+        &extra,
+    )
 }
 
 fn require_authenticated(ctx: &CallerContext) -> StoreResult<&OwnerInfo> {
@@ -570,18 +653,30 @@ impl ObjectStore for ModelStore {
             }
             None => None,
         };
+        let initial_versioning = if req.object_lock_enabled {
+            VersioningStatus::Enabled
+        } else {
+            VersioningStatus::Unversioned
+        };
         let b = ModelBucket {
             name: req.bucket.clone(),
             owner: caller,
             acl,
             region: self.cfg.region.clone(),
             created_ms: req.ctx.request_time_ms,
-            versioning: VersioningStatus::Unversioned,
+            versioning: initial_versioning,
             explicit_ownership,
             tags: BTreeMap::new(),
             cors: None,
             policy: None,
             public_access_block: None,
+            object_lock_enabled: req.object_lock_enabled,
+            object_lock_config: req
+                .object_lock_enabled
+                .then_some(ObjectLockConfiguration::default()),
+            lifecycle: None,
+            encryption: None,
+            logging: None,
             objects: BTreeMap::new(),
             uploads: BTreeMap::new(),
             completed_uploads: BTreeMap::new(),
@@ -675,6 +770,13 @@ impl ObjectStore for ModelStore {
             &PolicyEvalExtra::default(),
         )?;
         let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        if b.object_lock_enabled && req.status == VersioningStatus::Suspended {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidBucketState,
+                "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
+            )
+            .with_bucket(&req.bucket));
+        }
         b.versioning = req.status;
         Ok(())
     }
@@ -1194,6 +1296,412 @@ impl ObjectStore for ModelStore {
         Ok(())
     }
 
+    async fn get_object_lock_configuration(
+        &self,
+        req: BucketRef,
+    ) -> StoreResult<ObjectLockConfiguration> {
+        let guard = self.state.lock().unwrap();
+        let b = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketObjectLockConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        if !b.object_lock_enabled {
+            return Err(S3Error::new(
+                S3ErrorCode::ObjectLockConfigurationNotFoundError,
+                "Object Lock configuration does not exist for this bucket",
+            )
+            .with_bucket(&req.bucket));
+        }
+        Ok(b.object_lock_config.unwrap_or_default())
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: PutObjectLockConfigurationReq,
+    ) -> StoreResult<()> {
+        let mut guard = self.state.lock().unwrap();
+        let b_ro = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::PutBucketObjectLockConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        if !b_ro.object_lock_enabled && b_ro.versioning != VersioningStatus::Enabled {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidBucketState,
+                "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration",
+            )
+            .with_bucket(&req.bucket));
+        }
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        b.object_lock_enabled = true;
+        b.object_lock_config = Some(req.config);
+        Ok(())
+    }
+
+    async fn get_object_retention(&self, req: ObjectLockRef) -> StoreResult<ObjectRetention> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let guard = self.state.lock().unwrap();
+        let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_op_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            &[S3Action::GetObjectRetention],
+            None,
+            None,
+        )?;
+        if !b.object_lock_enabled {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "Bucket is missing Object Lock Configuration",
+            )
+            .with_bucket(&req.bucket));
+        }
+        ver.retention.ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchObjectLockConfiguration,
+                "The specified object does not have a ObjectLock configuration",
+            )
+            .with_key(&req.bucket, &req.key)
+        })
+    }
+
+    async fn put_object_retention(&self, req: PutObjectRetentionReq) -> StoreResult<()> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let mut guard = self.state.lock().unwrap();
+        let b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let target_seq = {
+            let ver = self.lookup_version_for_op_checked(
+                b_ro,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                &[S3Action::PutObjectRetention],
+                None,
+                None,
+            )?;
+            if !b_ro.object_lock_enabled {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    "Bucket is missing Object Lock Configuration",
+                )
+                .with_bucket(&req.bucket));
+            }
+            let can_bypass = can_bypass_governance_model(
+                b_ro,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.key,
+                Some(&ver.tags),
+            );
+            check_worm_put_retention(
+                ver.retention,
+                req.retention,
+                req.bypass_governance,
+                can_bypass,
+                req.ctx.request_time_ms,
+            )?;
+            ver.seq
+        };
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        if let Some(chain) = b.objects.get_mut(&req.key)
+            && let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq)
+        {
+            v.retention = Some(req.retention);
+        }
+        Ok(())
+    }
+
+    async fn get_object_legal_hold(&self, req: ObjectLockRef) -> StoreResult<LegalHoldStatus> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let guard = self.state.lock().unwrap();
+        let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_op_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            &[S3Action::GetObjectLegalHold],
+            None,
+            None,
+        )?;
+        if !b.object_lock_enabled {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "Bucket is missing Object Lock Configuration",
+            )
+            .with_bucket(&req.bucket));
+        }
+        ver.legal_hold.ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchObjectLockConfiguration,
+                "The specified object does not have a ObjectLock configuration",
+            )
+            .with_key(&req.bucket, &req.key)
+        })
+    }
+
+    async fn put_object_legal_hold(&self, req: PutObjectLegalHoldReq) -> StoreResult<()> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let mut guard = self.state.lock().unwrap();
+        let b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let target_seq = {
+            let ver = self.lookup_version_for_op_checked(
+                b_ro,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                &[S3Action::PutObjectLegalHold],
+                None,
+                None,
+            )?;
+            if !b_ro.object_lock_enabled {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    "Bucket is missing Object Lock Configuration",
+                )
+                .with_bucket(&req.bucket));
+            }
+            ver.seq
+        };
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        if let Some(chain) = b.objects.get_mut(&req.key)
+            && let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq)
+        {
+            v.legal_hold = Some(req.status);
+        }
+        Ok(())
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: BucketRef,
+    ) -> StoreResult<LifecycleConfiguration> {
+        let guard = self.state.lock().unwrap();
+        let b = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetLifecycleConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        b.lifecycle.clone().ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchLifecycleConfiguration,
+                "The lifecycle configuration does not exist",
+            )
+            .with_bucket(&req.bucket)
+        })
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: PutBucketLifecycleReq,
+    ) -> StoreResult<()> {
+        let mut guard = self.state.lock().unwrap();
+        let _ = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::PutLifecycleConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        guard.buckets.get_mut(&req.bucket).unwrap().lifecycle = Some(req.config);
+        Ok(())
+    }
+
+    async fn delete_bucket_lifecycle(&self, req: BucketRef) -> StoreResult<()> {
+        let mut guard = self.state.lock().unwrap();
+        let _ = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::PutLifecycleConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        guard.buckets.get_mut(&req.bucket).unwrap().lifecycle = None;
+        Ok(())
+    }
+
+    async fn get_bucket_encryption(&self, req: BucketRef) -> StoreResult<BucketEncryptionConfig> {
+        let guard = self.state.lock().unwrap();
+        let b = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetEncryptionConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        b.encryption.clone().ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError,
+                "The server side encryption configuration was not found",
+            )
+            .with_bucket(&req.bucket)
+        })
+    }
+
+    async fn put_bucket_encryption(&self, req: PutBucketEncryptionReq) -> StoreResult<()> {
+        let mut guard = self.state.lock().unwrap();
+        let _ = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::PutEncryptionConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        guard.buckets.get_mut(&req.bucket).unwrap().encryption = Some(req.config);
+        Ok(())
+    }
+
+    async fn delete_bucket_encryption(&self, req: BucketRef) -> StoreResult<()> {
+        let mut guard = self.state.lock().unwrap();
+        let _ = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::PutEncryptionConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        guard.buckets.get_mut(&req.bucket).unwrap().encryption = None;
+        Ok(())
+    }
+
+    async fn get_bucket_logging(&self, req: BucketRef) -> StoreResult<BucketLoggingStatus> {
+        let guard = self.state.lock().unwrap();
+        let b = check_bucket_action(
+            &guard,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketLogging],
+            Some(AclPermission::ReadAcp),
+            &PolicyEvalExtra::default(),
+        )?;
+        Ok(b.logging.clone().unwrap_or_default())
+    }
+
+    async fn put_bucket_logging(&self, req: PutBucketLoggingReq) -> StoreResult<()> {
+        let mut guard = self.state.lock().unwrap();
+        let src_owner_id = {
+            let src_b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+            let view = src_b.auth_view(self.cfg.default_object_ownership);
+            if let Some(pol) = view.policy {
+                let arn = format!("arn:aws:s3:::{}", req.bucket);
+                if pol.evaluate(
+                    &req.ctx,
+                    &[S3Action::PutBucketLogging],
+                    &arn,
+                    &PolicyEvalExtra::default(),
+                ) == PolicyDecision::ExplicitDeny
+                {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket));
+                }
+            }
+            if !view.is_caller_bucket_owner(&req.ctx) {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                    .with_bucket(&req.bucket));
+            }
+            src_b.owner.user_id.clone()
+        };
+
+        if let Some(le) = &req.status.logging_enabled {
+            let Some(target_b) = guard.buckets.get(&le.target_bucket) else {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidTargetBucketForLogging,
+                    "The target bucket for logging does not exist",
+                )
+                .with_bucket(&le.target_bucket));
+            };
+            if le.target_bucket == req.bucket {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidArgument,
+                    "Source bucket and target bucket cannot be the same",
+                ));
+            }
+            if target_b
+                .logging
+                .as_ref()
+                .and_then(|s| s.logging_enabled.as_ref())
+                .is_some()
+                || target_b.encryption.is_some()
+            {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidArgument,
+                    "Invalid target bucket state for logging",
+                ));
+            }
+
+            let src_arn = format!("arn:aws:s3:::{}", req.bucket);
+            let target_res_arn = format!("arn:aws:s3:::{}/{}", le.target_bucket, le.target_prefix);
+            let svc_extra = PolicyEvalExtra {
+                source_arn: Some(&src_arn),
+                source_account: Some(&src_owner_id),
+                ..Default::default()
+            };
+            let allowed_by_policy = target_b.policy.as_ref().is_some_and(|pol| {
+                pol.allows_service(
+                    "logging.s3.amazonaws.com",
+                    &[S3Action::PutObject],
+                    &target_res_arn,
+                    &svc_extra,
+                )
+            });
+            let allowed_by_acl = target_b.effective_ownership(self.cfg.default_object_ownership)
+                != ObjectOwnership::BucketOwnerEnforced
+                && target_b.acl.grants.iter().any(|g| {
+                    matches!(&g.grantee, AclGrantee::Group(u) if u == GROUP_LOG_DELIVERY)
+                        && matches!(
+                            g.permission,
+                            AclPermission::Write | AclPermission::FullControl
+                        )
+                })
+                && target_b.acl.grants.iter().any(|g| {
+                    matches!(&g.grantee, AclGrantee::Group(u) if u == GROUP_LOG_DELIVERY)
+                        && matches!(
+                            g.permission,
+                            AclPermission::ReadAcp | AclPermission::FullControl
+                        )
+                });
+            if !allowed_by_policy && !allowed_by_acl {
+                return Err(S3Error::new(
+                    S3ErrorCode::AccessDenied,
+                    "Bucket policy on target bucket does not allow logging service PutObject",
+                ));
+            }
+        }
+
+        guard.buckets.get_mut(&req.bucket).unwrap().logging = Some(req.status);
+        Ok(())
+    }
+
     async fn put_object<S: VerifiedBodyStream>(
         &self,
         req: PutObjectReq,
@@ -1202,7 +1710,7 @@ impl ObjectStore for ModelStore {
         validate_object_key(&req.bucket, &req.key)?;
         validate_user_metadata(&req.user_meta)?;
 
-        {
+        let pre_sse = {
             let guard = self.state.lock().unwrap();
             let b = check_bucket_write_object(
                 &guard,
@@ -1211,6 +1719,13 @@ impl ObjectStore for ModelStore {
                 &req.bucket,
                 &req.key,
                 req.tags.as_ref(),
+            )?;
+            let sse_write = validate_sse_write(&req.raw_sse, b.encryption.is_some())?;
+            let _ = resolve_upload_object_lock(
+                b.object_lock_enabled,
+                b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
             )?;
             enforce_block_public_acl_spec(
                 b.auth_view(self.cfg.default_object_ownership)
@@ -1224,7 +1739,8 @@ impl ObjectStore for ModelStore {
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
             )?;
-        }
+            sse_write
+        };
 
         // [FR-1, PR-21] Stream & verify digests BEFORE touching visible state
         let mut buf = BytesMut::new();
@@ -1244,7 +1760,7 @@ impl ObjectStore for ModelStore {
 
         // [FR-17] Evaluate preconditions atomically at commit point
         let mut guard = self.state.lock().unwrap();
-        let (obj_owner, obj_acl) = {
+        let (obj_owner, obj_acl, sse_write, retention, legal_hold) = {
             let b = check_bucket_write_object(
                 &guard,
                 self.cfg.default_object_ownership,
@@ -1253,25 +1769,59 @@ impl ObjectStore for ModelStore {
                 &req.key,
                 req.tags.as_ref(),
             )?;
+            let sse_w = validate_sse_write(&req.raw_sse, b.encryption.is_some())?;
+            let (ret, lh) = resolve_upload_object_lock(
+                b.object_lock_enabled,
+                b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
+            )?;
             enforce_block_public_acl_spec(
                 b.auth_view(self.cfg.default_object_ownership)
                     .block_public_acls(),
                 req.acl.as_ref(),
             )
             .map_err(|e| e.with_key(&req.bucket, &req.key))?;
-            resolve_object_owner_and_acl(
+            let (own, acl) = resolve_object_owner_and_acl(
                 b.effective_ownership(self.cfg.default_object_ownership),
                 &b.owner,
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
-            )?
+            )?;
+            (own, acl, sse_w, ret, lh)
         };
+        let _ = pre_sse;
         guard.next_seq += 1;
         let seq = guard.next_seq;
 
         let bucket = guard.buckets.get_mut(&req.bucket).unwrap();
         let head = head_state_of(bucket.objects.get(&req.key));
         evaluate_write_preconditions(&req.preconditions, &req.bucket, &req.key, head)?;
+
+        let iv = model_make_iv(seq, 0);
+        let (stored_sse, sse_resp) = match &sse_write {
+            ValidatedSseWrite::None => (SseStoredMeta::None, SseResponseHeaders::None),
+            ValidatedSseWrite::SseS3 => {
+                aes256_ctr_xor(&self.sse_s3_master_key, &iv, 0, &mut buf);
+                (SseStoredMeta::SseS3 { iv }, SseResponseHeaders::SseS3)
+            }
+            ValidatedSseWrite::SseC {
+                key,
+                key_md5,
+                key_md5_b64,
+            } => {
+                aes256_ctr_xor(key, &iv, 0, &mut buf);
+                (
+                    SseStoredMeta::SseC {
+                        key_md5: *key_md5,
+                        iv,
+                    },
+                    SseResponseHeaders::SseC {
+                        key_md5_b64: key_md5_b64.clone(),
+                    },
+                )
+            }
+        };
 
         // [FR-7, PR-17] Quoted MD5 hex ETag
         let etag = format!("\"{}\"", hex::encode(digests.md5));
@@ -1280,6 +1830,15 @@ impl ObjectStore for ModelStore {
             VersioningStatus::Suspended => Some("null".to_string()),
             VersioningStatus::Enabled => Some(format!("v{seq:016x}")),
         };
+
+        let obj_tags = req.tags.unwrap_or_default();
+        let exp_hdr = compute_x_amz_expiration(
+            bucket.lifecycle.as_ref(),
+            &req.key,
+            digests.total_bytes,
+            &obj_tags,
+            req.ctx.request_time_ms,
+        );
 
         let ver = ModelVersion {
             seq,
@@ -1292,9 +1851,12 @@ impl ObjectStore for ModelStore {
             user_meta: req.user_meta,
             owner: obj_owner,
             acl: obj_acl,
-            tags: req.tags.unwrap_or_default(),
+            tags: obj_tags,
             last_modified_ms: req.ctx.request_time_ms,
             parts: None,
+            sse: stored_sse,
+            retention,
+            legal_hold,
         };
 
         let chain = bucket.objects.entry(req.key).or_default();
@@ -1304,6 +1866,8 @@ impl ObjectStore for ModelStore {
             etag,
             version_id,
             checksum: digests.checksum,
+            sse: sse_resp,
+            expiration_header: exp_hdr,
         })
     }
 
@@ -1346,6 +1910,9 @@ impl ObjectStore for ModelStore {
             None,
             None,
         )?;
+        let sse_read = validate_sse_read_or_part(&req.raw_sse)?;
+        let (_, sse_resp) =
+            match_sse_for_stored_object(&ver.sse, &sse_read, &self.sse_s3_master_key)?;
 
         let object_parts = if req.attrs.object_parts {
             ver.parts.as_ref().map(|all_parts| {
@@ -1389,13 +1956,14 @@ impl ObjectStore for ModelStore {
             object_parts,
             storage_class: req.attrs.storage_class.then(|| "STANDARD".to_string()),
             object_size: req.attrs.object_size.then_some(ver.data.len() as u64),
+            sse: sse_resp,
         })
     }
 
     async fn delete_object(&self, req: DeleteObjectReq) -> StoreResult<DeleteObjectResp> {
         validate_object_key(&req.bucket, &req.key)?;
         let mut guard = self.state.lock().unwrap();
-        let dm_owner = {
+        let (dm_owner, can_bypass) = {
             let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
             let view = b.auth_view(self.cfg.default_object_ownership);
             let actions: &[S3Action] = if req.version_id.is_some() {
@@ -1434,7 +2002,17 @@ impl ObjectStore for ModelStore {
                 return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                     .with_key(&req.bucket, &req.key));
             }
-            req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone())
+            let can_byp = can_bypass_governance_model(
+                b,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.key,
+                existing_tags,
+            );
+            (
+                req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone()),
+                can_byp,
+            )
         };
         guard.next_seq += 1;
         let seq = guard.next_seq;
@@ -1450,6 +2028,16 @@ impl ObjectStore for ModelStore {
                     .iter()
                     .position(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
                 {
+                    if !chain[pos].is_delete_marker {
+                        check_worm_version_delete(
+                            chain[pos].retention,
+                            chain[pos].legal_hold,
+                            req.bypass_governance,
+                            can_bypass,
+                            req.ctx.request_time_ms,
+                        )
+                        .map_err(|e| e.with_key(&req.bucket, &req.key))?;
+                    }
                     let removed = chain.remove(pos);
                     if chain.is_empty() {
                         bucket.objects.remove(&req.key);
@@ -1500,6 +2088,9 @@ impl ObjectStore for ModelStore {
                     tags: BTreeMap::new(),
                     last_modified_ms: req.ctx.request_time_ms,
                     parts: None,
+                    sse: SseStoredMeta::None,
+                    retention: None,
+                    legal_hold: None,
                 };
                 let chain = bucket.objects.entry(req.key).or_default();
                 if bucket.versioning == VersioningStatus::Suspended {
@@ -1537,6 +2128,7 @@ impl ObjectStore for ModelStore {
                 key: item.key.clone(),
                 version_id: item.version_id.clone(),
                 if_match: item.etag_if_match,
+                bypass_governance: req.bypass_governance,
             };
             match self.delete_object(sub).await {
                 Ok(resp) => {
@@ -1577,6 +2169,9 @@ impl ObjectStore for ModelStore {
             && !req.replace_metadata
             && req.acl.is_none()
             && req.tagging_directive == TaggingDirective::Copy
+            && req.raw_sse.sse_algorithm.is_none()
+            && !req.raw_sse.has_customer_headers()
+            && !req.raw_lock.has_any()
         {
             // [FR-20] Self-copy with no changes -> 400 InvalidRequest
             return Err(S3Error::new(
@@ -1606,7 +2201,7 @@ impl ObjectStore for ModelStore {
             TaggingDirective::Replace => req.tags.as_ref(),
         };
 
-        let (dst_owner, dst_acl) = {
+        let (dst_owner, dst_acl, dst_sse_write, retention, legal_hold) = {
             let dst_b = check_bucket_write_object(
                 &guard,
                 self.cfg.default_object_ownership,
@@ -1615,6 +2210,13 @@ impl ObjectStore for ModelStore {
                 &req.dst_key,
                 req_tags_for_auth,
             )?;
+            let dst_sse_w = validate_sse_write(&req.raw_sse, dst_b.encryption.is_some())?;
+            let (ret, lh) = resolve_upload_object_lock(
+                dst_b.object_lock_enabled,
+                dst_b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
+            )?;
             enforce_block_public_acl_spec(
                 dst_b
                     .auth_view(self.cfg.default_object_ownership)
@@ -1622,13 +2224,18 @@ impl ObjectStore for ModelStore {
                 req.acl.as_ref(),
             )
             .map_err(|e| e.with_key(&req.dst_bucket, &req.dst_key))?;
-            resolve_object_owner_and_acl(
+            let (own, acl) = resolve_object_owner_and_acl(
                 dst_b.effective_ownership(self.cfg.default_object_ownership),
                 &dst_b.owner,
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
-            )?
+            )?;
+            (own, acl, dst_sse_w, ret, lh)
         };
+
+        let src_sse_read = validate_copy_source_sse(&req.raw_copy_src_sse)?;
+        let (src_key_iv, _) =
+            match_sse_for_stored_object(&src_ver.sse, &src_sse_read, &self.sse_s3_master_key)?;
 
         if src_ver.data.len() as u64 > MAX_SINGLE_PUT_BYTES {
             // [FR-21] CopyObject > 5 GiB -> 400 InvalidRequest
@@ -1644,6 +2251,9 @@ impl ObjectStore for ModelStore {
             &src_ver.etag,
             src_ver.last_modified_ms,
         )?;
+
+        let plain_bytes =
+            decrypt_model_version_slice(&src_ver, src_key_iv, 0, src_ver.data.len() as u64);
 
         guard.next_seq += 1;
         let seq = guard.next_seq;
@@ -1666,19 +2276,54 @@ impl ObjectStore for ModelStore {
         } else {
             (src_ver.sys_meta.clone(), src_ver.user_meta.clone())
         };
-        let md5_raw: [u8; 16] = Md5::digest(&src_ver.data).into();
+        let md5_raw: [u8; 16] = Md5::digest(&plain_bytes).into();
         let etag = format!("\"{}\"", hex::encode(md5_raw));
         let dst_csum = ChecksumState {
             algorithm: src_ver.checksum.algorithm,
             checksum_type: ChecksumType::FullObject,
-            value_b64: compute_checksum_b64(src_ver.checksum.algorithm, &src_ver.data),
+            value_b64: compute_checksum_b64(src_ver.checksum.algorithm, &plain_bytes),
             client_requested: src_ver.checksum.client_requested,
         };
+
+        let iv = model_make_iv(seq, 0);
+        let mut dst_buf = BytesMut::from(plain_bytes.as_ref());
+        let (stored_sse, sse_resp) = match &dst_sse_write {
+            ValidatedSseWrite::None => (SseStoredMeta::None, SseResponseHeaders::None),
+            ValidatedSseWrite::SseS3 => {
+                aes256_ctr_xor(&self.sse_s3_master_key, &iv, 0, &mut dst_buf);
+                (SseStoredMeta::SseS3 { iv }, SseResponseHeaders::SseS3)
+            }
+            ValidatedSseWrite::SseC {
+                key,
+                key_md5,
+                key_md5_b64,
+            } => {
+                aes256_ctr_xor(key, &iv, 0, &mut dst_buf);
+                (
+                    SseStoredMeta::SseC {
+                        key_md5: *key_md5,
+                        iv,
+                    },
+                    SseResponseHeaders::SseC {
+                        key_md5_b64: key_md5_b64.clone(),
+                    },
+                )
+            }
+        };
+
+        let exp_hdr = compute_x_amz_expiration(
+            dst_b.lifecycle.as_ref(),
+            &req.dst_key,
+            plain_bytes.len() as u64,
+            &dst_tags,
+            req.ctx.request_time_ms,
+        );
+
         let new_ver = ModelVersion {
             seq,
             version_id: dst_vid.clone(),
             is_delete_marker: false,
-            data: src_ver.data.clone(),
+            data: dst_buf.freeze(),
             etag: etag.clone(),
             checksum: dst_csum.clone(),
             sys_meta,
@@ -1688,6 +2333,9 @@ impl ObjectStore for ModelStore {
             tags: dst_tags,
             last_modified_ms: req.ctx.request_time_ms,
             parts: None,
+            sse: stored_sse,
+            retention,
+            legal_hold,
         };
 
         let chain = dst_b.objects.entry(req.dst_key).or_default();
@@ -1699,6 +2347,8 @@ impl ObjectStore for ModelStore {
             src_version_id: src_ver.version_id,
             dst_version_id: dst_vid,
             checksum: dst_csum.client_requested.then_some(dst_csum),
+            sse: sse_resp,
+            expiration_header: exp_hdr,
         })
     }
 
@@ -1721,7 +2371,7 @@ impl ObjectStore for ModelStore {
         };
 
         let mut guard = self.state.lock().unwrap();
-        let (initiator, obj_owner, obj_acl) = {
+        let (initiator, obj_owner, obj_acl, sse_write, retention, legal_hold) = {
             let b = check_bucket_write_object(
                 &guard,
                 self.cfg.default_object_ownership,
@@ -1729,6 +2379,13 @@ impl ObjectStore for ModelStore {
                 &req.bucket,
                 &req.key,
                 req.tags.as_ref(),
+            )?;
+            let sse_w = validate_sse_write(&req.raw_sse, b.encryption.is_some())?;
+            let (ret, lh) = resolve_upload_object_lock(
+                b.object_lock_enabled,
+                b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
             )?;
             enforce_block_public_acl_spec(
                 b.auth_view(self.cfg.default_object_ownership)
@@ -1743,12 +2400,25 @@ impl ObjectStore for ModelStore {
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
             )?;
-            (initiator, obj_owner, obj_acl)
+            (initiator, obj_owner, obj_acl, sse_w, ret, lh)
         };
         guard.next_seq += 1;
         let seq = guard.next_seq;
         // [FR-24] Opaque UploadId
         let upload_id = format!("mp{seq:032x}");
+        let iv = model_make_iv(seq, 0);
+        let (up_sse, sse_resp) = match sse_write {
+            ValidatedSseWrite::None => (SseStoredMeta::None, SseResponseHeaders::None),
+            ValidatedSseWrite::SseS3 => (SseStoredMeta::SseS3 { iv }, SseResponseHeaders::SseS3),
+            ValidatedSseWrite::SseC {
+                key_md5,
+                key_md5_b64,
+                ..
+            } => (
+                SseStoredMeta::SseC { key_md5, iv },
+                SseResponseHeaders::SseC { key_md5_b64 },
+            ),
+        };
 
         let b = guard.buckets.get_mut(&req.bucket).unwrap();
         b.uploads.insert(
@@ -1763,6 +2433,9 @@ impl ObjectStore for ModelStore {
                 user_meta: req.user_meta,
                 checksum_algorithm: req.checksum_algorithm,
                 checksum_type: resolved_type,
+                sse: up_sse,
+                retention,
+                legal_hold,
                 parts: BTreeMap::new(),
             },
         );
@@ -1773,6 +2446,7 @@ impl ObjectStore for ModelStore {
             upload_id,
             checksum_algorithm: req.checksum_algorithm,
             checksum_type: resolved_type,
+            sse: sse_resp,
         })
     }
 
@@ -1790,7 +2464,7 @@ impl ObjectStore for ModelStore {
             ));
         }
 
-        let upload_csum_info = {
+        let (upload_csum_info, part_enc_key, sse_resp) = {
             let guard = self.state.lock().unwrap();
             let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
             let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
@@ -1828,7 +2502,14 @@ impl ObjectStore for ModelStore {
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
                 );
             }
-            (up.checksum_algorithm, up.checksum_type)
+            let part_sse_req = validate_sse_read_or_part(&req.raw_sse)?;
+            let (key_iv, sse_r) =
+                match_sse_for_stored_object(&up.sse, &part_sse_req, &self.sse_s3_master_key)?;
+            (
+                (up.checksum_algorithm, up.checksum_type),
+                key_iv.map(|(k, _)| k),
+                sse_r,
+            )
         };
 
         let mut buf = BytesMut::new();
@@ -1845,7 +2526,6 @@ impl ObjectStore for ModelStore {
             buf.extend_from_slice(&chunk);
         }
         let digests = body.finish().map_err(map_body_err)?;
-        let data = buf.freeze();
 
         if let Some(up_alg) = upload_csum_info.0
             && digests.checksum.client_requested && digests.checksum.algorithm != up_alg {
@@ -1860,7 +2540,7 @@ impl ObjectStore for ModelStore {
 
         let part_csum = upload_csum_info
             .0
-            .map(|alg| (alg, compute_checksum_b64(alg, &data)));
+            .map(|alg| (alg, compute_checksum_b64(alg, &buf)));
         let resp_csum = if let Some((alg, val)) = &part_csum {
             Some(ChecksumState {
                 algorithm: *alg,
@@ -1891,6 +2571,17 @@ impl ObjectStore for ModelStore {
                     S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
                 );
             }
+        guard.next_seq += 1;
+        let p_seq = guard.next_seq;
+        let part_iv = if let Some(k) = &part_enc_key {
+            let iv = model_make_iv(p_seq, req.part_number);
+            aes256_ctr_xor(k, &iv, 0, &mut buf);
+            Some(iv)
+        } else {
+            None
+        };
+        let data = buf.freeze();
+
         let b = guard.buckets.get_mut(&req.bucket).unwrap();
         let up = b
             .uploads
@@ -1913,12 +2604,14 @@ impl ObjectStore for ModelStore {
                 data,
                 md5: digests.md5,
                 checksum: part_csum,
+                sse_iv: part_iv,
             },
         );
 
         Ok(UploadPartResp {
             etag,
             checksum: resp_csum,
+            sse: sse_resp,
         })
     }
 
@@ -1973,6 +2666,7 @@ impl ObjectStore for ModelStore {
             );
         }
         let up_alg = up_ro.checksum_algorithm;
+        let up_sse = up_ro.sse;
 
         let src_ver = self
             .lookup_version_for_copy_checked(
@@ -1984,6 +2678,13 @@ impl ObjectStore for ModelStore {
             )?
             .clone();
 
+        let dst_sse_req = validate_sse_read_or_part(&req.raw_sse)?;
+        let (dst_key_iv, sse_resp) =
+            match_sse_for_stored_object(&up_sse, &dst_sse_req, &self.sse_s3_master_key)?;
+        let src_sse_req = validate_copy_source_sse(&req.raw_copy_src_sse)?;
+        let (src_key_iv, _) =
+            match_sse_for_stored_object(&src_ver.sse, &src_sse_req, &self.sse_s3_master_key)?;
+
         evaluate_copy_source_preconditions(
             &req.src_preconditions,
             &src_ver.etag,
@@ -1991,7 +2692,7 @@ impl ObjectStore for ModelStore {
         )?;
 
         let src_len = src_ver.data.len() as u64;
-        let slice = if let Some((start, end)) = req.src_range {
+        let (cp_start, cp_end_excl) = if let Some((start, end)) = req.src_range {
             // [FR-31] Out-of-bounds x-amz-copy-source-range -> InvalidRange (or InvalidArgument)
             if start > end || end >= src_len {
                 return Err(S3Error::new(
@@ -2005,7 +2706,7 @@ impl ObjectStore for ModelStore {
                     "Your proposed upload exceeds the maximum allowed size",
                 ));
             }
-            src_ver.data.slice(start as usize..(end as usize + 1))
+            (start, end + 1)
         } else {
             if src_len > MAX_PART_SIZE_BYTES {
                 return Err(S3Error::new(
@@ -2013,18 +2714,30 @@ impl ObjectStore for ModelStore {
                     "Your proposed upload exceeds the maximum allowed size",
                 ));
             }
-            src_ver.data.clone()
+            (0, src_len)
         };
 
-        let md5: [u8; 16] = Md5::digest(&slice).into();
+        let plain_slice = decrypt_model_version_slice(&src_ver, src_key_iv, cp_start, cp_end_excl);
+        let md5: [u8; 16] = Md5::digest(&plain_slice).into();
         let etag = format!("\"{}\"", hex::encode(md5));
-        let part_csum = up_alg.map(|alg| (alg, compute_checksum_b64(alg, &slice)));
+        let part_csum = up_alg.map(|alg| (alg, compute_checksum_b64(alg, &plain_slice)));
         let resp_csum = part_csum.as_ref().map(|(alg, val)| ChecksumState {
             algorithm: *alg,
             checksum_type: ChecksumType::FullObject,
             value_b64: val.clone(),
             client_requested: true,
         });
+
+        guard.next_seq += 1;
+        let p_seq = guard.next_seq;
+        let mut stored_buf = BytesMut::from(plain_slice.as_ref());
+        let part_iv = if let Some((dst_k, _)) = &dst_key_iv {
+            let iv = model_make_iv(p_seq, req.part_number);
+            aes256_ctr_xor(dst_k, &iv, 0, &mut stored_buf);
+            Some(iv)
+        } else {
+            None
+        };
 
         let dst_b = guard.buckets.get_mut(&req.dst_bucket).unwrap();
         let up = dst_b
@@ -2037,9 +2750,10 @@ impl ObjectStore for ModelStore {
                 part_number: req.part_number,
                 last_modified_ms: req.ctx.request_time_ms,
                 etag: etag.clone(),
-                data: slice,
+                data: stored_buf.freeze(),
                 md5,
                 checksum: part_csum,
+                sse_iv: part_iv,
             },
         );
 
@@ -2048,6 +2762,7 @@ impl ObjectStore for ModelStore {
             last_modified_ms: req.ctx.request_time_ms,
             src_version_id: src_ver.version_id,
             checksum: resp_csum,
+            sse: sse_resp,
         })
     }
 
@@ -2135,8 +2850,13 @@ impl ObjectStore for ModelStore {
             );
         }
 
+        let complete_sse_req = validate_sse_read_or_part(&req.raw_sse)?;
+        let (complete_key_iv, sse_resp) =
+            match_sse_for_stored_object(&up.sse, &complete_sse_req, &self.sse_s3_master_key)?;
+
         let deduped_parts = dedup_complete_parts(&req.parts)?;
         let mut concat = BytesMut::new();
+        let mut plain_concat = BytesMut::new();
         let mut md5_concat = Vec::with_capacity(deduped_parts.len() * 16);
         let mut boundaries = Vec::with_capacity(deduped_parts.len());
         let mut part_csum_b64s = Vec::with_capacity(deduped_parts.len());
@@ -2189,15 +2909,24 @@ impl ObjectStore for ModelStore {
             }
 
             concat.extend_from_slice(&uploaded.data);
+            if let Some((k, up_iv)) = &complete_key_iv {
+                let mut dec = uploaded.data.to_vec();
+                aes256_ctr_xor(k, &uploaded.sse_iv.unwrap_or(*up_iv), 0, &mut dec);
+                plain_concat.extend_from_slice(&dec);
+            } else {
+                plain_concat.extend_from_slice(&uploaded.data);
+            }
             md5_concat.extend_from_slice(&uploaded.md5);
             boundaries.push(ModelPartBoundary {
                 part_number: uploaded.part_number,
                 size: part_len,
                 checksum: uploaded.checksum.clone(),
+                sse_iv: uploaded.sse_iv,
             });
         }
 
         let full_data = concat.freeze();
+        let plain_data = plain_concat.freeze();
         let total_size = full_data.len() as u64;
         if total_size > self.cfg.max_object_size {
             return Err(S3Error::new(
@@ -2213,7 +2942,7 @@ impl ObjectStore for ModelStore {
                 ));
             }
 
-        // [PR-25] Final object checksum (Model computes FULL_OBJECT directly over concatenated bytes!)
+        // [PR-25] Final object checksum over plaintext bytes
         let final_checksum = match (up.checksum_algorithm, up.checksum_type) {
             (Some(alg), Some(ChecksumType::Composite)) => ChecksumState {
                 algorithm: alg,
@@ -2224,13 +2953,13 @@ impl ObjectStore for ModelStore {
             (Some(alg), Some(ChecksumType::FullObject)) => ChecksumState {
                 algorithm: alg,
                 checksum_type: ChecksumType::FullObject,
-                value_b64: compute_checksum_b64(alg, &full_data),
+                value_b64: compute_checksum_b64(alg, &plain_data),
                 client_requested: true,
             },
             _ => ChecksumState {
                 algorithm: ChecksumAlgorithm::Crc64Nvme,
                 checksum_type: ChecksumType::FullObject,
-                value_b64: compute_checksum_b64(ChecksumAlgorithm::Crc64Nvme, &full_data),
+                value_b64: compute_checksum_b64(ChecksumAlgorithm::Crc64Nvme, &plain_data),
                 client_requested: false,
             },
         };
@@ -2262,6 +2991,14 @@ impl ObjectStore for ModelStore {
             VersioningStatus::Enabled => Some(format!("v{seq:016x}")),
         };
 
+        let exp_hdr = compute_x_amz_expiration(
+            b.lifecycle.as_ref(),
+            &req.key,
+            total_size,
+            &up.tags,
+            req.ctx.request_time_ms,
+        );
+
         let ver = ModelVersion {
             seq,
             version_id: version_id.clone(),
@@ -2276,6 +3013,9 @@ impl ObjectStore for ModelStore {
             tags: up.tags,
             last_modified_ms: req.ctx.request_time_ms,
             parts: Some(boundaries),
+            sse: up.sse,
+            retention: up.retention,
+            legal_hold: up.legal_hold,
         };
 
         let chain = b.objects.entry(req.key.clone()).or_default();
@@ -2288,6 +3028,8 @@ impl ObjectStore for ModelStore {
             etag,
             version_id,
             checksum: final_checksum.client_requested.then_some(final_checksum),
+            sse: sse_resp,
+            expiration_header: exp_hdr,
         };
         b.completed_uploads.insert(
             (req.key, req.upload_id),
@@ -3012,21 +3754,12 @@ impl ModelStore {
             Some(AclPermission::Read),
             None,
         )?;
-
-        let last_mod_http = httpdate::fmt_http_date(
-            std::time::UNIX_EPOCH
-                + std::time::Duration::from_millis(ver.last_modified_ms.max(0) as u64),
-        );
-        evaluate_read_preconditions(
-            &req.preconditions,
-            &ver.etag,
-            ver.last_modified_ms,
-            &last_mod_http,
-        )?;
+        let sse_read = validate_sse_read_or_part(&req.raw_sse)?;
 
         let total_size = ver.data.len() as u64;
         let mut part_specific_csum: Option<ChecksumState> = None;
 
+        // Validate partNumber bounds BEFORE SSE-C key match (`test_multipart_sse_c_get_part`)
         let (start, end, is_partial, parts_count) = if let Some(pn) = req.part_number {
             // [FR-10] partNumber reading
             if pn == 0 || pn > MAX_PARTS_COUNT {
@@ -3082,6 +3815,20 @@ impl ModelStore {
             (0, total_size - 1, false, None)
         };
 
+        let (key_iv, sse_resp) =
+            match_sse_for_stored_object(&ver.sse, &sse_read, &self.sse_s3_master_key)?;
+
+        let last_mod_http = httpdate::fmt_http_date(
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(ver.last_modified_ms.max(0) as u64),
+        );
+        evaluate_read_preconditions(
+            &req.preconditions,
+            &ver.etag,
+            ver.last_modified_ms,
+            &last_mod_http,
+        )?;
+
         let content_len = if let Some(pn) = req.part_number {
             if let Some(parts) = &ver.parts {
                 parts[pn as usize - 1].size
@@ -3112,9 +3859,26 @@ impl ModelStore {
         };
 
         let slice = if need_bytes && content_len > 0 {
-            ver.data.slice(start as usize..(end as usize + 1))
+            decrypt_model_version_slice(ver, key_iv, start, end + 1)
         } else {
             Bytes::new()
+        };
+
+        let is_current = b
+            .objects
+            .get(&req.key)
+            .and_then(|c| c.first())
+            .is_some_and(|h| h.seq == ver.seq);
+        let exp_hdr = if is_current {
+            compute_x_amz_expiration(
+                b.lifecycle.as_ref(),
+                &req.key,
+                total_size,
+                &ver.tags,
+                ver.last_modified_ms,
+            )
+        } else {
+            None
         };
 
         let meta = ObjectMetaSnapshot {
@@ -3133,8 +3897,240 @@ impl ModelStore {
             checksum,
             parts_count,
             tags_count: ver.tags.len(),
+            sse: sse_resp,
+            retention: ver.retention,
+            legal_hold: ver.legal_hold,
+            expiration_header: exp_hdr,
         };
         Ok((meta, slice))
+    }
+
+    /// Execute one lifecycle evaluation sweep across all buckets (`PR-39` ~ `PR-40`).
+    pub fn run_lifecycle_tick(&self, now_ms: i64, lc_debug_interval_secs: Option<u64>) {
+        let day_ms: i64 = lc_debug_interval_secs
+            .map(|s| (s as i64).saturating_mul(1000))
+            .unwrap_or(86_400_000);
+
+        let mut guard = self.state.lock().unwrap();
+        let bucket_names: Vec<String> = guard.buckets.keys().cloned().collect();
+
+        for bname in bucket_names {
+            let Some(lc) = guard
+                .buckets
+                .get(&bname)
+                .and_then(|b| b.lifecycle.clone())
+            else {
+                continue;
+            };
+
+            // 1. Current version Expiration (Days / Date)
+            let expired_current_keys: Vec<String> = {
+                let b = guard.buckets.get(&bname).unwrap();
+                let mut out = Vec::new();
+                for (key, chain) in &b.objects {
+                    let Some(head) = chain.first() else { continue };
+                    if head.is_delete_marker {
+                        continue;
+                    }
+                    let size = head.data.len() as u64;
+                    let is_exp = lc.rules.iter().any(|rule| {
+                        if rule.status != LifecycleRuleStatus::Enabled {
+                            return false;
+                        }
+                        let Some(exp) = &rule.expiration else {
+                            return false;
+                        };
+                        if !rule.matches_object(key, size, &head.tags) {
+                            return false;
+                        }
+                        if let Some(d) = exp.days {
+                            if lc_debug_interval_secs.is_some() {
+                                now_ms.saturating_sub(head.last_modified_ms)
+                                    >= i64::from(d).saturating_mul(day_ms)
+                            } else {
+                                let exp_ms = ((head.last_modified_ms.div_euclid(1000))
+                                    .div_euclid(86_400)
+                                    + i64::from(d)
+                                    + 1)
+                                    * 86_400_000;
+                                now_ms >= exp_ms
+                            }
+                        } else if let Some(date_us) = exp.date_us {
+                            now_ms.saturating_mul(1000) >= date_us
+                        } else {
+                            false
+                        }
+                    });
+                    if is_exp {
+                        out.push(key.clone());
+                    }
+                }
+                out
+            };
+
+            for key in expired_current_keys {
+                guard.next_seq += 1;
+                let seq = guard.next_seq;
+                let b = guard.buckets.get_mut(&bname).unwrap();
+                match b.versioning {
+                    VersioningStatus::Unversioned => {
+                        let locked = b
+                            .objects
+                            .get(&key)
+                            .and_then(|c| c.first())
+                            .is_some_and(|h| {
+                                check_worm_version_delete(
+                                    h.retention,
+                                    h.legal_hold,
+                                    false,
+                                    false,
+                                    now_ms,
+                                )
+                                .is_err()
+                            });
+                        if !locked {
+                            b.objects.remove(&key);
+                        }
+                    }
+                    VersioningStatus::Enabled | VersioningStatus::Suspended => {
+                        let vid = if b.versioning == VersioningStatus::Suspended {
+                            "null".to_string()
+                        } else {
+                            format!("v{seq:016x}")
+                        };
+                        let dm_owner = b.owner.clone();
+                        let dm_acl = AccessControlPolicy::new_private(dm_owner.clone());
+                        let dm = ModelVersion {
+                            seq,
+                            version_id: Some(vid),
+                            is_delete_marker: true,
+                            data: Bytes::new(),
+                            etag: String::new(),
+                            checksum: ChecksumState {
+                                algorithm: ChecksumAlgorithm::Crc64Nvme,
+                                checksum_type: ChecksumType::FullObject,
+                                value_b64: String::new(),
+                                client_requested: false,
+                            },
+                            sys_meta: SystemMeta::default(),
+                            user_meta: Vec::new(),
+                            owner: dm_owner,
+                            acl: dm_acl,
+                            tags: BTreeMap::new(),
+                            last_modified_ms: now_ms,
+                            parts: None,
+                            sse: SseStoredMeta::None,
+                            retention: None,
+                            legal_hold: None,
+                        };
+                        if let Some(chain) = b.objects.get_mut(&key) {
+                            if b.versioning == VersioningStatus::Suspended {
+                                chain.retain(|v| v.version_id.as_deref().unwrap_or("null") != "null");
+                            }
+                            chain.insert(0, dm);
+                        }
+                    }
+                }
+            }
+
+            // 2. NoncurrentVersionExpiration & 3. ExpiredObjectDeleteMarker
+            {
+                let b = guard.buckets.get_mut(&bname).unwrap();
+                let all_keys: Vec<String> = b.objects.keys().cloned().collect();
+                for key in all_keys {
+                    let Some(chain) = b.objects.get_mut(&key) else {
+                        continue;
+                    };
+                    if chain.len() >= 2 {
+                        let mut remove_seqs: Vec<u64> = Vec::new();
+                        let mut newer_nc_seen = 0u32;
+                        for idx in 1..chain.len() {
+                            let noncurrent_since_ms = chain[idx - 1].last_modified_ms;
+                            let ver = &chain[idx];
+                            if ver.is_delete_marker {
+                                continue;
+                            }
+                            let cur_newer = newer_nc_seen;
+                            newer_nc_seen = newer_nc_seen.saturating_add(1);
+                            if check_worm_version_delete(
+                                ver.retention,
+                                ver.legal_hold,
+                                false,
+                                false,
+                                now_ms,
+                            )
+                            .is_err()
+                            {
+                                continue;
+                            }
+                            let size = ver.data.len() as u64;
+                            let should_del = lc.rules.iter().any(|rule| {
+                                if rule.status != LifecycleRuleStatus::Enabled {
+                                    return false;
+                                }
+                                let Some(nc) = &rule.noncurrent_version_expiration else {
+                                    return false;
+                                };
+                                if !rule.matches_object(&key, size, &ver.tags) {
+                                    return false;
+                                }
+                                if let Some(keep) = nc.newer_noncurrent_versions
+                                    && cur_newer < keep
+                                {
+                                    return false;
+                                }
+                                now_ms.saturating_sub(noncurrent_since_ms)
+                                    >= i64::from(nc.noncurrent_days).saturating_mul(day_ms)
+                            });
+                            if should_del {
+                                remove_seqs.push(ver.seq);
+                            }
+                        }
+                        if !remove_seqs.is_empty() {
+                            chain.retain(|v| !remove_seqs.contains(&v.seq));
+                        }
+                    }
+
+                    let remove_sole_dm = if chain.len() == 1 && chain[0].is_delete_marker {
+                        lc.rules.iter().any(|rule| {
+                            rule.status == LifecycleRuleStatus::Enabled
+                                && rule
+                                    .expiration
+                                    .is_some_and(|e| e.expired_object_delete_marker == Some(true))
+                                && rule.matches_key_without_tags_or_size(&key)
+                        })
+                    } else {
+                        false
+                    };
+                    if remove_sole_dm || chain.is_empty() {
+                        b.objects.remove(&key);
+                    }
+                }
+
+                // 4. AbortIncompleteMultipartUpload
+                let expired_uploads: Vec<(String, String)> = b
+                    .uploads
+                    .iter()
+                    .filter_map(|((k, uid), up)| {
+                        let should_abort = lc.rules.iter().any(|rule| {
+                            if rule.status != LifecycleRuleStatus::Enabled {
+                                return false;
+                            }
+                            let Some(ab) = &rule.abort_incomplete_multipart_upload else {
+                                return false;
+                            };
+                            rule.matches_key_without_tags_or_size(k)
+                                && now_ms.saturating_sub(up.initiated_ms)
+                                    >= i64::from(ab.days_after_initiation).saturating_mul(day_ms)
+                        });
+                        should_abort.then(|| (k.clone(), uid.clone()))
+                    })
+                    .collect();
+                for ku in expired_uploads {
+                    b.uploads.remove(&ku);
+                }
+            }
+        }
     }
 }
 

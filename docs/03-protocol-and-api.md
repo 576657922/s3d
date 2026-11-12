@@ -26,7 +26,7 @@ S3 在对象 key 解码与 SigV4 规范路径上与通用 Web 框架不同，严
 ### 1.3 子资源路由优先级（`PR-5`）
 
 同一个 HTTP 方法 + 路径可通过 query 参数区分不同操作，按以下顺序匹配：
-1. **未实现黑名单子资源**（规格书第 5 节末尾 12 项：`website`、`replication`、`notification`、`inventory`、`analytics`、`metrics`、`intelligent-tiering`、`accelerate`、`requestPayment`、`select`、`restore`、`torrent`，以及 P2 未开启时的对应参数）→ 立即返回 `501 NotImplemented`。
+1. **未实现黑名单子资源**（规格书第 5 节末尾 12 项：`website`、`replication`、`notification`、`inventory`、`analytics`、`metrics`、`intelligent-tiering`、`accelerate`、`requestPayment`、`select`、`restore`、`torrent`）→ 立即返回 `501 NotImplemented`。
 2. **精确动作子资源**（互斥，若同时携带多个不兼容动作参数 → `400 InvalidArgument`）：
    - 桶级：`location`、`delete`、`uploads`、`versions`、`versioning`、`tagging`、`cors`、`policy`、`policyStatus`、`publicAccessBlock`、`acl`、`ownershipControls`、`object-lock`、`lifecycle`、`encryption`、`logging`；无动作参数时 `GET` 按 `list-type=2` 分流 `ListObjectsV2` 与 `ListObjectsV1`。
    - 对象级：`uploads`（POST → `CreateMultipartUpload`）、`uploadId`（配合 `partNumber` → `UploadPart`/`UploadPartCopy`；无 `partNumber` 按 GET/POST/DELETE 分流 `ListParts`/`Complete`/`Abort`）、`attributes`、`tagging`、`acl`、`retention`、`legal-hold`。
@@ -227,3 +227,63 @@ $$\text{CRC}(A \Vert B) = T^{8 \cdot \text{len}_B}\!\left(\text{CRC}(A)\right) \
    - 缺字段 → `400 InvalidArgument`；未知 AK → `403 InvalidAccessKeyId`；签名不符 → `403 SignatureDoesNotMatch`。
 3. **Policy JSON 校验**：顶层键区分大小写，必须同时含 `"expiration"`（严格 `YYYY-MM-DDTHH:MM:SS[.sss]Z`，格式错误 → `400 InvalidPolicyDocument`，已过期 → `403 AccessDenied`）与 `"conditions"` 数组。条件支持 `{"field": "val"}`、`["eq", "$field", "val"]`、`["starts-with", "$field", "prefix"]`、`["content-length-range", min, max]`（操作符与字段名不区分大小写，字段值区分大小写）。除豁免字段（`file`、`policy`、签名字段、`x-ignore-*`、`x-amz-checksum-*`）外，表单字段与策略条件须双向覆盖且包含匹配的 `bucket` 条件（不满足 → `403 AccessDenied`；文件超 `max` → `400 EntityTooLarge`；低于 `min` → `400 EntityTooSmall`）。
 4. **成功响应**：携带非空 `success_action_redirect` / `redirect` 时返回 `303 See Other`（`Location` 追加 `bucket`、`key`、`etag` 查询参数）；否则按 `success_action_status` 返回 `200 OK`、`201 Created`（无 `xmlns` 的 `<PostResponse>` XML）或默认 `204 No Content`。
+
+---
+
+## 7. P2 企业级特性精确规范（M4 细化落地）
+
+### 7.1 对象锁（Object Lock）与 WORM 状态机（`?object-lock`、`?retention`、`?legal-hold`）
+
+1. **桶级开启与版本控制联动**：
+   - `CreateBucket` 携带 `x-amz-bucket-object-lock-enabled: true` 时自动同时开启 `Versioning = Enabled` 与 `ObjectLockEnabled = Enabled`。
+   - 已创建桶支持通过 `PutObjectLockConfiguration`（`<ObjectLockEnabled>Enabled</ObjectLockEnabled>`）后置开启对象锁（对齐 AWS S3 自 2023-11 起行为），但前置要求当前桶 `Versioning == Enabled`，否则返回 `409 InvalidBucketState`。
+   - 一旦桶开启对象锁，严禁将版本控制降级为 `Suspended`（`PutBucketVersioning(Suspended)` → `409 InvalidBucketState`），且未开启对象锁的桶调用 `GetObjectLockConfiguration` 返回 `404 ObjectLockConfigurationNotFoundError`，调用 `?retention` / `?legal-hold` 返回 `400 InvalidRequest`。
+2. **默认保留策略与上传头校验**：
+   - `<DefaultRetention>` 仅允许 `<Days>` 或 `<Years>` 二选一且 `> 0`（两者皆有、皆无或 `<= 0` → `400 MalformedXML` / `InvalidArgument`）。
+   - `PutObject` / `CopyObject` / `CreateMultipartUpload` / `PostObject` 携带 `x-amz-object-lock-mode` 或 `x-amz-object-lock-retain-until-date` 时，二者必须成对出现且 `RetainUntilDate` 必须严格大于当前服务端 UTC 时间（违规 → `400 InvalidArgument`）。若请求头同时携带对象锁头，单次 `PutObject`（非 `CopyObject` / `CreateMultipartUpload`）须提供 `Content-MD5` 或 `x-amz-checksum-*` 完整性摘要（缺失 → `400 InvalidRequest`）。
+   - 若写入请求未显式指定保留期且桶配置了 `DefaultRetention`，新创建版本自动继承 `now + Days*86400s`（或 `Years` 日历年偏移）的默认保留期；`CopyObject` 绝不隐式复制源版本的保留期或 Legal Hold。
+3. **版本级保留期修改与 WORM 删除保护**：
+   - 删除标记（Delete Marker）不支持 `?retention` 与 `?legal-hold`（访问返回 `405 MethodNotAllowed`）。
+   - 不带 `versionId` 的 `DeleteObject` / `DeleteObjects` 仅追加新删除标记，不受历史版本锁阻断；**带 `versionId` 的永久删除**在提交点检查目标版本：
+     - `LegalHold == ON` → 无条件拒绝（`403 AccessDenied`，任何绕过头均无效）；
+     - `RetainUntilDate > now` 且模式为 `COMPLIANCE` → 无条件拒绝（`403 AccessDenied`）；
+     - `RetainUntilDate > now` 且模式为 `GOVERNANCE` → 仅当请求携带 `x-amz-bypass-governance-retention: true` 且调用者具备 `s3:BypassGovernanceRetention` 权限时放行，否则返回 `403 AccessDenied`。
+   - `PutObjectRetention` 修改已有保留期时：`COMPLIANCE` 模式下严禁切换为 `GOVERNANCE` 或缩短未过期的 `RetainUntilDate`；`GOVERNANCE` 模式下缩短保留期、清空或切换模式必须携带 `x-amz-bypass-governance-retention: true`（否则 `403 AccessDenied`）。
+
+### 7.2 生命周期（Lifecycle）v1/v2 配置、`x-amz-expiration` 与后台清扫器（`?lifecycle`）
+
+1. **XML 双版本解析与校验**：
+   - 兼容 S3 v1（规则直挂 `<Prefix>`）与 v2（`<Filter>` 内含 `<Prefix>`、`<Tag>`、`<ObjectSizeGreaterThan>`、`<ObjectSizeLessThan>` 或 `<And>` 组合），并在 `GetBucketLifecycleConfiguration` 中按原始 v1/v2 形态无损回放。
+   - 规则 ID 最长 255 字节且同配置内唯一（重复 → `400 InvalidArgument`）；`<Expiration>` 中 `Days`、`Date`（须为 UTC 午夜 `00:00:00Z` 整数天边界）、`ExpiredObjectDeleteMarker` 三者互斥，且 `ExpiredObjectDeleteMarker` 不得与 `<Tag>` 过滤同用；`<AbortIncompleteMultipartUpload><DaysAfterInitiation>` 必须 `> 0`。未配置时 `GET ?lifecycle` 返回 `404 NoSuchLifecycleConfiguration`。
+2. **`x-amz-expiration` 动态响应头计算**：
+   - 对 `PutObject`、`CopyObject`、`CompleteMultipartUpload`、`PostObject`、`GetObject`、`HeadObject` 的最新可见版本（`is_latest && !is_delete_marker`），扫描桶内所有 `Status == Enabled` 且不含对象大小过滤条件的匹配规则（`Prefix` + 当前对象 `TagSet` 全包含），选取最早到期的一条输出：
+     `x-amz-expiration: expiry-date="<RFC2822 GMT>", rule-id="<escaped_id>"`
+   - 若规则为 `Days = D`，按 AWS S3 午夜取整公式将 `creation_ms + D * period` 向上取整至下一个 UTC `00:00:00 GMT`（调试模式 `--lc-debug-interval <secs>` 下每“天”折算为 `<secs>` 秒，以支持 `s3-tests` 秒级过期验收）。
+3. **后台周期清扫器（`sweep_lifecycle`）**：
+   - 后台任务按周期扫描所有配置了 Lifecycle 的桶，在桶/键锁保护下原子生成 WAL 记录推进四类动作：
+     - 当前版本到期（`Expiration`）：非版本化桶永久删除对象；版本化桶（`Enabled`/`Suspended`）若头版本非删除标记则插入新删除标记；
+     - 历史版本到期（`NoncurrentVersionExpiration`）：按版本成为非当前版本的时刻 `noncurrent_since_ms` 判定，保留最新 `NewerNoncurrentVersions` 个非当前版本后永久清理超龄历史版本；
+     - 孤立删除标记清理（`ExpiredObjectDeleteMarker: true`）：当某 key 仅剩唯一版本且该版本为删除标记时将其永久移除；
+     - 未完成分片清理（`AbortIncompleteMultipartUpload`）：自动中止超龄 `Open` 分片会话并释放已上传分片供 GC 回收。
+
+### 7.3 服务端加密（SSE-S3 与 SSE-C）及 AES-256-CTR 存储模型（`?encryption`）
+
+1. **请求头互斥与密钥校验**：
+   - SSE-S3（`x-amz-server-side-encryption: AES256`）与 SSE-C（`x-amz-server-side-encryption-customer-algorithm` / `-key` / `-key-md5`）严禁同请求混用（混用 → `400 InvalidArgument`）；本系统不接入外部 KMS，`aws:kms` / `aws:kms:dsse` 按不支持算法拒绝。
+   - SSE-C 要求三头齐全、算法精确为 `AES256`、`key` Base64 解码后精确 32 字节、且 `Base64(MD5(raw_key)) == key-md5`（不符 → `400 InvalidArgument`）。`CopyObject` / `UploadPartCopy` 源端独立使用 `x-amz-copy-source-server-side-encryption-customer-*` 三元组验证源对象密钥。
+   - 若写入请求未携带任何 SSE 头且目标桶配置了 `?encryption` 默认 `AES256` 规则，自动升级为 SSE-S3（`BucketKeyEnabled` 原样持久化与回显）。
+2. **AES-256-CTR 流式落盘与任意偏移寻址解密**：
+   - **安全铁律**：客户提供的 32 字节原始 `SSECustomerKey` **仅在当次请求内存栈中存活**，严禁写入段文件、WAL、`ckpt-<lsn>` 检查点或任何日志；元数据仅持久化 `key_md5`（用于快速匹配与响应回显）及 `HMAC-SHA256(instance_secret, raw_key)` 验证码（抵御 MD5 碰撞）。SSE-S3 数据密钥由实例密钥结合随机 16 字节 `sse_iv` 经 HMAC-SHA256 派生。
+   - **落盘与校验和分层**：`ETag`（MD5）与 `x-amz-checksum-*` 均在**明文字节流**上计算；写入段文件前经 **AES-256-CTR**（128-bit 大端分组计数器 `block_idx = byte_offset / 16`，组内偏移 `byte_offset % 16`）加密为密文落盘，段块 CRC32C 保护密文物理完整性。
+   - **分片独立 IV 支持非 16B 对齐分片**：分片上传每个 `PartRecord` 独立生成并保存专属 16 字节 `sse_iv`；因此任意非 16 字节倍数的分片（如 5 MiB + 3 B）在 `GetObject` 全量读取、`Range` 跨分片随机切片、`?partNumber=N` 单片读取及 `UploadPartCopy` 源切片重加密时，均可按各自 `(part.sse_iv, local_offset)` 精确 `O(1)` 定位解密。
+   - **读取与 `CompleteMultipartUpload` 门禁**：对 SSE-C 对象执行 `GetObject`、`HeadObject`、`GetObjectAttributes` 或对 SSE-C 分片会话执行 `UploadPart`、`CompleteMultipartUpload` 时，必须提供匹配的 `SSECustomer*` 三元组（缺失或密钥不符 → `400 InvalidRequest` / `AccessDenied`）；`ListObjects*`、`GetObjectTagging`、`DeleteObject` 等纯元数据/目录操作无需提供 SSE-C 密钥。
+3. **Bucket Policy 加密条件键扩展**：
+   - 求值上下文注入 `s3:x-amz-server-side-encryption`（仅显式请求 SSE-S3 或桶默认加密生效时存在；SSE-C 请求不置该键以使 `StringNotEquals` 精确生效）与 `s3:x-amz-server-side-encryption-customer-algorithm`。
+
+### 7.4 桶访问日志配置（`?logging`）与目标桶服务主体校验
+
+- 未配置日志或写入空 `<BucketLoggingStatus/>` 时，`GetBucketLogging` 返回空 `<BucketLoggingStatus xmlns="..."/>`（`200 OK`）。
+- 启用 `<LoggingEnabled>` 时校验：
+  1. `<TargetBucket>` 必须存在于当前实例（不存在 → `400 InvalidTargetBucketForLogging`），且拥有者必须与源桶拥有者属于同一账号（跨账号 → `400 InvalidTargetBucketForLogging`）。
+  2. `<TargetObjectKeyFormat>` 缺省自动归一化为 `<SimplePrefix/>`；支持 `<SimplePrefix/>` 与 `<PartitionedPrefix><PartitionDateSource>DeliveryTime|EventTime</PartitionDateSource></PartitionedPrefix>`；完整持久化并按序回放 `<TargetGrants>`（校验被授权邮箱/ID 存在性，不存在 → `400 InvalidTargetBucketForLogging`）。
+  3. 当目标桶启用桶策略授权而非传统日志组 ACL 时，以服务主体 `Principal = {"Service": "logging.s3.amazonaws.com"}`、`Action = "s3:PutObject"`、`Resource = "arn:aws:s3:::{target_bucket}/{target_prefix}*"` 及条件上下文 `aws:SourceArn = "arn:aws:s3:::{source_bucket}"`、`aws:SourceAccount = "{source_owner_id}"` 对目标桶策略求值；若未获 `Allow`（或命中 `Deny`）且无日志写 ACL，则返回 `403 CrossLocationLoggingProhibited` / `InvalidTargetBucketForLogging`。

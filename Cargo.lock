@@ -1400,9 +1400,14 @@ dependencies = [
 name = "s3d-types"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
+ "hmac 0.12.1",
+ "httpdate",
+ "md-5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

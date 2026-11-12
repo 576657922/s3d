@@ -806,7 +806,7 @@ pub async fn run_http_wgl_campaign(
     let global_op_counter = Arc::new(AtomicU64::new(1));
     let violation_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let mut handles = Vec::with_capacity(NUM_CLIENTS);
+    let mut handles = tokio::task::JoinSet::new();
     for cid in 0..NUM_CLIENTS {
         let addr = s3_addr.clone();
         let rev = Arc::clone(&round_events);
@@ -817,9 +817,11 @@ pub async fn run_http_wgl_campaign(
         let op_cnt = Arc::clone(&global_op_counter);
         let verr = Arc::clone(&violation_err);
 
-        handles.push(tokio::spawn(async move {
+        handles.spawn(async move {
             let mut cli = PersistentHttpClient::new(addr.clone());
-            let mut rng = StdRng::seed_from_u64(seed ^ ((cid as u64 + 1) * 0x9E37_79B9_7F4A_7C15));
+            let mut rng = StdRng::seed_from_u64(
+                seed ^ (cid as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
             let mut client_seq = 0u64;
 
             for _round in 0..rounds {
@@ -1018,11 +1020,21 @@ pub async fn run_http_wgl_campaign(
             }
 
             Ok::<(), String>(())
-        }));
+        });
     }
 
-    for h in handles {
-        h.await.map_err(|e| format!("client task panicked: {e}"))??;
+    while let Some(res) = handles.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                handles.abort_all();
+                return Err(e);
+            }
+            Err(e) => {
+                handles.abort_all();
+                return Err(format!("client task panicked: {e}"));
+            }
+        }
     }
 
     bg_stop.store(true, Ordering::Relaxed);

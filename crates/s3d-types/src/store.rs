@@ -11,6 +11,11 @@ use crate::acl::{AccessControlPolicy, AclSpec};
 use crate::cond::Preconditions;
 use crate::cors::CorsConfiguration;
 use crate::error::StoreResult;
+use crate::p2::{
+    BucketEncryptionConfig, BucketLoggingStatus, LegalHoldStatus, LifecycleConfiguration,
+    ObjectLockConfiguration, ObjectRetention, RawCopySourceSseHeaders, RawSseHeaders,
+    RawUploadObjectLockHeaders, SseResponseHeaders,
+};
 use crate::policy::{PublicAccessBlockConfig, RequestPolicyContext};
 use crate::range::ByteRangeSpec;
 use crate::tagging::TaggingDirective;
@@ -323,6 +328,7 @@ pub struct CreateBucketReq {
     pub location_constraint: Option<String>,
     pub object_ownership: Option<ObjectOwnership>,
     pub acl: Option<AclSpec>,
+    pub object_lock_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +358,8 @@ pub struct PutObjectReq {
     pub tags: Option<BTreeMap<String, String>>,
     pub preconditions: Preconditions,
     pub max_bytes_limit: u64,
+    pub raw_sse: RawSseHeaders,
+    pub raw_lock: RawUploadObjectLockHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +367,8 @@ pub struct PutObjectResp {
     pub etag: String,
     pub version_id: Option<String>,
     pub checksum: ChecksumState,
+    pub sse: SseResponseHeaders,
+    pub expiration_header: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +381,7 @@ pub struct GetObjectReq {
     pub part_number: Option<u32>,
     pub preconditions: Preconditions,
     pub checksum_mode_enabled: bool,
+    pub raw_sse: RawSseHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -390,6 +401,10 @@ pub struct ObjectMetaSnapshot {
     pub checksum: Option<ChecksumState>,
     pub parts_count: Option<u32>,
     pub tags_count: usize,
+    pub sse: SseResponseHeaders,
+    pub retention: Option<ObjectRetention>,
+    pub legal_hold: Option<LegalHoldStatus>,
+    pub expiration_header: Option<String>,
 }
 
 pub struct GetObjectResp<R> {
@@ -404,6 +419,7 @@ pub struct DeleteObjectReq {
     pub key: String,
     pub version_id: Option<String>,
     pub if_match: Option<Vec<String>>,
+    pub bypass_governance: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +441,7 @@ pub struct DeleteObjectsReq {
     pub bucket: String,
     pub quiet: bool,
     pub items: Vec<DeleteObjectsItem>,
+    pub bypass_governance: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +482,9 @@ pub struct CopyObjectReq {
     pub tags: Option<BTreeMap<String, String>>,
     pub src_preconditions: Preconditions,
     pub dst_preconditions: Preconditions,
+    pub raw_sse: RawSseHeaders,
+    pub raw_copy_src_sse: RawCopySourceSseHeaders,
+    pub raw_lock: RawUploadObjectLockHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +494,8 @@ pub struct CopyObjectResp {
     pub src_version_id: Option<String>,
     pub dst_version_id: Option<String>,
     pub checksum: Option<ChecksumState>,
+    pub sse: SseResponseHeaders,
+    pub expiration_header: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +624,7 @@ pub struct GetObjectAttributesReq {
     pub attrs: ObjectAttributesMask,
     pub max_parts: usize,
     pub part_number_marker: u32,
+    pub raw_sse: RawSseHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +653,7 @@ pub struct GetObjectAttributesResp {
     pub object_parts: Option<ObjectAttributesPartsResp>,
     pub storage_class: Option<String>,
     pub object_size: Option<u64>,
+    pub sse: SseResponseHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +667,8 @@ pub struct CreateMultipartUploadReq {
     pub tags: Option<BTreeMap<String, String>>,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: Option<ChecksumType>,
+    pub raw_sse: RawSseHeaders,
+    pub raw_lock: RawUploadObjectLockHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +678,7 @@ pub struct CreateMultipartUploadResp {
     pub upload_id: String,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: Option<ChecksumType>,
+    pub sse: SseResponseHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -662,12 +689,14 @@ pub struct UploadPartReq {
     pub upload_id: String,
     pub part_number: u32,
     pub max_bytes_limit: u64,
+    pub raw_sse: RawSseHeaders,
 }
 
 #[derive(Debug, Clone)]
 pub struct UploadPartResp {
     pub etag: String,
     pub checksum: Option<ChecksumState>,
+    pub sse: SseResponseHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -682,6 +711,8 @@ pub struct UploadPartCopyReq {
     pub dst_key: String,
     pub upload_id: String,
     pub part_number: u32,
+    pub raw_sse: RawSseHeaders,
+    pub raw_copy_src_sse: RawCopySourceSseHeaders,
 }
 
 #[derive(Debug, Clone)]
@@ -690,6 +721,7 @@ pub struct UploadPartCopyResp {
     pub last_modified_ms: i64,
     pub src_version_id: Option<String>,
     pub checksum: Option<ChecksumState>,
+    pub sse: SseResponseHeaders,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,6 +772,7 @@ pub struct CompleteMultipartUploadReq {
     pub expected_checksum: Option<(ChecksumAlgorithm, String)>,
     pub expected_object_size: Option<u64>,
     pub preconditions: Preconditions,
+    pub raw_sse: RawSseHeaders,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,6 +782,10 @@ pub struct CompleteMultipartUploadResp {
     pub etag: String,
     pub version_id: Option<String>,
     pub checksum: Option<ChecksumState>,
+    #[serde(default)]
+    pub sse: SseResponseHeaders,
+    #[serde(default)]
+    pub expiration_header: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +960,63 @@ pub struct PutPublicAccessBlockReq {
     pub config: PublicAccessBlockConfig,
 }
 
+// ---- M4 (P2) Object Lock, Lifecycle, Encryption & Logging DTOs ----
+
+#[derive(Debug, Clone)]
+pub struct PutObjectLockConfigurationReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub config: ObjectLockConfiguration,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectLockRef {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutObjectRetentionReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+    pub retention: ObjectRetention,
+    pub bypass_governance: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutObjectLegalHoldReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+    pub status: LegalHoldStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutBucketLifecycleReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub config: LifecycleConfiguration,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutBucketEncryptionReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub config: BucketEncryptionConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutBucketLoggingReq {
+    pub ctx: CallerContext,
+    pub bucket: String,
+    pub status: BucketLoggingStatus,
+}
+
 // ---- Core ObjectStore Trait ----
 
 pub trait ObjectStore: Send + Sync + 'static {
@@ -1064,6 +1158,73 @@ pub trait ObjectStore: Send + Sync + 'static {
     fn delete_public_access_block(
         &self,
         req: BucketRef,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_object_lock_configuration(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<ObjectLockConfiguration>> + Send;
+
+    fn put_object_lock_configuration(
+        &self,
+        req: PutObjectLockConfigurationReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_object_retention(
+        &self,
+        req: ObjectLockRef,
+    ) -> impl Future<Output = StoreResult<ObjectRetention>> + Send;
+
+    fn put_object_retention(
+        &self,
+        req: PutObjectRetentionReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_object_legal_hold(
+        &self,
+        req: ObjectLockRef,
+    ) -> impl Future<Output = StoreResult<LegalHoldStatus>> + Send;
+
+    fn put_object_legal_hold(
+        &self,
+        req: PutObjectLegalHoldReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_bucket_lifecycle_configuration(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<LifecycleConfiguration>> + Send;
+
+    fn put_bucket_lifecycle_configuration(
+        &self,
+        req: PutBucketLifecycleReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn delete_bucket_lifecycle(&self, req: BucketRef) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_bucket_encryption(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<BucketEncryptionConfig>> + Send;
+
+    fn put_bucket_encryption(
+        &self,
+        req: PutBucketEncryptionReq,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn delete_bucket_encryption(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    fn get_bucket_logging(
+        &self,
+        req: BucketRef,
+    ) -> impl Future<Output = StoreResult<BucketLoggingStatus>> + Send;
+
+    fn put_bucket_logging(
+        &self,
+        req: PutBucketLoggingReq,
     ) -> impl Future<Output = StoreResult<()>> + Send;
 
     fn put_object<S: VerifiedBodyStream>(

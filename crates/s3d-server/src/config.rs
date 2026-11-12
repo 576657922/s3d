@@ -28,6 +28,7 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub log_format: String,
     pub reserved_disk_bytes: u64,
+    pub lc_debug_interval_secs: Option<u64>,
     #[serde(skip)]
     pub header_read_timeout: Duration,
     #[serde(skip)]
@@ -57,6 +58,7 @@ impl Default for ServerConfig {
             max_connections: 1024,
             log_format: "json".to_string(),
             reserved_disk_bytes: 2 * 1024 * 1024 * 1024,
+            lc_debug_interval_secs: None,
             header_read_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
         }

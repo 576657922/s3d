@@ -55,6 +55,9 @@ struct ServeArgs {
     max_connections: Option<usize>,
     #[arg(long)]
     log_format: Option<String>,
+    /// Override 1 lifecycle "day" with N seconds (for deterministic s3-tests lifecycle suites)
+    #[arg(long)]
+    lc_debug_interval: Option<u64>,
 }
 
 fn init_tracing(log_format: &str) {
@@ -131,6 +134,9 @@ async fn main() -> ExitCode {
             }
             if let Some(v) = args.log_format {
                 cfg.log_format = v;
+            }
+            if let Some(v) = args.lc_debug_interval {
+                cfg.lc_debug_interval_secs = Some(v);
             }
 
             if let Err(e) = cfg.validate() {

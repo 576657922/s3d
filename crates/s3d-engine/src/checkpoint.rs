@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use s3d_disk::{DiskError, DiskFile};
 use s3d_types::{
-    AccessControlPolicy, AclGrant, AclPermission, BucketPolicyDoc, ChecksumAlgorithm,
-    ChecksumState, ChecksumType, CompleteMultipartUploadResp, CorsConfiguration, ObjectOwnership,
-    OwnerInfo, PublicAccessBlockConfig, SystemMeta, VersioningStatus,
+    AccessControlPolicy, AclGrant, AclPermission, BucketEncryptionConfig, BucketLoggingStatus,
+    BucketPolicyDoc, ChecksumAlgorithm, ChecksumState, ChecksumType, CompleteMultipartUploadResp,
+    CorsConfiguration, LegalHoldStatus, LifecycleConfiguration, ObjectLockConfiguration,
+    ObjectOwnership, ObjectRetention, OwnerInfo, PublicAccessBlockConfig, SseStoredMeta,
+    SystemMeta, VersioningStatus,
 };
 
 use crate::catalog::{
@@ -140,6 +142,11 @@ pub fn write_checkpoint_to_file<F: DiskFile>(
             }
         }
         encode_opt_json(&mut writer, b.public_access_block.as_ref())?;
+        writer.put_u8(u8::from(b.object_lock_enabled))?;
+        encode_opt_json(&mut writer, b.object_lock_config.as_ref())?;
+        encode_opt_json(&mut writer, b.lifecycle.as_ref())?;
+        encode_opt_json(&mut writer, b.encryption.as_ref())?;
+        encode_opt_json(&mut writer, b.logging.as_ref())?;
 
         // Object chains in ascending UTF-8 key order
         writer.put_u64(b.objects.len() as u64)?;
@@ -217,8 +224,12 @@ pub fn write_checkpoint_to_file<F: DiskFile>(
                                 writer.put_str(val)?;
                             }
                         }
+                        encode_opt_iv(&mut writer, p.sse_iv)?;
                     }
                 }
+                encode_sse_meta(&mut writer, &v.sse)?;
+                encode_opt_json(&mut writer, v.retention.as_ref())?;
+                encode_opt_legal_hold(&mut writer, v.legal_hold)?;
             }
         }
 
@@ -252,6 +263,9 @@ pub fn write_checkpoint_to_file<F: DiskFile>(
                     writer.put_u8(encode_csum_type(ct))?;
                 }
             }
+            encode_sse_meta(&mut writer, &up.sse)?;
+            encode_opt_json(&mut writer, up.retention.as_ref())?;
+            encode_opt_legal_hold(&mut writer, up.legal_hold)?;
             writer.put_u32(up.parts.len() as u32)?;
             for p in up.parts.values() {
                 writer.put_u64(p.part_seq)?;
@@ -276,6 +290,7 @@ pub fn write_checkpoint_to_file<F: DiskFile>(
                     writer.put_u32(ext.len)?;
                     writer.put_u32(ext.crc32c)?;
                 }
+                encode_opt_iv(&mut writer, p.sse_iv)?;
             }
         }
 
@@ -468,6 +483,16 @@ fn decode_checkpoint_reader<R: ReadAt>(
         };
         let public_access_block: Option<PublicAccessBlockConfig> =
             decode_opt_json(&mut stream, 8192)?;
+        let object_lock_enabled = match stream.get_u8()? {
+            0 => false,
+            1 => true,
+            other => return Err(format!("invalid object_lock_enabled byte {other}")),
+        };
+        let object_lock_config: Option<ObjectLockConfiguration> =
+            decode_opt_json(&mut stream, 16 * 1024)?;
+        let lifecycle: Option<LifecycleConfiguration> = decode_opt_json(&mut stream, 512 * 1024)?;
+        let encryption: Option<BucketEncryptionConfig> = decode_opt_json(&mut stream, 16 * 1024)?;
+        let logging: Option<BucketLoggingStatus> = decode_opt_json(&mut stream, 512 * 1024)?;
 
         let key_count = stream.get_u64()?;
         if key_count > 20_000_000 {
@@ -556,16 +581,21 @@ fn decode_checkpoint_reader<R: ReadAt>(
                             }
                             other => return Err(format!("invalid part csum tag {other}")),
                         };
+                        let psse_iv = decode_opt_iv(&mut stream)?;
                         pv.push(PartBoundaryInfo {
                             part_number: pn,
                             size: psize,
                             checksum: pcsum,
+                            sse_iv: psse_iv,
                         });
                     }
                     Some(pv.into())
                 } else {
                     None
                 };
+                let sse = decode_sse_meta(&mut stream)?;
+                let retention: Option<ObjectRetention> = decode_opt_json(&mut stream, 4096)?;
+                let legal_hold = decode_opt_legal_hold(&mut stream)?;
 
                 chain.push(ObjectVersionEntry {
                     seq,
@@ -587,6 +617,9 @@ fn decode_checkpoint_reader<R: ReadAt>(
                     last_modified_ms,
                     extents: extents.into(),
                     parts,
+                    sse,
+                    retention,
+                    legal_hold,
                 });
             }
             objects.insert(key, chain);
@@ -629,6 +662,9 @@ fn decode_checkpoint_reader<R: ReadAt>(
                 1 => Some(decode_csum_type(stream.get_u8()?)?),
                 other => return Err(format!("invalid upload csum type flag {other}")),
             };
+            let up_sse = decode_sse_meta(&mut stream)?;
+            let up_retention: Option<ObjectRetention> = decode_opt_json(&mut stream, 4096)?;
+            let up_legal_hold = decode_opt_legal_hold(&mut stream)?;
             let pcnt = stream.get_u32()? as usize;
             if pcnt > 10_000 {
                 return Err("too many upload parts".into());
@@ -665,6 +701,7 @@ fn decode_checkpoint_reader<R: ReadAt>(
                         crc32c: stream.get_u32()?,
                     });
                 }
+                let sse_iv = decode_opt_iv(&mut stream)?;
                 parts.insert(
                     part_number,
                     UploadPartEntry {
@@ -677,6 +714,7 @@ fn decode_checkpoint_reader<R: ReadAt>(
                         crc64_nvme,
                         checksum,
                         extents: extents.into(),
+                        sse_iv,
                     },
                 );
             }
@@ -694,6 +732,9 @@ fn decode_checkpoint_reader<R: ReadAt>(
                     user_meta,
                     checksum_algorithm,
                     checksum_type,
+                    sse: up_sse,
+                    retention: up_retention,
+                    legal_hold: up_legal_hold,
                     parts,
                 },
             );
@@ -727,6 +768,11 @@ fn decode_checkpoint_reader<R: ReadAt>(
                 cors,
                 policy,
                 public_access_block,
+                object_lock_enabled,
+                object_lock_config,
+                lifecycle,
+                encryption,
+                logging,
                 objects,
                 uploads,
                 completed_uploads,
@@ -1239,6 +1285,90 @@ fn decode_opt_json<R: ReadAt, T: serde::de::DeserializeOwned>(
     }
 }
 
+fn encode_opt_iv<F: DiskFile>(
+    w: &mut ChunkedCkptWriter<'_, F>,
+    iv: Option<[u8; 16]>,
+) -> Result<(), DiskError> {
+    match iv {
+        None => w.put_u8(0),
+        Some(bytes) => {
+            w.put_u8(1)?;
+            w.put_bytes(&bytes)
+        }
+    }
+}
+
+fn decode_opt_iv<R: ReadAt>(r: &mut ChunkedCkptReader<'_, R>) -> Result<Option<[u8; 16]>, String> {
+    match r.get_u8()? {
+        0 => Ok(None),
+        1 => {
+            let mut iv = [0u8; 16];
+            r.get_exact(&mut iv)?;
+            Ok(Some(iv))
+        }
+        other => Err(format!("invalid opt_iv tag {other}")),
+    }
+}
+
+fn encode_sse_meta<F: DiskFile>(
+    w: &mut ChunkedCkptWriter<'_, F>,
+    sse: &SseStoredMeta,
+) -> Result<(), DiskError> {
+    match sse {
+        SseStoredMeta::None => w.put_u8(0),
+        SseStoredMeta::SseS3 { iv } => {
+            w.put_u8(1)?;
+            w.put_bytes(iv)
+        }
+        SseStoredMeta::SseC { key_md5, iv } => {
+            w.put_u8(2)?;
+            w.put_bytes(key_md5)?;
+            w.put_bytes(iv)
+        }
+    }
+}
+
+fn decode_sse_meta<R: ReadAt>(r: &mut ChunkedCkptReader<'_, R>) -> Result<SseStoredMeta, String> {
+    match r.get_u8()? {
+        0 => Ok(SseStoredMeta::None),
+        1 => {
+            let mut iv = [0u8; 16];
+            r.get_exact(&mut iv)?;
+            Ok(SseStoredMeta::SseS3 { iv })
+        }
+        2 => {
+            let mut key_md5 = [0u8; 16];
+            let mut iv = [0u8; 16];
+            r.get_exact(&mut key_md5)?;
+            r.get_exact(&mut iv)?;
+            Ok(SseStoredMeta::SseC { key_md5, iv })
+        }
+        other => Err(format!("invalid sse_meta tag {other}")),
+    }
+}
+
+fn encode_opt_legal_hold<F: DiskFile>(
+    w: &mut ChunkedCkptWriter<'_, F>,
+    lh: Option<LegalHoldStatus>,
+) -> Result<(), DiskError> {
+    match lh {
+        None => w.put_u8(0),
+        Some(LegalHoldStatus::On) => w.put_u8(1),
+        Some(LegalHoldStatus::Off) => w.put_u8(2),
+    }
+}
+
+fn decode_opt_legal_hold<R: ReadAt>(
+    r: &mut ChunkedCkptReader<'_, R>,
+) -> Result<Option<LegalHoldStatus>, String> {
+    match r.get_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(LegalHoldStatus::On)),
+        2 => Ok(Some(LegalHoldStatus::Off)),
+        other => Err(format!("invalid opt_legal_hold tag {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,6 +1424,9 @@ mod tests {
                 }]
                 .into(),
                 parts: None,
+                sse: SseStoredMeta::SseS3 { iv: [0x42; 16] },
+                retention: None,
+                legal_hold: Some(LegalHoldStatus::On),
             }],
         );
 
@@ -1315,6 +1448,14 @@ mod tests {
                 cors: None,
                 policy: None,
                 public_access_block: None,
+                object_lock_enabled: true,
+                object_lock_config: Some(ObjectLockConfiguration::default()),
+                lifecycle: None,
+                encryption: Some(BucketEncryptionConfig {
+                    sse_algorithm: "AES256".into(),
+                    bucket_key_enabled: None,
+                }),
+                logging: None,
                 objects,
                 uploads: BTreeMap::new(),
                 completed_uploads: BTreeMap::new(),

@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use s3d_types::{
-    AccessControlPolicy, ChecksumAlgorithm, ChecksumState, ChecksumType,
-    CompleteMultipartUploadResp, CorsConfiguration, ObjectOwnership, OwnerInfo,
-    PublicAccessBlockConfig, SystemMeta, VersioningStatus,
+    AccessControlPolicy, BucketEncryptionConfig, BucketLoggingStatus, ChecksumAlgorithm,
+    ChecksumState, ChecksumType, CompleteMultipartUploadResp, CorsConfiguration, LegalHoldStatus,
+    LifecycleConfiguration, ObjectLockConfiguration, ObjectOwnership, ObjectRetention, OwnerInfo,
+    PublicAccessBlockConfig, SseStoredMeta, SystemMeta, VersioningStatus,
 };
 
 pub const FORMAT_MAGIC: &[u8; 8] = b"S3DFMT01";
@@ -175,6 +176,8 @@ pub struct PartBoundaryInfo {
     pub part_number: u32,
     pub size: u64,
     pub checksum: Option<(ChecksumAlgorithm, String)>,
+    #[serde(default)]
+    pub sse_iv: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +214,8 @@ pub enum WalOp {
         created_ms: i64,
         #[serde(default)]
         explicit_ownership: Option<ObjectOwnership>,
+        #[serde(default)]
+        object_lock_enabled: bool,
     },
     UpdateBucketVersioning {
         name: String,
@@ -240,6 +245,22 @@ pub enum WalOp {
         name: String,
         config: Option<PublicAccessBlockConfig>,
     },
+    UpdateBucketObjectLock {
+        name: String,
+        config: ObjectLockConfiguration,
+    },
+    UpdateBucketLifecycle {
+        name: String,
+        config: Option<LifecycleConfiguration>,
+    },
+    UpdateBucketEncryption {
+        name: String,
+        config: Option<BucketEncryptionConfig>,
+    },
+    UpdateBucketLogging {
+        name: String,
+        status: Option<BucketLoggingStatus>,
+    },
     DeleteBucket {
         name: String,
     },
@@ -262,6 +283,12 @@ pub enum WalOp {
         extents: Vec<Extent>,
         #[serde(default)]
         parts: Option<Vec<PartBoundaryInfo>>,
+        #[serde(default)]
+        sse: SseStoredMeta,
+        #[serde(default)]
+        retention: Option<ObjectRetention>,
+        #[serde(default)]
+        legal_hold: Option<LegalHoldStatus>,
     },
     UpdateObjectAcl {
         bucket: String,
@@ -275,10 +302,27 @@ pub enum WalOp {
         seq: u64,
         tags: BTreeMap<String, String>,
     },
+    UpdateObjectRetention {
+        bucket: String,
+        key: String,
+        seq: u64,
+        retention: ObjectRetention,
+    },
+    UpdateObjectLegalHold {
+        bucket: String,
+        key: String,
+        seq: u64,
+        status: LegalHoldStatus,
+    },
     DeleteVersion {
         bucket: String,
         key: String,
         version_id: Option<String>,
+    },
+    DeleteVersionBySeq {
+        bucket: String,
+        key: String,
+        seq: u64,
     },
     CreateMultipartUpload {
         bucket: String,
@@ -294,6 +338,12 @@ pub enum WalOp {
         user_meta: Vec<(String, String)>,
         checksum_algorithm: Option<ChecksumAlgorithm>,
         checksum_type: Option<ChecksumType>,
+        #[serde(default)]
+        sse: SseStoredMeta,
+        #[serde(default)]
+        retention: Option<ObjectRetention>,
+        #[serde(default)]
+        legal_hold: Option<LegalHoldStatus>,
     },
     PutUploadPart {
         bucket: String,
@@ -308,6 +358,8 @@ pub enum WalOp {
         crc64_nvme: u64,
         checksum: Option<(ChecksumAlgorithm, String)>,
         extents: Vec<Extent>,
+        #[serde(default)]
+        sse_iv: Option<[u8; 16]>,
     },
     CompleteMultipartUpload {
         bucket: String,
@@ -327,6 +379,12 @@ pub enum WalOp {
         completed_ms: i64,
         extents: Vec<Extent>,
         parts: Vec<PartBoundaryInfo>,
+        #[serde(default)]
+        sse: SseStoredMeta,
+        #[serde(default)]
+        retention: Option<ObjectRetention>,
+        #[serde(default)]
+        legal_hold: Option<LegalHoldStatus>,
         resp: CompleteMultipartUploadResp,
     },
     AbortMultipartUpload {
@@ -359,10 +417,17 @@ impl WalOp {
             Self::UpdateBucketCors { .. } => 0x16,
             Self::UpdateBucketPolicy { .. } => 0x17,
             Self::UpdatePublicAccessBlock { .. } => 0x18,
+            Self::UpdateBucketObjectLock { .. } => 0x19,
+            Self::UpdateBucketLifecycle { .. } => 0x1A,
+            Self::UpdateBucketEncryption { .. } => 0x1B,
+            Self::UpdateBucketLogging { .. } => 0x1C,
             Self::PutVersion { .. } => 0x20,
             Self::DeleteVersion { .. } => 0x21,
             Self::UpdateObjectAcl { .. } => 0x22,
             Self::UpdateObjectTagging { .. } => 0x23,
+            Self::UpdateObjectRetention { .. } => 0x24,
+            Self::UpdateObjectLegalHold { .. } => 0x25,
+            Self::DeleteVersionBySeq { .. } => 0x26,
             Self::CreateMultipartUpload { .. } => 0x30,
             Self::PutUploadPart { .. } => 0x31,
             Self::CompleteMultipartUpload { .. } => 0x32,

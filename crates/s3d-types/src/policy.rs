@@ -44,6 +44,8 @@ pub struct PolicyEvalExtra<'a> {
     pub delimiter: Option<&'a str>,
     pub existing_object_tags: Option<&'a BTreeMap<String, String>>,
     pub request_object_tags: Option<&'a BTreeMap<String, String>>,
+    pub source_arn: Option<&'a str>,
+    pub source_account: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +72,14 @@ pub enum S3Action {
     PutBucketTagging,
     GetBucketCORS,
     PutBucketCORS,
+    GetBucketObjectLockConfiguration,
+    PutBucketObjectLockConfiguration,
+    GetLifecycleConfiguration,
+    PutLifecycleConfiguration,
+    GetEncryptionConfiguration,
+    PutEncryptionConfiguration,
+    GetBucketLogging,
+    PutBucketLogging,
     // Object actions
     GetObject,
     GetObjectVersion,
@@ -90,6 +100,11 @@ pub enum S3Action {
     PutObjectVersionTagging,
     DeleteObjectTagging,
     DeleteObjectVersionTagging,
+    GetObjectRetention,
+    PutObjectRetention,
+    GetObjectLegalHold,
+    PutObjectLegalHold,
+    BypassGovernanceRetention,
 }
 
 impl S3Action {
@@ -116,6 +131,14 @@ impl S3Action {
             Self::PutBucketTagging => "s3:PutBucketTagging",
             Self::GetBucketCORS => "s3:GetBucketCORS",
             Self::PutBucketCORS => "s3:PutBucketCORS",
+            Self::GetBucketObjectLockConfiguration => "s3:GetBucketObjectLockConfiguration",
+            Self::PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
+            Self::GetLifecycleConfiguration => "s3:GetLifecycleConfiguration",
+            Self::PutLifecycleConfiguration => "s3:PutLifecycleConfiguration",
+            Self::GetEncryptionConfiguration => "s3:GetEncryptionConfiguration",
+            Self::PutEncryptionConfiguration => "s3:PutEncryptionConfiguration",
+            Self::GetBucketLogging => "s3:GetBucketLogging",
+            Self::PutBucketLogging => "s3:PutBucketLogging",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
             Self::PutObject => "s3:PutObject",
@@ -135,6 +158,11 @@ impl S3Action {
             Self::PutObjectVersionTagging => "s3:PutObjectVersionTagging",
             Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
             Self::DeleteObjectVersionTagging => "s3:DeleteObjectVersionTagging",
+            Self::GetObjectRetention => "s3:GetObjectRetention",
+            Self::PutObjectRetention => "s3:PutObjectRetention",
+            Self::GetObjectLegalHold => "s3:GetObjectLegalHold",
+            Self::PutObjectLegalHold => "s3:PutObjectLegalHold",
+            Self::BypassGovernanceRetention => "s3:BypassGovernanceRetention",
         }
     }
 }
@@ -148,6 +176,7 @@ pub enum PolicyEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PrincipalEntry {
     Any,
+    AwsWildcard,
     Aws(String),
     CanonicalUser(String),
     Service(String),
@@ -156,7 +185,7 @@ enum PrincipalEntry {
 impl PrincipalEntry {
     fn matches(&self, caller: Option<&OwnerInfo>, is_authenticated: bool) -> bool {
         match self {
-            Self::Any => true,
+            Self::Any | Self::AwsWildcard => true,
             Self::CanonicalUser(uid) => {
                 is_authenticated && caller.is_some_and(|c| c.user_id == *uid)
             }
@@ -185,6 +214,14 @@ impl PrincipalEntry {
                 false
             }
             Self::Service(_) => false,
+        }
+    }
+
+    fn matches_service(&self, service_name: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Service(s) => s.eq_ignore_ascii_case(service_name),
+            Self::AwsWildcard | Self::Aws(_) | Self::CanonicalUser(_) => false,
         }
     }
 }
@@ -335,6 +372,55 @@ impl BucketPolicyDoc {
             PolicyDecision::ImplicitDeny
         }
     }
+
+    /// Evaluate whether an AWS Service principal (e.g. `logging.s3.amazonaws.com`) is granted `actions`
+    /// on `resource_arn` under `extra` (`aws:SourceArn`, `aws:SourceAccount`).
+    pub fn allows_service(
+        &self,
+        service_name: &str,
+        actions: &[S3Action],
+        resource_arn: &str,
+        extra: &PolicyEvalExtra<'_>,
+    ) -> bool {
+        let empty_ctx = CallerContext::default();
+        let mut allowed = false;
+        for stmt in &self.statements {
+            let prin_hit = stmt
+                .principals
+                .iter()
+                .any(|p| p.matches_service(service_name));
+            if stmt.is_not_principal == prin_hit {
+                continue;
+            }
+            let act_hit = actions.iter().any(|req_act| {
+                stmt.actions
+                    .iter()
+                    .any(|pat| match_iam_wildcard(pat, req_act.as_str(), true))
+            });
+            if stmt.is_not_action == act_hit {
+                continue;
+            }
+            let res_hit = stmt
+                .resources
+                .iter()
+                .any(|pat| match_iam_wildcard(pat, resource_arn, false));
+            if stmt.is_not_resource == res_hit {
+                continue;
+            }
+            if !stmt
+                .conditions
+                .iter()
+                .all(|clause| eval_condition_clause(clause, &empty_ctx, extra))
+            {
+                continue;
+            }
+            match stmt.effect {
+                PolicyEffect::Deny => return false,
+                PolicyEffect::Allow => allowed = true,
+            }
+        }
+        allowed
+    }
 }
 
 fn malformed_policy(msg: impl Into<String>) -> S3Error {
@@ -399,9 +485,16 @@ fn parse_statement(val: &Value, bucket_name: &str) -> StoreResult<PolicyStatemen
     let (is_not_resource, resources) = match (obj.get("Resource"), obj.get("NotResource")) {
         (Some(r), None) => (false, parse_string_or_array(r, "Resource")?),
         (None, Some(nr)) => (true, parse_string_or_array(nr, "NotResource")?),
-        _ => {
+        (None, None) => (
+            false,
+            vec![
+                format!("arn:aws:s3:::{bucket_name}"),
+                format!("arn:aws:s3:::{bucket_name}/*"),
+            ],
+        ),
+        (Some(_), Some(_)) => {
             return Err(malformed_policy(
-                "Statement must contain Resource or NotResource",
+                "Statement cannot contain both Resource and NotResource",
             ))
         }
     };
@@ -470,7 +563,7 @@ fn parse_principals(val: &Value) -> StoreResult<Vec<PrincipalEntry>> {
                     "AWS" => {
                         for item in vals {
                             if item == "*" {
-                                out.push(PrincipalEntry::Any);
+                                out.push(PrincipalEntry::AwsWildcard);
                             } else {
                                 out.push(PrincipalEntry::Aws(item));
                             }
@@ -622,7 +715,11 @@ fn is_public_statement(stmt: &PolicyStatement) -> bool {
     if stmt.effect != PolicyEffect::Allow || stmt.is_not_principal {
         return false;
     }
-    if !stmt.principals.iter().any(|p| matches!(p, PrincipalEntry::Any)) {
+    if !stmt
+        .principals
+        .iter()
+        .any(|p| matches!(p, PrincipalEntry::Any | PrincipalEntry::AwsWildcard))
+    {
         return false;
     }
     // Check if conditions restrict public access (e.g. non-wildcard IpAddress on aws:SourceIp)
@@ -710,6 +807,8 @@ fn lookup_condition_value(
     match key_lower {
         "aws:referer" => pctx.referer.clone(),
         "aws:sourceip" => pctx.source_ip.map(|ip| ip.to_string()),
+        "aws:sourcearn" => extra.source_arn.map(str::to_string),
+        "aws:sourceaccount" => extra.source_account.map(str::to_string),
         "aws:securetransport" => Some("false".to_string()),
         "aws:username" => ctx.caller.as_ref().map(|c| c.display_name.clone()),
         "aws:userid" => ctx.caller.as_ref().map(|c| c.user_id.clone()),
@@ -1128,6 +1227,8 @@ pub fn can_reveal_missing_key(
         delimiter: None,
         existing_object_tags: None,
         request_object_tags: None,
+        source_arn: None,
+        source_account: None,
     };
     let actions: &[S3Action] = if has_version_id {
         &[S3Action::ListBucketVersions, S3Action::ListBucket]

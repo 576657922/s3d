@@ -24,9 +24,9 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 use crate::catalog::{
-    BucketEntry, EngineByteReader, InflightWriteGuard, MemoryCatalog, MultipartUploadEntry,
-    ObjectVersionEntry, SegmentPin, SegmentSlot, UploadPartEntry, SEG_STATE_ACTIVE,
-    SEG_STATE_SEALED,
+    build_extent_read_slices, BucketEntry, EngineByteReader, InflightWriteGuard, MemoryCatalog,
+    MultipartUploadEntry, ObjectVersionEntry, SegmentPin, SegmentSlot, UploadPartEntry,
+    SEG_STATE_ACTIVE, SEG_STATE_SEALED,
 };
 use crate::checkpoint::{read_checkpoint_from_file, write_checkpoint_to_file};
 pub use crate::checkpoint::{decode_checkpoint_bytes, LoadedCheckpoint};
@@ -125,6 +125,7 @@ pub struct Engine<D: Disk> {
     disk: D,
     cfg: EngineConfig,
     format: FormatFile,
+    sse_s3_master_key: [u8; 32],
     _lock_guard: Box<dyn Send + Sync>,
     read_only_poisoned: AtomicBool,
     next_seq: AtomicU64,
@@ -537,10 +538,13 @@ impl<D: Disk> Engine<D> {
             .last_checkpoint_lsn
             .store(base_lsn, Ordering::Relaxed);
 
+        let sse_s3_master_key = derive_sse_s3_master_key(&format.instance_uuid);
+
         Ok(Arc::new(Self {
             disk,
             cfg,
             format,
+            sse_s3_master_key,
             _lock_guard: lock_guard,
             read_only_poisoned: AtomicBool::new(false),
             next_seq: AtomicU64::new(initial_next_seq),
@@ -614,10 +618,34 @@ impl<D: Disk> Engine<D> {
         &self.key_locks[(h as usize) % KEY_LOCK_STRIPES]
     }
 
+    fn make_random_iv(&self) -> [u8; 16] {
+        let mut iv = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut iv);
+        iv
+    }
+
     /// Write a single framed data block (`<= max_block_payload`) into the active segment.
     fn write_data_block(&self, payload: &[u8]) -> StoreResult<(Extent, InflightWriteGuard<D>)> {
         let mut frame = Vec::with_capacity(BLOCK_HEADER_LEN as usize + payload.len());
         self.write_data_block_reuse(payload, &mut frame)
+    }
+
+    fn write_stream_block_maybe_enc(
+        &self,
+        plain_block: &[u8],
+        enc_ctx: Option<(&Aes256Cipher, &[u8; 16], u64)>,
+        enc_scratch: &mut Vec<u8>,
+        frame_buf: &mut Vec<u8>,
+    ) -> StoreResult<(Extent, InflightWriteGuard<D>)> {
+        match enc_ctx {
+            None => self.write_data_block_reuse(plain_block, frame_buf),
+            Some((cipher, iv, plain_offset)) => {
+                enc_scratch.clear();
+                enc_scratch.extend_from_slice(plain_block);
+                aes256_ctr_xor_with_cipher(cipher, iv, plain_offset, enc_scratch);
+                self.write_data_block_reuse(enc_scratch, frame_buf)
+            }
+        }
     }
 
     fn write_data_block_reuse(
@@ -1456,6 +1484,7 @@ fn apply_wal_op(
             region,
             created_ms,
             explicit_ownership,
+            object_lock_enabled,
         } => {
             catalog.buckets.insert(
                 name.clone(),
@@ -1465,12 +1494,22 @@ fn apply_wal_op(
                     acl,
                     region,
                     created_ms,
-                    versioning: VersioningStatus::Unversioned,
+                    versioning: if object_lock_enabled {
+                        VersioningStatus::Enabled
+                    } else {
+                        VersioningStatus::Unversioned
+                    },
                     explicit_ownership,
                     tags: BTreeMap::new(),
                     cors: None,
                     policy: None,
                     public_access_block: None,
+                    object_lock_enabled,
+                    object_lock_config: object_lock_enabled
+                        .then_some(ObjectLockConfiguration::default()),
+                    lifecycle: None,
+                    encryption: None,
+                    logging: None,
                     objects: BTreeMap::new(),
                     uploads: BTreeMap::new(),
                     completed_uploads: BTreeMap::new(),
@@ -1513,6 +1552,27 @@ fn apply_wal_op(
                 b.public_access_block = config;
             }
         }
+        WalOp::UpdateBucketObjectLock { name, config } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.object_lock_enabled = true;
+                b.object_lock_config = Some(config);
+            }
+        }
+        WalOp::UpdateBucketLifecycle { name, config } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.lifecycle = config;
+            }
+        }
+        WalOp::UpdateBucketEncryption { name, config } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.encryption = config;
+            }
+        }
+        WalOp::UpdateBucketLogging { name, status } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.logging = status;
+            }
+        }
         WalOp::DeleteBucket { name } => {
             catalog.buckets.remove(&name);
         }
@@ -1533,6 +1593,9 @@ fn apply_wal_op(
             last_modified_ms,
             extents,
             parts,
+            sse,
+            retention,
+            legal_hold,
         } => {
             if seq > catalog.next_seq {
                 catalog.next_seq = seq;
@@ -1553,6 +1616,9 @@ fn apply_wal_op(
                     last_modified_ms,
                     extents: extents.into(),
                     parts: parts.map(Into::into),
+                    sse,
+                    retention,
+                    legal_hold,
                 };
                 let chain = b.objects.entry(key).or_default();
                 let mut _unused = Vec::new();
@@ -1589,6 +1655,36 @@ fn apply_wal_op(
                 v.tags = tags;
             }
         }
+        WalOp::UpdateObjectRetention {
+            bucket,
+            key,
+            seq,
+            retention,
+        } => {
+            if let Some(v) = catalog
+                .buckets
+                .get_mut(&bucket)
+                .and_then(|b| b.objects.get_mut(&key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == seq))
+            {
+                v.retention = Some(retention);
+            }
+        }
+        WalOp::UpdateObjectLegalHold {
+            bucket,
+            key,
+            seq,
+            status,
+        } => {
+            if let Some(v) = catalog
+                .buckets
+                .get_mut(&bucket)
+                .and_then(|b| b.objects.get_mut(&key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == seq))
+            {
+                v.legal_hold = Some(status);
+            }
+        }
         WalOp::DeleteVersion {
             bucket,
             key,
@@ -1612,6 +1708,16 @@ fn apply_wal_op(
                 }
             }
         }
+        WalOp::DeleteVersionBySeq { bucket, key, seq } => {
+            if let Some(b) = catalog.buckets.get_mut(&bucket)
+                && let Some(chain) = b.objects.get_mut(&key)
+            {
+                chain.retain(|v| v.seq != seq);
+                if chain.is_empty() {
+                    b.objects.remove(&key);
+                }
+            }
+        }
         WalOp::CreateMultipartUpload {
             bucket,
             key,
@@ -1625,6 +1731,9 @@ fn apply_wal_op(
             user_meta,
             checksum_algorithm,
             checksum_type,
+            sse,
+            retention,
+            legal_hold,
         } => {
             if let Some(b) = catalog.buckets.get_mut(&bucket) {
                 b.uploads.insert(
@@ -1641,6 +1750,9 @@ fn apply_wal_op(
                         user_meta,
                         checksum_algorithm,
                         checksum_type,
+                        sse,
+                        retention,
+                        legal_hold,
                         parts: BTreeMap::new(),
                     },
                 );
@@ -1659,6 +1771,7 @@ fn apply_wal_op(
             crc64_nvme,
             checksum,
             extents,
+            sse_iv,
         } => {
             if part_seq > catalog.next_seq {
                 catalog.next_seq = part_seq;
@@ -1680,6 +1793,7 @@ fn apply_wal_op(
                         crc64_nvme,
                         checksum,
                         extents: extents.into(),
+                        sse_iv,
                     },
                 );
             }
@@ -1701,6 +1815,9 @@ fn apply_wal_op(
             completed_ms,
             extents,
             parts,
+            sse,
+            retention,
+            legal_hold,
             resp,
         } => {
             if seq > catalog.next_seq {
@@ -1722,6 +1839,9 @@ fn apply_wal_op(
                     last_modified_ms: completed_ms,
                     extents: extents.into(),
                     parts: Some(parts.into()),
+                    sse,
+                    retention,
+                    legal_hold,
                 };
                 let chain = b.objects.entry(key.clone()).or_default();
                 let mut _unused = Vec::new();
@@ -1783,6 +1903,30 @@ fn now_epoch_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn can_bypass_governance_engine(
+    bucket: &BucketEntry,
+    default_ownership: ObjectOwnership,
+    ctx: &CallerContext,
+    key: &str,
+    existing_tags: Option<&BTreeMap<String, String>>,
+) -> bool {
+    let view = bucket.auth_view(default_ownership);
+    let extra = PolicyEvalExtra {
+        existing_object_tags: existing_tags,
+        ..Default::default()
+    };
+    authorize_object_action(
+        &view,
+        ctx,
+        key,
+        &[S3Action::BypassGovernanceRetention],
+        Some(&bucket.owner),
+        None,
+        true,
+        &extra,
+    )
 }
 
 fn require_authenticated(ctx: &CallerContext) -> StoreResult<&OwnerInfo> {
@@ -2236,6 +2380,12 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
         };
 
+        let initial_versioning = if req.object_lock_enabled {
+            VersioningStatus::Enabled
+        } else {
+            VersioningStatus::Unversioned
+        };
+
         let op = WalOp::CreateBucket {
             name: req.bucket.clone(),
             owner: caller.clone(),
@@ -2243,6 +2393,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             region: self.cfg.region.clone(),
             created_ms: req.ctx.request_time_ms,
             explicit_ownership,
+            object_lock_enabled: req.object_lock_enabled,
         };
         let _cg = self.commit_wal(op).await?;
 
@@ -2255,12 +2406,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 acl,
                 region: self.cfg.region.clone(),
                 created_ms: req.ctx.request_time_ms,
-                versioning: VersioningStatus::Unversioned,
+                versioning: initial_versioning,
                 explicit_ownership,
                 tags: BTreeMap::new(),
                 cors: None,
                 policy: None,
                 public_access_block: None,
+                object_lock_enabled: req.object_lock_enabled,
+                object_lock_config: req
+                    .object_lock_enabled
+                    .then_some(ObjectLockConfiguration::default()),
+                lifecycle: None,
+                encryption: None,
+                logging: None,
                 objects: BTreeMap::new(),
                 uploads: BTreeMap::new(),
                 completed_uploads: BTreeMap::new(),
@@ -2274,7 +2432,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             owner: caller,
             region: self.cfg.region.clone(),
             created_ms: req.ctx.request_time_ms,
-            versioning: VersioningStatus::Unversioned,
+            versioning: initial_versioning,
             ownership,
         })
     }
@@ -2370,7 +2528,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, "").lock().await;
         {
             let cat = self.catalog.read().unwrap();
-            let _ = check_bucket_action(
+            let b = check_bucket_action(
                 &cat,
                 self.cfg.default_object_ownership,
                 &req.ctx,
@@ -2379,6 +2537,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 None,
                 &PolicyEvalExtra::default(),
             )?;
+            if b.object_lock_enabled && req.status == VersioningStatus::Suspended {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidBucketState,
+                    "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
+                )
+                .with_bucket(&req.bucket));
+            }
         }
         let _cg = self
             .commit_wal(WalOp::UpdateBucketVersioning {
@@ -3139,6 +3304,537 @@ impl<D: Disk> ObjectStore for Engine<D> {
         Ok(())
     }
 
+    async fn get_object_lock_configuration(
+        &self,
+        req: BucketRef,
+    ) -> StoreResult<ObjectLockConfiguration> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketObjectLockConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        if !b.object_lock_enabled {
+            return Err(S3Error::new(
+                S3ErrorCode::ObjectLockConfigurationNotFoundError,
+                "Object Lock configuration does not exist for this bucket",
+            )
+            .with_bucket(&req.bucket));
+        }
+        Ok(b.object_lock_config.unwrap_or_default())
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: PutObjectLockConfigurationReq,
+    ) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let b = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutBucketObjectLockConfiguration],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+            if !b.object_lock_enabled && b.versioning != VersioningStatus::Enabled {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidBucketState,
+                    "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration",
+                )
+                .with_bucket(&req.bucket));
+            }
+        }
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketObjectLock {
+                name: req.bucket.clone(),
+                config: req.config,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.object_lock_enabled = true;
+                b.object_lock_config = Some(req.config);
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
+    async fn get_object_retention(&self, req: ObjectLockRef) -> StoreResult<ObjectRetention> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let cat = self.catalog.read().unwrap();
+        let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_op_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            &[S3Action::GetObjectRetention],
+            None,
+            None,
+        )?;
+        if !b.object_lock_enabled {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "Bucket is missing Object Lock Configuration",
+            )
+            .with_bucket(&req.bucket));
+        }
+        ver.retention.ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchObjectLockConfiguration,
+                "The specified object does not have a ObjectLock configuration",
+            )
+            .with_key(&req.bucket, &req.key)
+        })
+    }
+
+    async fn put_object_retention(&self, req: PutObjectRetentionReq) -> StoreResult<()> {
+        validate_object_key(&req.bucket, &req.key)?;
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let target_seq = {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let ver = self.lookup_version_for_op_checked(
+                b,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                &[S3Action::PutObjectRetention],
+                None,
+                None,
+            )?;
+            if !b.object_lock_enabled {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    "Bucket is missing Object Lock Configuration",
+                )
+                .with_bucket(&req.bucket));
+            }
+            let can_bypass = can_bypass_governance_engine(
+                b,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.key,
+                Some(&ver.tags),
+            );
+            check_worm_put_retention(
+                ver.retention,
+                req.retention,
+                req.bypass_governance,
+                can_bypass,
+                req.ctx.request_time_ms,
+            )?;
+            ver.seq
+        };
+        let _cg = self
+            .commit_wal(WalOp::UpdateObjectRetention {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                seq: target_seq,
+                retention: req.retention,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(v) = cat
+                .buckets
+                .get_mut(&req.bucket)
+                .and_then(|b| b.objects.get_mut(&req.key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+            {
+                v.retention = Some(req.retention);
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
+    async fn get_object_legal_hold(&self, req: ObjectLockRef) -> StoreResult<LegalHoldStatus> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let cat = self.catalog.read().unwrap();
+        let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_op_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            &[S3Action::GetObjectLegalHold],
+            None,
+            None,
+        )?;
+        if !b.object_lock_enabled {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "Bucket is missing Object Lock Configuration",
+            )
+            .with_bucket(&req.bucket));
+        }
+        ver.legal_hold.ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchObjectLockConfiguration,
+                "The specified object does not have a ObjectLock configuration",
+            )
+            .with_key(&req.bucket, &req.key)
+        })
+    }
+
+    async fn put_object_legal_hold(&self, req: PutObjectLegalHoldReq) -> StoreResult<()> {
+        validate_object_key(&req.bucket, &req.key)?;
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let target_seq = {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let ver = self.lookup_version_for_op_checked(
+                b,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                &[S3Action::PutObjectLegalHold],
+                None,
+                None,
+            )?;
+            if !b.object_lock_enabled {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    "Bucket is missing Object Lock Configuration",
+                )
+                .with_bucket(&req.bucket));
+            }
+            ver.seq
+        };
+        let _cg = self
+            .commit_wal(WalOp::UpdateObjectLegalHold {
+                bucket: req.bucket.clone(),
+                key: req.key.clone(),
+                seq: target_seq,
+                status: req.status,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(v) = cat
+                .buckets
+                .get_mut(&req.bucket)
+                .and_then(|b| b.objects.get_mut(&req.key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+            {
+                v.legal_hold = Some(req.status);
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: BucketRef,
+    ) -> StoreResult<LifecycleConfiguration> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetLifecycleConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        b.lifecycle.clone().ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::NoSuchLifecycleConfiguration,
+                "The lifecycle configuration does not exist",
+            )
+            .with_bucket(&req.bucket)
+        })
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: PutBucketLifecycleReq,
+    ) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutLifecycleConfiguration],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketLifecycle {
+                name: req.bucket.clone(),
+                config: Some(req.config.clone()),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.lifecycle = Some(req.config);
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
+    async fn delete_bucket_lifecycle(&self, req: BucketRef) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutLifecycleConfiguration],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketLifecycle {
+                name: req.bucket.clone(),
+                config: None,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.lifecycle = None;
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
+    async fn get_bucket_encryption(&self, req: BucketRef) -> StoreResult<BucketEncryptionConfig> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetEncryptionConfiguration],
+            None,
+            &PolicyEvalExtra::default(),
+        )?;
+        b.encryption.clone().ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError,
+                "The server side encryption configuration was not found",
+            )
+            .with_bucket(&req.bucket)
+        })
+    }
+
+    async fn put_bucket_encryption(&self, req: PutBucketEncryptionReq) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutEncryptionConfiguration],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketEncryption {
+                name: req.bucket.clone(),
+                config: Some(req.config.clone()),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.encryption = Some(req.config);
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
+    async fn delete_bucket_encryption(&self, req: BucketRef) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = check_bucket_action(
+                &cat,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.bucket,
+                &[S3Action::PutEncryptionConfiguration],
+                None,
+                &PolicyEvalExtra::default(),
+            )?;
+        }
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketEncryption {
+                name: req.bucket.clone(),
+                config: None,
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.encryption = None;
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
+    async fn get_bucket_logging(&self, req: BucketRef) -> StoreResult<BucketLoggingStatus> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_action(
+            &cat,
+            self.cfg.default_object_ownership,
+            &req.ctx,
+            &req.bucket,
+            &[S3Action::GetBucketLogging],
+            Some(AclPermission::ReadAcp),
+            &PolicyEvalExtra::default(),
+        )?;
+        Ok(b.logging.clone().unwrap_or_default())
+    }
+
+    async fn put_bucket_logging(&self, req: PutBucketLoggingReq) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let src_b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let view = src_b.auth_view(self.cfg.default_object_ownership);
+            if let Some(pol) = view.policy {
+                let arn = format!("arn:aws:s3:::{}", req.bucket);
+                if pol.evaluate(
+                    &req.ctx,
+                    &[S3Action::PutBucketLogging],
+                    &arn,
+                    &PolicyEvalExtra::default(),
+                ) == PolicyDecision::ExplicitDeny
+                {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket));
+                }
+            }
+            if !view.is_caller_bucket_owner(&req.ctx) {
+                return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                    .with_bucket(&req.bucket));
+            }
+            let src_owner_id = src_b.owner.user_id.clone();
+
+            if let Some(le) = &req.status.logging_enabled {
+                let Some(target_b) = cat.buckets.get(&le.target_bucket) else {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidTargetBucketForLogging,
+                        "The target bucket for logging does not exist",
+                    )
+                    .with_bucket(&le.target_bucket));
+                };
+                if le.target_bucket == req.bucket {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        "Source bucket and target bucket cannot be the same",
+                    ));
+                }
+                if target_b
+                    .logging
+                    .as_ref()
+                    .and_then(|s| s.logging_enabled.as_ref())
+                    .is_some()
+                    || target_b.encryption.is_some()
+                {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        "Invalid target bucket state for logging",
+                    ));
+                }
+
+                let src_arn = format!("arn:aws:s3:::{}", req.bucket);
+                let target_res_arn =
+                    format!("arn:aws:s3:::{}/{}", le.target_bucket, le.target_prefix);
+                let svc_extra = PolicyEvalExtra {
+                    source_arn: Some(&src_arn),
+                    source_account: Some(&src_owner_id),
+                    ..Default::default()
+                };
+                let allowed_by_policy = target_b.policy.as_ref().is_some_and(|pol| {
+                    pol.allows_service(
+                        "logging.s3.amazonaws.com",
+                        &[S3Action::PutObject],
+                        &target_res_arn,
+                        &svc_extra,
+                    )
+                });
+                let allowed_by_acl = target_b.effective_ownership(self.cfg.default_object_ownership)
+                    != ObjectOwnership::BucketOwnerEnforced
+                    && target_b.acl.grants.iter().any(|g| {
+                        matches!(&g.grantee, AclGrantee::Group(u) if u == GROUP_LOG_DELIVERY)
+                            && matches!(
+                                g.permission,
+                                AclPermission::Write | AclPermission::FullControl
+                            )
+                    })
+                    && target_b.acl.grants.iter().any(|g| {
+                        matches!(&g.grantee, AclGrantee::Group(u) if u == GROUP_LOG_DELIVERY)
+                            && matches!(
+                                g.permission,
+                                AclPermission::ReadAcp | AclPermission::FullControl
+                            )
+                    });
+                if !allowed_by_policy && !allowed_by_acl {
+                    return Err(S3Error::new(
+                        S3ErrorCode::AccessDenied,
+                        "Bucket policy on target bucket does not allow logging service PutObject",
+                    ));
+                }
+            }
+        }
+        let _cg = self
+            .commit_wal(WalOp::UpdateBucketLogging {
+                name: req.bucket.clone(),
+                status: Some(req.status.clone()),
+            })
+            .await?;
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.logging = Some(req.status);
+            }
+        }
+        drop(_cg);
+        Ok(())
+    }
+
     async fn put_object<S: VerifiedBodyStream>(
         &self,
         req: PutObjectReq,
@@ -3148,7 +3844,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         validate_user_metadata(&req.user_meta)?;
         self.check_writable(true)?;
 
-        {
+        let sse_write = {
             let cat = self.catalog.read().unwrap();
             let b = check_bucket_write_object(
                 &cat,
@@ -3157,6 +3853,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &req.bucket,
                 &req.key,
                 req.tags.as_ref(),
+            )?;
+            let sse_w = validate_sse_write(&req.raw_sse, b.encryption.is_some())?;
+            let _ = resolve_upload_object_lock(
+                b.object_lock_enabled,
+                b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
             )?;
             enforce_block_public_acl_spec(
                 b.auth_view(self.cfg.default_object_ownership)
@@ -3170,14 +3873,41 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
             )?;
-        }
+            sse_w
+        };
 
-        // 1. Stream data into segment blocks (<= max_block_payload) while computing digests
+        let iv = self.make_random_iv();
+        let (cipher_opt, stored_sse, sse_resp) = match &sse_write {
+            ValidatedSseWrite::None => (None, SseStoredMeta::None, SseResponseHeaders::None),
+            ValidatedSseWrite::SseS3 => (
+                Some(Aes256Cipher::new(&self.sse_s3_master_key)),
+                SseStoredMeta::SseS3 { iv },
+                SseResponseHeaders::SseS3,
+            ),
+            ValidatedSseWrite::SseC {
+                key,
+                key_md5,
+                key_md5_b64,
+            } => (
+                Some(Aes256Cipher::new(key)),
+                SseStoredMeta::SseC {
+                    key_md5: *key_md5,
+                    iv,
+                },
+                SseResponseHeaders::SseC {
+                    key_md5_b64: key_md5_b64.clone(),
+                },
+            ),
+        };
+
+        // 1. Stream data into segment blocks (<= max_block_payload), encrypting at-rest if needed
         let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut enc_scratch: Vec<u8> = Vec::new();
         let mut frame_buf: Vec<u8> = Vec::new();
         let mut extents: Vec<Extent> = Vec::new();
         let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut seen_bytes = 0u64;
+        let mut plain_offset = 0u64;
 
         while let Some(chunk) = poll_fn(|cx| body.poll_next_chunk(cx))
             .await
@@ -3193,10 +3923,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
             let mut slice: &[u8] = &chunk;
             while !slice.is_empty() {
                 if block_buf.is_empty() && slice.len() >= self.cfg.max_block_payload {
-                    let (ext, guard) = self.write_data_block_reuse(
-                        &slice[..self.cfg.max_block_payload],
+                    let blk = &slice[..self.cfg.max_block_payload];
+                    let enc_ctx = cipher_opt.as_ref().map(|c| (c, &iv, plain_offset));
+                    let (ext, guard) = self.write_stream_block_maybe_enc(
+                        blk,
+                        enc_ctx,
+                        &mut enc_scratch,
                         &mut frame_buf,
                     )?;
+                    plain_offset += blk.len() as u64;
                     touched_slots.entry(guard.seg_id()).or_insert(guard);
                     extents.push(ext);
                     slice = &slice[self.cfg.max_block_payload..];
@@ -3207,7 +3942,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 block_buf.extend_from_slice(&slice[..take]);
                 slice = &slice[take..];
                 if block_buf.len() == self.cfg.max_block_payload {
-                    let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+                    let enc_ctx = cipher_opt.as_ref().map(|c| (c, &iv, plain_offset));
+                    let (ext, guard) = self.write_stream_block_maybe_enc(
+                        &block_buf,
+                        enc_ctx,
+                        &mut enc_scratch,
+                        &mut frame_buf,
+                    )?;
+                    plain_offset += block_buf.len() as u64;
                     touched_slots.entry(guard.seg_id()).or_insert(guard);
                     extents.push(ext);
                     block_buf.clear();
@@ -3215,11 +3957,18 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
         }
         if !block_buf.is_empty() {
-            let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+            let enc_ctx = cipher_opt.as_ref().map(|c| (c, &iv, plain_offset));
+            let (ext, guard) = self.write_stream_block_maybe_enc(
+                &block_buf,
+                enc_ctx,
+                &mut enc_scratch,
+                &mut frame_buf,
+            )?;
             touched_slots.entry(guard.seg_id()).or_insert(guard);
             extents.push(ext);
         }
         drop(block_buf);
+        drop(enc_scratch);
         drop(frame_buf);
 
         // 2. Verify SHA-256 / Content-MD5 / Checksum BEFORE syncing or writing WAL! (PR-21)
@@ -3228,7 +3977,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
         // 3. Acquire KeyLock, re-evaluate preconditions & ACL at commit point (FR-17),
         //    then coalesce segment fdatasync + WAL fdatasync in group commit (ST-1, §8.3)
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
-        let (versioning, obj_owner, obj_acl) = {
+        let obj_tags = req.tags.clone().unwrap_or_default();
+        let (versioning, obj_owner, obj_acl, retention, legal_hold, exp_hdr) = {
             let cat = self.catalog.read().unwrap();
             let b = check_bucket_write_object(
                 &cat,
@@ -3237,6 +3987,12 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &req.bucket,
                 &req.key,
                 req.tags.as_ref(),
+            )?;
+            let (ret, lh) = resolve_upload_object_lock(
+                b.object_lock_enabled,
+                b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
             )?;
             enforce_block_public_acl_spec(
                 b.auth_view(self.cfg.default_object_ownership)
@@ -3252,7 +4008,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
             )?;
             let head = head_state_of(b.objects.get(&req.key));
             evaluate_write_preconditions(&req.preconditions, &req.bucket, &req.key, head)?;
-            (b.versioning, owner, acl)
+            let exp_h = compute_x_amz_expiration(
+                b.lifecycle.as_ref(),
+                &req.key,
+                digests.total_bytes,
+                &obj_tags,
+                req.ctx.request_time_ms,
+            );
+            (b.versioning, owner, acl, ret, lh, exp_h)
         };
         let seq = self.alloc_seq();
 
@@ -3262,7 +4025,6 @@ impl<D: Disk> ObjectStore for Engine<D> {
             VersioningStatus::Suspended => Some("null".to_string()),
             VersioningStatus::Enabled => Some(format!("v{seq:016x}")),
         };
-        let obj_tags = req.tags.unwrap_or_default();
 
         let op = WalOp::PutVersion {
             bucket: req.bucket.clone(),
@@ -3281,6 +4043,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
             last_modified_ms: req.ctx.request_time_ms,
             extents: extents.clone(),
             parts: None,
+            sse: stored_sse,
+            retention,
+            legal_hold,
         };
         let _cg = self.commit_wal_with_segments(&touched_slots, op).await?;
 
@@ -3308,6 +4073,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: extents.clone().into(),
                     parts: None,
+                    sse: stored_sse,
+                    retention,
+                    legal_hold,
                 };
                 insert_version_chain(b.versioning, chain, entry, &mut reclaimed_extents);
             }
@@ -3321,6 +4089,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
             etag,
             version_id,
             checksum: digests.checksum,
+            sse: sse_resp,
+            expiration_header: exp_hdr,
         })
     }
 
@@ -3360,6 +4130,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
             None,
             None,
         )?;
+        let sse_read = validate_sse_read_or_part(&req.raw_sse)?;
+        let (_, sse_resp) =
+            match_sse_for_stored_object(&ver.sse, &sse_read, &self.sse_s3_master_key)?;
 
         let object_parts = if req.attrs.object_parts {
             ver.parts.as_ref().map(|all_parts| {
@@ -3403,6 +4176,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             object_parts,
             storage_class: req.attrs.storage_class.then(|| "STANDARD".to_string()),
             object_size: req.attrs.object_size.then_some(ver.total_size),
+            sse: sse_resp,
         })
     }
 
@@ -3451,9 +4225,32 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                     .with_key(&req.bucket, &req.key));
             }
+            let can_bypass = can_bypass_governance_engine(
+                b,
+                self.cfg.default_object_ownership,
+                &req.ctx,
+                &req.key,
+                existing_tags,
+            );
             let dm_owner = req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone());
             let head = head_state_of(b.objects.get(&req.key));
             evaluate_delete_preconditions(req.if_match.as_deref(), &req.bucket, &req.key, head)?;
+            if let Some(vid) = &req.version_id
+                && let Some(chain) = b.objects.get(&req.key)
+                && let Some(v) = chain
+                    .iter()
+                    .find(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
+                && !v.is_delete_marker
+            {
+                check_worm_version_delete(
+                    v.retention,
+                    v.legal_hold,
+                    req.bypass_governance,
+                    can_bypass,
+                    req.ctx.request_time_ms,
+                )
+                .map_err(|e| e.with_key(&req.bucket, &req.key))?;
+            }
             (b.versioning, dm_owner)
         };
         let seq = self.alloc_seq();
@@ -3551,6 +4348,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         last_modified_ms: req.ctx.request_time_ms,
                         extents: Vec::new(),
                         parts: None,
+                        sse: SseStoredMeta::None,
+                        retention: None,
+                        legal_hold: None,
                     })
                     .await?;
 
@@ -3589,6 +4389,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                                 last_modified_ms: req.ctx.request_time_ms,
                                 extents: Arc::new([]),
                                 parts: None,
+                                sse: SseStoredMeta::None,
+                                retention: None,
+                                legal_hold: None,
                             },
                         );
                     }
@@ -3626,6 +4429,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 key: item.key.clone(),
                 version_id: item.version_id.clone(),
                 if_match: item.etag_if_match,
+                bypass_governance: req.bypass_governance,
             };
             match self.delete_object(sub).await {
                 Ok(resp) => {
@@ -3666,6 +4470,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
             && !req.replace_metadata
             && req.acl.is_none()
             && req.tagging_directive == TaggingDirective::Copy
+            && req.raw_sse.sse_algorithm.is_none()
+            && !req.raw_sse.has_customer_headers()
+            && !req.raw_lock.has_any()
         {
             return Err(S3Error::new(
                 S3ErrorCode::InvalidRequest,
@@ -3675,7 +4482,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         self.check_writable(true)?;
 
         // 1. Lock-free snapshot read of source metadata & pin its segments
-        let (src_ver, src_pins, dst_tags) = {
+        let (src_ver, src_pins, dst_tags, src_key_iv, dst_sse_write) = {
             let cat = self.catalog.read().unwrap();
             let src_b = lookup_bucket_checked(&cat, &req.ctx, &req.src_bucket)?;
             let found = self
@@ -3703,6 +4510,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &req.dst_key,
                 req_tags_for_auth,
             )?;
+            let dst_sse_w = validate_sse_write(&req.raw_sse, dst_b.encryption.is_some())?;
+            let _ = resolve_upload_object_lock(
+                dst_b.object_lock_enabled,
+                dst_b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
+            )?;
             enforce_block_public_acl_spec(
                 dst_b
                     .auth_view(self.cfg.default_object_ownership)
@@ -3717,6 +4531,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 req.acl.as_ref(),
             )?;
 
+            let src_sse_read = validate_copy_source_sse(&req.raw_copy_src_sse)?;
+            let (s_key_iv, _) =
+                match_sse_for_stored_object(&found.sse, &src_sse_read, &self.sse_s3_master_key)?;
+
             if found.total_size > MAX_SINGLE_PUT_BYTES {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidRequest,
@@ -3730,34 +4548,121 @@ impl<D: Disk> ObjectStore for Engine<D> {
             )?;
 
             let pins = self.pin_extents(&found.extents)?;
-            (found, pins, dst_tags)
+            (found, pins, dst_tags, s_key_iv, dst_sse_w)
         };
 
-        // 2. Copy blocks sequentially into active segment (maintaining strict 1-to-1 block ownership!)
+        let src_cipher = src_key_iv.map(|(k, _)| Aes256Cipher::new(&k));
+        let dst_iv = self.make_random_iv();
+        let (dst_cipher, stored_sse, sse_resp) = match &dst_sse_write {
+            ValidatedSseWrite::None => (None, SseStoredMeta::None, SseResponseHeaders::None),
+            ValidatedSseWrite::SseS3 => (
+                Some(Aes256Cipher::new(&self.sse_s3_master_key)),
+                SseStoredMeta::SseS3 { iv: dst_iv },
+                SseResponseHeaders::SseS3,
+            ),
+            ValidatedSseWrite::SseC {
+                key,
+                key_md5,
+                key_md5_b64,
+            } => (
+                Some(Aes256Cipher::new(key)),
+                SseStoredMeta::SseC {
+                    key_md5: *key_md5,
+                    iv: dst_iv,
+                },
+                SseResponseHeaders::SseC {
+                    key_md5_b64: key_md5_b64.clone(),
+                },
+            ),
+        };
+
+        // 2. Copy blocks sequentially into active segment (decrypting source & re-encrypting destination if needed)
         let mut new_extents = Vec::with_capacity(src_ver.extents.len());
         let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut md5_hasher = Md5::new();
         let mut csum_hasher = ActiveHasher::new(src_ver.checksum.algorithm);
+        let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut enc_scratch: Vec<u8> = Vec::new();
+        let mut frame_buf: Vec<u8> = Vec::new();
+        let mut dst_plain_offset = 0u64;
 
-        for ext in src_ver.extents.iter() {
-            let Some(pin) = src_pins.get(&ext.seg_id) else {
-                return Err(S3Error::new(S3ErrorCode::InternalError, "Missing source segment"));
-            };
-            let mut raw = vec![0u8; ext.physical_bytes() as usize];
-            pin.slot()
-                .file
-                .read_exact_at(ext.offset, &mut raw)
-                .map_err(|_| S3Error::new(S3ErrorCode::InternalError, "Source read failed"))?;
-            let payload = &raw[12..];
-            if crc32c::crc32c(payload) != ext.crc32c {
-                return Err(S3Error::new(
-                    S3ErrorCode::InternalError,
-                    "Source block CRC32C mismatch",
-                ));
+        let slices = build_extent_read_slices(
+            &src_ver.extents,
+            src_ver.parts.as_deref(),
+            src_key_iv.map(|(_, iv)| iv),
+            0,
+            src_ver.total_size,
+        );
+        let mut cached_ext: Option<(u32, u64)> = None;
+        let mut raw_buf: Vec<u8> = Vec::new();
+        let mut dec_buf: Vec<u8> = Vec::new();
+
+        for rs in slices {
+            let ext = rs.ext;
+            if cached_ext != Some((ext.seg_id, ext.offset)) {
+                let Some(pin) = src_pins.get(&ext.seg_id) else {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InternalError,
+                        "Missing source segment",
+                    ));
+                };
+                raw_buf.resize(ext.physical_bytes() as usize, 0);
+                pin.slot()
+                    .file
+                    .read_exact_at(ext.offset, &mut raw_buf)
+                    .map_err(|_| S3Error::new(S3ErrorCode::InternalError, "Source read failed"))?;
+                let hdr: [u8; 12] = raw_buf[0..12].try_into().unwrap();
+                let (blk_len, blk_crc) = decode_block_header(&hdr).map_err(|_| {
+                    S3Error::new(S3ErrorCode::InternalError, "Source block header corrupt")
+                })?;
+                let payload = &raw_buf[12..];
+                if blk_len != ext.len || blk_crc != ext.crc32c || crc32c::crc32c(payload) != ext.crc32c
+                {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InternalError,
+                        "Source block CRC32C mismatch",
+                    ));
+                }
+                cached_ext = Some((ext.seg_id, ext.offset));
             }
-            md5_hasher.update(payload);
-            csum_hasher.update(payload);
-            let (new_ext, guard) = self.write_data_block(payload)?;
+
+            dec_buf.clear();
+            dec_buf.extend_from_slice(&raw_buf[(12 + rs.rel_s)..(12 + rs.rel_e)]);
+            if let (Some((iv, ctr_off)), Some(sc)) = (rs.ctr, &src_cipher) {
+                aes256_ctr_xor_with_cipher(sc, &iv, ctr_off, &mut dec_buf);
+            }
+            md5_hasher.update(&dec_buf);
+            csum_hasher.update(&dec_buf);
+
+            let mut slice: &[u8] = &dec_buf;
+            while !slice.is_empty() {
+                let space = self.cfg.max_block_payload - block_buf.len();
+                let take = space.min(slice.len());
+                block_buf.extend_from_slice(&slice[..take]);
+                slice = &slice[take..];
+                if block_buf.len() == self.cfg.max_block_payload {
+                    let enc_ctx = dst_cipher.as_ref().map(|c| (c, &dst_iv, dst_plain_offset));
+                    let (new_ext, guard) = self.write_stream_block_maybe_enc(
+                        &block_buf,
+                        enc_ctx,
+                        &mut enc_scratch,
+                        &mut frame_buf,
+                    )?;
+                    dst_plain_offset += block_buf.len() as u64;
+                    touched_slots.entry(guard.seg_id()).or_insert(guard);
+                    new_extents.push(new_ext);
+                    block_buf.clear();
+                }
+            }
+        }
+        if !block_buf.is_empty() {
+            let enc_ctx = dst_cipher.as_ref().map(|c| (c, &dst_iv, dst_plain_offset));
+            let (new_ext, guard) = self.write_stream_block_maybe_enc(
+                &block_buf,
+                enc_ctx,
+                &mut enc_scratch,
+                &mut frame_buf,
+            )?;
             touched_slots.entry(guard.seg_id()).or_insert(guard);
             new_extents.push(new_ext);
         }
@@ -3769,7 +4674,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             TaggingDirective::Copy => (!src_ver.tags.is_empty()).then_some(&dst_tags),
             TaggingDirective::Replace => req.tags.as_ref(),
         };
-        let (dst_versioning, dst_owner, dst_acl) = {
+        let (dst_versioning, dst_owner, dst_acl, retention, legal_hold, exp_hdr) = {
             let cat = self.catalog.read().unwrap();
             let dst_b = check_bucket_write_object(
                 &cat,
@@ -3778,6 +4683,12 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &req.dst_bucket,
                 &req.dst_key,
                 req_tags_for_auth,
+            )?;
+            let (ret, lh) = resolve_upload_object_lock(
+                dst_b.object_lock_enabled,
+                dst_b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
             )?;
             enforce_block_public_acl_spec(
                 dst_b
@@ -3799,7 +4710,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &req.dst_key,
                 dst_head,
             )?;
-            (dst_b.versioning, owner, acl)
+            let exp_h = compute_x_amz_expiration(
+                dst_b.lifecycle.as_ref(),
+                &req.dst_key,
+                src_ver.total_size,
+                &dst_tags,
+                req.ctx.request_time_ms,
+            );
+            (dst_b.versioning, owner, acl, ret, lh, exp_h)
         };
         let seq = self.alloc_seq();
 
@@ -3845,6 +4763,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
             last_modified_ms: req.ctx.request_time_ms,
             extents: new_extents.clone(),
             parts: None,
+            sse: stored_sse,
+            retention,
+            legal_hold,
         };
         let _cg = self.commit_wal_with_segments(&touched_slots, op).await?;
 
@@ -3871,6 +4792,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: new_extents.clone().into(),
                     parts: None,
+                    sse: stored_sse,
+                    retention,
+                    legal_hold,
                 };
                 insert_version_chain(dst_versioning, chain, entry, &mut reclaimed);
             }
@@ -3885,6 +4809,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
             src_version_id: src_ver.version_id,
             dst_version_id: dst_vid,
             checksum: dst_csum.client_requested.then_some(dst_csum),
+            sse: sse_resp,
+            expiration_header: exp_hdr,
         })
     }
 
@@ -3908,7 +4834,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         self.check_writable(true)?;
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
-        let (initiator, obj_owner, obj_acl) = {
+        let (initiator, obj_owner, obj_acl, sse_write, retention, legal_hold) = {
             let cat = self.catalog.read().unwrap();
             let b = check_bucket_write_object(
                 &cat,
@@ -3917,6 +4843,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &req.bucket,
                 &req.key,
                 req.tags.as_ref(),
+            )?;
+            let sse_w = validate_sse_write(&req.raw_sse, b.encryption.is_some())?;
+            let (ret, lh) = resolve_upload_object_lock(
+                b.object_lock_enabled,
+                b.object_lock_config.as_ref(),
+                &req.raw_lock,
+                req.ctx.request_time_ms,
             )?;
             enforce_block_public_acl_spec(
                 b.auth_view(self.cfg.default_object_ownership)
@@ -3931,7 +4864,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 req.ctx.caller.as_ref(),
                 req.acl.as_ref(),
             )?;
-            (initiator, obj_owner, obj_acl)
+            (initiator, obj_owner, obj_acl, sse_w, ret, lh)
         };
 
         let seq = self.alloc_seq();
@@ -3940,6 +4873,19 @@ impl<D: Disk> ObjectStore for Engine<D> {
         // [FR-24] >= 128-bit random entropy UploadId
         let upload_id = format!("mp{seq:016x}{}", hex::encode(entropy));
         let up_tags = req.tags.unwrap_or_default();
+        let iv = self.make_random_iv();
+        let (up_sse, sse_resp) = match sse_write {
+            ValidatedSseWrite::None => (SseStoredMeta::None, SseResponseHeaders::None),
+            ValidatedSseWrite::SseS3 => (SseStoredMeta::SseS3 { iv }, SseResponseHeaders::SseS3),
+            ValidatedSseWrite::SseC {
+                key_md5,
+                key_md5_b64,
+                ..
+            } => (
+                SseStoredMeta::SseC { key_md5, iv },
+                SseResponseHeaders::SseC { key_md5_b64 },
+            ),
+        };
 
         let _cg = self
             .commit_wal(WalOp::CreateMultipartUpload {
@@ -3955,6 +4901,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 user_meta: req.user_meta.clone(),
                 checksum_algorithm: req.checksum_algorithm,
                 checksum_type: resolved_type,
+                sse: up_sse,
+                retention,
+                legal_hold,
             })
             .await?;
 
@@ -3978,6 +4927,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         user_meta: req.user_meta,
                         checksum_algorithm: req.checksum_algorithm,
                         checksum_type: resolved_type,
+                        sse: up_sse,
+                        retention,
+                        legal_hold,
                         parts: BTreeMap::new(),
                     },
                 );
@@ -3991,6 +4943,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             upload_id,
             checksum_algorithm: req.checksum_algorithm,
             checksum_type: resolved_type,
+            sse: sse_resp,
         })
     }
 
@@ -4008,7 +4961,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         }
         self.check_writable(true)?;
 
-        let up_alg = {
+        let (up_alg, part_enc_key, sse_resp) = {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
             let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
@@ -4048,14 +5001,23 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         .with_bucket(&req.bucket),
                 );
             }
-            up.checksum_algorithm
+            let part_sse_req = validate_sse_read_or_part(&req.raw_sse)?;
+            let (key_iv, sse_r) =
+                match_sse_for_stored_object(&up.sse, &part_sse_req, &self.sse_s3_master_key)?;
+            (up.checksum_algorithm, key_iv.map(|(k, _)| k), sse_r)
         };
 
+        let part_iv = self.make_random_iv();
+        let part_cipher = part_enc_key.map(|k| Aes256Cipher::new(&k));
+        let part_iv_opt = part_cipher.as_ref().map(|_| part_iv);
+
         let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut enc_scratch: Vec<u8> = Vec::new();
         let mut frame_buf: Vec<u8> = Vec::new();
         let mut extents: Vec<Extent> = Vec::new();
         let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut seen_bytes = 0u64;
+        let mut part_plain_offset = 0u64;
         let mut crc64_hasher = crc64fast_nvme::Digest::new();
         let mut up_csum_hasher = up_alg.map(ActiveHasher::new);
 
@@ -4077,10 +5039,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
             let mut slice: &[u8] = &chunk;
             while !slice.is_empty() {
                 if block_buf.is_empty() && slice.len() >= self.cfg.max_block_payload {
-                    let (ext, guard) = self.write_data_block_reuse(
-                        &slice[..self.cfg.max_block_payload],
+                    let blk = &slice[..self.cfg.max_block_payload];
+                    let enc_ctx = part_cipher.as_ref().map(|c| (c, &part_iv, part_plain_offset));
+                    let (ext, guard) = self.write_stream_block_maybe_enc(
+                        blk,
+                        enc_ctx,
+                        &mut enc_scratch,
                         &mut frame_buf,
                     )?;
+                    part_plain_offset += blk.len() as u64;
                     touched_slots.entry(guard.seg_id()).or_insert(guard);
                     extents.push(ext);
                     slice = &slice[self.cfg.max_block_payload..];
@@ -4091,7 +5058,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 block_buf.extend_from_slice(&slice[..take]);
                 slice = &slice[take..];
                 if block_buf.len() == self.cfg.max_block_payload {
-                    let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+                    let enc_ctx = part_cipher.as_ref().map(|c| (c, &part_iv, part_plain_offset));
+                    let (ext, guard) = self.write_stream_block_maybe_enc(
+                        &block_buf,
+                        enc_ctx,
+                        &mut enc_scratch,
+                        &mut frame_buf,
+                    )?;
+                    part_plain_offset += block_buf.len() as u64;
                     touched_slots.entry(guard.seg_id()).or_insert(guard);
                     extents.push(ext);
                     block_buf.clear();
@@ -4099,11 +5073,18 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
         }
         if !block_buf.is_empty() {
-            let (ext, guard) = self.write_data_block_reuse(&block_buf, &mut frame_buf)?;
+            let enc_ctx = part_cipher.as_ref().map(|c| (c, &part_iv, part_plain_offset));
+            let (ext, guard) = self.write_stream_block_maybe_enc(
+                &block_buf,
+                enc_ctx,
+                &mut enc_scratch,
+                &mut frame_buf,
+            )?;
             touched_slots.entry(guard.seg_id()).or_insert(guard);
             extents.push(ext);
         }
         drop(block_buf);
+        drop(enc_scratch);
         drop(frame_buf);
 
         let digests = body.finish().map_err(map_body_err)?;
@@ -4180,6 +5161,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     crc64_nvme: part_crc64,
                     checksum: part_csum.clone(),
                     extents: extents.clone(),
+                    sse_iv: part_iv_opt,
                 },
             )
             .await?;
@@ -4206,6 +5188,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         crc64_nvme: part_crc64,
                         checksum: part_csum,
                         extents: extents.clone().into(),
+                        sse_iv: part_iv_opt,
                     },
                 ) {
                     reclaimed.extend(old_part.extents.iter().copied());
@@ -4218,6 +5201,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         Ok(UploadPartResp {
             etag,
             checksum: resp_csum,
+            sse: sse_resp,
         })
     }
 
@@ -4231,7 +5215,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         }
         self.check_writable(true)?;
 
-        let (src_ver, src_pins, up_alg, slice_start, slice_end_excl) = {
+        let (src_ver, src_pins, up_alg, slice_start, slice_end_excl, src_key_iv, dst_enc_key, sse_resp) = {
             let cat = self.catalog.read().unwrap();
             let src_b = lookup_bucket_checked(&cat, &req.ctx, &req.src_bucket)?;
             let dst_b = lookup_bucket_checked(&cat, &req.ctx, &req.dst_bucket)?;
@@ -4276,6 +5260,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 );
             }
             let up_alg = up.checksum_algorithm;
+            let up_sse = up.sse;
 
             let found = self
                 .lookup_version_for_copy_checked(
@@ -4286,6 +5271,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     req.src_version_id.as_deref(),
                 )?
                 .clone();
+
+            let dst_sse_req = validate_sse_read_or_part(&req.raw_sse)?;
+            let (dst_key_iv, sse_r) =
+                match_sse_for_stored_object(&up_sse, &dst_sse_req, &self.sse_s3_master_key)?;
+            let src_sse_req = validate_copy_source_sse(&req.raw_copy_src_sse)?;
+            let (s_key_iv, _) =
+                match_sse_for_stored_object(&found.sse, &src_sse_req, &self.sse_s3_master_key)?;
 
             evaluate_copy_source_preconditions(
                 &req.src_preconditions,
@@ -4323,66 +5315,107 @@ impl<D: Disk> ObjectStore for Engine<D> {
             } else {
                 BTreeMap::new()
             };
-            (found, pins, up_alg, s, e_excl)
+            (
+                found,
+                pins,
+                up_alg,
+                s,
+                e_excl,
+                s_key_iv,
+                dst_key_iv.map(|(k, _)| k),
+                sse_r,
+            )
         };
 
+        let src_cipher = src_key_iv.map(|(k, _)| Aes256Cipher::new(&k));
+        let part_iv = self.make_random_iv();
+        let dst_part_cipher = dst_enc_key.map(|k| Aes256Cipher::new(&k));
+        let part_iv_opt = dst_part_cipher.as_ref().map(|_| part_iv);
+
         let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut enc_scratch: Vec<u8> = Vec::new();
+        let mut frame_buf: Vec<u8> = Vec::new();
         let mut extents: Vec<Extent> = Vec::new();
         let mut touched_slots: BTreeMap<u32, InflightWriteGuard<D>> = BTreeMap::new();
         let mut md5_hasher = Md5::new();
         let mut crc64_hasher = crc64fast_nvme::Digest::new();
         let mut up_csum_hasher = up_alg.map(ActiveHasher::new);
+        let mut dst_part_plain_offset = 0u64;
 
         if slice_start < slice_end_excl {
-            let mut logical_pos = 0u64;
-            for ext in src_ver.extents.iter() {
-                let ext_len = ext.len as u64;
-                if ext_len == 0 {
-                    continue;
-                }
-                let ext_start = logical_pos;
-                let ext_end_excl = logical_pos + ext_len;
-                logical_pos = ext_end_excl;
+            let slices = build_extent_read_slices(
+                &src_ver.extents,
+                src_ver.parts.as_deref(),
+                src_key_iv.map(|(_, iv)| iv),
+                slice_start,
+                slice_end_excl,
+            );
+            let mut cached_ext: Option<(u32, u64)> = None;
+            let mut raw_buf: Vec<u8> = Vec::new();
+            let mut dec_buf: Vec<u8> = Vec::new();
 
-                if ext_end_excl <= slice_start {
-                    continue;
-                }
-                if ext_start >= slice_end_excl {
-                    break;
+            for rs in slices {
+                let ext = rs.ext;
+                if cached_ext != Some((ext.seg_id, ext.offset)) {
+                    let Some(pin) = src_pins.get(&ext.seg_id) else {
+                        return Err(S3Error::new(
+                            S3ErrorCode::InternalError,
+                            "Missing source segment",
+                        ));
+                    };
+                    raw_buf.resize(ext.physical_bytes() as usize, 0);
+                    pin.slot()
+                        .file
+                        .read_exact_at(ext.offset, &mut raw_buf)
+                        .map_err(|_| {
+                            S3Error::new(S3ErrorCode::InternalError, "Source read failed")
+                        })?;
+                    let hdr: [u8; 12] = raw_buf[0..12].try_into().unwrap();
+                    let (blk_len, blk_crc) = decode_block_header(&hdr).map_err(|_| {
+                        S3Error::new(S3ErrorCode::InternalError, "Source block header corrupt")
+                    })?;
+                    let payload = &raw_buf[12..];
+                    if blk_len != ext.len
+                        || blk_crc != ext.crc32c
+                        || crc32c::crc32c(payload) != ext.crc32c
+                    {
+                        return Err(S3Error::new(
+                            S3ErrorCode::InternalError,
+                            "Source block CRC32C mismatch",
+                        ));
+                    }
+                    cached_ext = Some((ext.seg_id, ext.offset));
                 }
 
-                let Some(pin) = src_pins.get(&ext.seg_id) else {
-                    return Err(S3Error::new(S3ErrorCode::InternalError, "Missing source segment"));
-                };
-                let mut raw = vec![0u8; ext.physical_bytes() as usize];
-                pin.slot()
-                    .file
-                    .read_exact_at(ext.offset, &mut raw)
-                    .map_err(|_| S3Error::new(S3ErrorCode::InternalError, "Source read failed"))?;
-                let payload = &raw[12..];
-                if crc32c::crc32c(payload) != ext.crc32c {
-                    return Err(S3Error::new(
-                        S3ErrorCode::InternalError,
-                        "Source block CRC32C mismatch",
-                    ));
+                dec_buf.clear();
+                dec_buf.extend_from_slice(&raw_buf[(12 + rs.rel_s)..(12 + rs.rel_e)]);
+                if let (Some((iv, ctr_off)), Some(sc)) = (rs.ctr, &src_cipher) {
+                    aes256_ctr_xor_with_cipher(sc, &iv, ctr_off, &mut dec_buf);
                 }
 
-                let rel_s = slice_start.saturating_sub(ext_start) as usize;
-                let rel_e = (slice_end_excl.min(ext_end_excl) - ext_start) as usize;
-                let mut slice = &payload[rel_s..rel_e];
-                md5_hasher.update(slice);
-                crc64_hasher.write(slice);
+                md5_hasher.update(&dec_buf);
+                crc64_hasher.write(&dec_buf);
                 if let Some(h) = &mut up_csum_hasher {
-                    h.update(slice);
+                    h.update(&dec_buf);
                 }
 
+                let mut slice: &[u8] = &dec_buf;
                 while !slice.is_empty() {
                     let space = self.cfg.max_block_payload - block_buf.len();
                     let take = space.min(slice.len());
                     block_buf.extend_from_slice(&slice[..take]);
                     slice = &slice[take..];
                     if block_buf.len() == self.cfg.max_block_payload {
-                        let (new_ext, guard) = self.write_data_block(&block_buf)?;
+                        let enc_ctx = dst_part_cipher
+                            .as_ref()
+                            .map(|c| (c, &part_iv, dst_part_plain_offset));
+                        let (new_ext, guard) = self.write_stream_block_maybe_enc(
+                            &block_buf,
+                            enc_ctx,
+                            &mut enc_scratch,
+                            &mut frame_buf,
+                        )?;
+                        dst_part_plain_offset += block_buf.len() as u64;
                         touched_slots.entry(guard.seg_id()).or_insert(guard);
                         extents.push(new_ext);
                         block_buf.clear();
@@ -4390,7 +5423,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 }
             }
             if !block_buf.is_empty() {
-                let (new_ext, guard) = self.write_data_block(&block_buf)?;
+                let enc_ctx = dst_part_cipher
+                    .as_ref()
+                    .map(|c| (c, &part_iv, dst_part_plain_offset));
+                let (new_ext, guard) = self.write_stream_block_maybe_enc(
+                    &block_buf,
+                    enc_ctx,
+                    &mut enc_scratch,
+                    &mut frame_buf,
+                )?;
                 touched_slots.entry(guard.seg_id()).or_insert(guard);
                 extents.push(new_ext);
                 block_buf.clear();
@@ -4459,6 +5500,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     crc64_nvme: part_crc64,
                     checksum: part_csum.clone(),
                     extents: extents.clone(),
+                    sse_iv: part_iv_opt,
                 },
             )
             .await?;
@@ -4485,6 +5527,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         crc64_nvme: part_crc64,
                         checksum: part_csum,
                         extents: extents.clone().into(),
+                        sse_iv: part_iv_opt,
                     },
                 ) {
                     reclaimed.extend(old_part.extents.iter().copied());
@@ -4499,6 +5542,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             last_modified_ms: req.ctx.request_time_ms,
             src_version_id: src_ver.version_id,
             checksum: resp_csum,
+            sse: sse_resp,
         })
     }
 
@@ -4516,7 +5560,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         self.check_writable(false)?;
 
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
-        let (up, versioning) = {
+        let (up, versioning, sse_resp) = {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
 
@@ -4589,7 +5633,10 @@ impl<D: Disk> ObjectStore for Engine<D> {
                         .with_bucket(&req.bucket),
                 );
             }
-            (up, b.versioning)
+            let complete_sse_req = validate_sse_read_or_part(&req.raw_sse)?;
+            let (_, sse_r) =
+                match_sse_for_stored_object(&up.sse, &complete_sse_req, &self.sse_s3_master_key)?;
+            (up, b.versioning, sse_r)
         };
 
         let deduped_parts = dedup_complete_parts(&req.parts)?;
@@ -4687,6 +5734,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 part_number: uploaded.part_number,
                 size: part_len,
                 checksum: uploaded.checksum.clone(),
+                sse_iv: uploaded.sse_iv,
             });
         }
 
@@ -4749,13 +5797,20 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 ));
             }
 
-        // [FR-15, FR-17] Evaluate destination preconditions at commit point
-        {
+        // [FR-15, FR-17] Evaluate destination preconditions & lifecycle header at commit point
+        let exp_hdr = {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
             let head = head_state_of(b.objects.get(&req.key));
             evaluate_write_preconditions(&req.preconditions, &req.bucket, &req.key, head)?;
-        }
+            compute_x_amz_expiration(
+                b.lifecycle.as_ref(),
+                &req.key,
+                total_size,
+                &up.tags,
+                req.ctx.request_time_ms,
+            )
+        };
 
         let seq = self.alloc_seq();
         let outer_md5: [u8; 16] = Md5::digest(&md5_concat).into();
@@ -4774,6 +5829,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
             checksum: final_checksum
                 .client_requested
                 .then(|| final_checksum.clone()),
+            sse: sse_resp,
+            expiration_header: exp_hdr,
         };
 
         let _cg = self
@@ -4794,6 +5851,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 completed_ms: req.ctx.request_time_ms,
                 extents: combined_extents.clone(),
                 parts: boundaries.clone(),
+                sse: up.sse,
+                retention: up.retention,
+                legal_hold: up.legal_hold,
                 resp: resp.clone(),
             })
             .await?;
@@ -4820,6 +5880,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: combined_extents.into(),
                     parts: Some(boundaries.into()),
+                    sse: up.sse,
+                    retention: up.retention,
+                    legal_hold: up.legal_hold,
                 };
                 let chain = b.objects.entry(req.key.clone()).or_default();
                 insert_version_chain(b.versioning, chain, entry, &mut reclaimed);
@@ -5619,7 +6682,7 @@ impl<D: Disk> Engine<D> {
         } else {
             &[S3Action::GetObject]
         };
-        let (ver, pins) = {
+        let (ver, pins, exp_hdr) = {
             let cat = self.catalog.read().unwrap();
             let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
             let found = self
@@ -5635,27 +6698,36 @@ impl<D: Disk> Engine<D> {
                 )?
                 .clone();
 
+            let is_current = b
+                .objects
+                .get(&req.key)
+                .and_then(|c| c.first())
+                .is_some_and(|h| h.seq == found.seq);
+            let exp_h = if is_current {
+                compute_x_amz_expiration(
+                    b.lifecycle.as_ref(),
+                    &req.key,
+                    found.total_size,
+                    &found.tags,
+                    found.last_modified_ms,
+                )
+            } else {
+                None
+            };
+
             let pins = if need_reader {
                 self.pin_extents(&found.extents)?
             } else {
                 BTreeMap::new()
             };
-            (found, pins)
+            (found, pins, exp_h)
         };
 
-        let last_mod_http = httpdate::fmt_http_date(
-            UNIX_EPOCH + std::time::Duration::from_millis(ver.last_modified_ms.max(0) as u64),
-        );
-        evaluate_read_preconditions(
-            &req.preconditions,
-            &ver.etag,
-            ver.last_modified_ms,
-            &last_mod_http,
-        )?;
-
+        let sse_read = validate_sse_read_or_part(&req.raw_sse)?;
         let total_size = ver.total_size;
         let mut part_specific_csum: Option<ChecksumState> = None;
 
+        // Validate partNumber bounds BEFORE SSE-C key match (`test_multipart_sse_c_get_part`)
         let (start, end, is_partial, parts_count) = if let Some(pn) = req.part_number {
             if pn == 0 || pn > MAX_PARTS_COUNT {
                 return Err(S3Error::new(
@@ -5710,6 +6782,19 @@ impl<D: Disk> Engine<D> {
             (0, total_size - 1, false, None)
         };
 
+        let (key_iv, sse_resp) =
+            match_sse_for_stored_object(&ver.sse, &sse_read, &self.sse_s3_master_key)?;
+
+        let last_mod_http = httpdate::fmt_http_date(
+            UNIX_EPOCH + std::time::Duration::from_millis(ver.last_modified_ms.max(0) as u64),
+        );
+        evaluate_read_preconditions(
+            &req.preconditions,
+            &ver.etag,
+            ver.last_modified_ms,
+            &last_mod_http,
+        )?;
+
         let content_len = if let Some(pn) = req.part_number {
             if let Some(parts) = &ver.parts {
                 parts[pn as usize - 1].size
@@ -5739,7 +6824,7 @@ impl<D: Disk> Engine<D> {
         };
 
         let reader = if need_reader && content_len > 0 {
-            EngineByteReader::new(pins, &ver.extents, start, end)
+            EngineByteReader::new(pins, &ver.extents, ver.parts.as_deref(), key_iv, start, end)
         } else {
             EngineByteReader::empty()
         };
@@ -5760,8 +6845,462 @@ impl<D: Disk> Engine<D> {
             checksum,
             parts_count,
             tags_count: ver.tags.len(),
+            sse: sse_resp,
+            retention: ver.retention,
+            legal_hold: ver.legal_hold,
+            expiration_header: exp_hdr,
         };
         Ok((meta, reader))
+    }
+
+    /// Execute one crash-safe lifecycle evaluation sweep across all buckets (`PR-39` ~ `PR-40`).
+    pub async fn run_lifecycle_tick(
+        &self,
+        now_ms: i64,
+        lc_debug_interval_secs: Option<u64>,
+    ) -> StoreResult<()> {
+        if self.is_read_only_poisoned() {
+            return Ok(());
+        }
+        let day_ms: i64 = lc_debug_interval_secs
+            .map(|s| (s as i64).saturating_mul(1000))
+            .unwrap_or(86_400_000);
+
+        let buckets_with_lc: Vec<(String, LifecycleConfiguration)> = {
+            let cat = self.catalog.read().unwrap();
+            cat.buckets
+                .iter()
+                .filter_map(|(name, b)| b.lifecycle.as_ref().map(|lc| (name.clone(), lc.clone())))
+                .collect()
+        };
+
+        for (bname, lc) in buckets_with_lc {
+            // 1. Current version Expiration (Days / Date)
+            let expired_currents: Vec<(String, u64)> = {
+                let cat = self.catalog.read().unwrap();
+                let Some(b) = cat.buckets.get(&bname) else {
+                    continue;
+                };
+                let mut out = Vec::new();
+                for (key, chain) in &b.objects {
+                    let Some(head) = chain.first() else { continue };
+                    if head.is_delete_marker {
+                        continue;
+                    }
+                    let is_exp = lc.rules.iter().any(|rule| {
+                        if rule.status != LifecycleRuleStatus::Enabled {
+                            return false;
+                        }
+                        let Some(exp) = &rule.expiration else {
+                            return false;
+                        };
+                        if !rule.matches_object(key, head.total_size, &head.tags) {
+                            return false;
+                        }
+                        if let Some(d) = exp.days {
+                            if lc_debug_interval_secs.is_some() {
+                                now_ms.saturating_sub(head.last_modified_ms)
+                                    >= i64::from(d).saturating_mul(day_ms)
+                            } else {
+                                let exp_ms = ((head.last_modified_ms.div_euclid(1000))
+                                    .div_euclid(86_400)
+                                    + i64::from(d)
+                                    + 1)
+                                    * 86_400_000;
+                                now_ms >= exp_ms
+                            }
+                        } else if let Some(date_us) = exp.date_us {
+                            now_ms.saturating_mul(1000) >= date_us
+                        } else {
+                            false
+                        }
+                    });
+                    if is_exp {
+                        out.push((key.clone(), head.seq));
+                    }
+                }
+                out
+            };
+
+            for (key, exp_head_seq) in expired_currents {
+                let _kl = self.key_stripe(&bname, &key).lock().await;
+                let action_opt = {
+                    let cat = self.catalog.read().unwrap();
+                    cat.buckets.get(&bname).and_then(|b| {
+                        let head = b.objects.get(&key)?.first()?;
+                        if head.seq != exp_head_seq || head.is_delete_marker {
+                            return None;
+                        }
+                        Some((
+                            b.versioning,
+                            b.owner.clone(),
+                            head.retention,
+                            head.legal_hold,
+                        ))
+                    })
+                };
+                let Some((versioning, b_owner, retention, legal_hold)) = action_opt else {
+                    continue;
+                };
+
+                match versioning {
+                    VersioningStatus::Unversioned => {
+                        if check_worm_version_delete(retention, legal_hold, false, false, now_ms)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let _cg = self
+                            .commit_wal(WalOp::DeleteVersionBySeq {
+                                bucket: bname.clone(),
+                                key: key.clone(),
+                                seq: exp_head_seq,
+                            })
+                            .await?;
+                        let mut reclaimed = Vec::new();
+                        {
+                            let mut cat = self.catalog.write().unwrap();
+                            if let Some(b) = cat.buckets.get_mut(&bname)
+                                && let Some(chain) = b.objects.get_mut(&key)
+                            {
+                                chain.retain(|v| {
+                                    if v.seq == exp_head_seq {
+                                        reclaimed.extend(v.extents.iter().copied());
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                                if chain.is_empty() {
+                                    b.objects.remove(&key);
+                                }
+                            }
+                        }
+                        if !reclaimed.is_empty() {
+                            self.adjust_live_bytes(&[], &reclaimed);
+                        }
+                        drop(_cg);
+                    }
+                    VersioningStatus::Enabled | VersioningStatus::Suspended => {
+                        let seq = self.alloc_seq();
+                        let vid = if versioning == VersioningStatus::Suspended {
+                            "null".to_string()
+                        } else {
+                            format!("v{seq:016x}")
+                        };
+                        let dummy_csum = ChecksumState {
+                            algorithm: ChecksumAlgorithm::Crc64Nvme,
+                            checksum_type: ChecksumType::FullObject,
+                            value_b64: String::new(),
+                            client_requested: false,
+                        };
+                        let dm_acl = AccessControlPolicy::new_private(b_owner.clone());
+                        let _cg = self
+                            .commit_wal(WalOp::PutVersion {
+                                bucket: bname.clone(),
+                                key: key.clone(),
+                                seq,
+                                version_id: Some(vid.clone()),
+                                is_delete_marker: true,
+                                total_size: 0,
+                                etag: String::new(),
+                                checksum: dummy_csum.clone(),
+                                sys_meta: SystemMeta::default(),
+                                user_meta: Vec::new(),
+                                owner: b_owner.clone(),
+                                acl: dm_acl.clone(),
+                                tags: BTreeMap::new(),
+                                last_modified_ms: now_ms,
+                                extents: Vec::new(),
+                                parts: None,
+                                sse: SseStoredMeta::None,
+                                retention: None,
+                                legal_hold: None,
+                            })
+                            .await?;
+                        let mut reclaimed = Vec::new();
+                        {
+                            let mut cat = self.catalog.write().unwrap();
+                            if seq > cat.next_seq {
+                                cat.next_seq = seq;
+                            }
+                            if let Some(b) = cat.buckets.get_mut(&bname)
+                                && let Some(chain) = b.objects.get_mut(&key)
+                            {
+                                if b.versioning == VersioningStatus::Suspended {
+                                    chain.retain(|old| {
+                                        if old.version_id.as_deref().unwrap_or("null") == "null" {
+                                            reclaimed.extend(old.extents.iter().copied());
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
+                                }
+                                chain.insert(
+                                    0,
+                                    ObjectVersionEntry {
+                                        seq,
+                                        version_id: Some(vid),
+                                        is_delete_marker: true,
+                                        total_size: 0,
+                                        etag: String::new(),
+                                        checksum: dummy_csum,
+                                        sys_meta: Arc::new(SystemMeta::default()),
+                                        user_meta: Vec::new(),
+                                        owner: Arc::new(b_owner),
+                                        acl: Arc::new(dm_acl),
+                                        tags: BTreeMap::new(),
+                                        last_modified_ms: now_ms,
+                                        extents: Arc::new([]),
+                                        parts: None,
+                                        sse: SseStoredMeta::None,
+                                        retention: None,
+                                        legal_hold: None,
+                                    },
+                                );
+                            }
+                        }
+                        if !reclaimed.is_empty() {
+                            self.adjust_live_bytes(&[], &reclaimed);
+                        }
+                        drop(_cg);
+                    }
+                }
+            }
+
+            // 2. NoncurrentVersionExpiration
+            let expired_noncurrents: Vec<(String, u64)> = {
+                let cat = self.catalog.read().unwrap();
+                let Some(b) = cat.buckets.get(&bname) else {
+                    continue;
+                };
+                let mut out = Vec::new();
+                for (key, chain) in &b.objects {
+                    if chain.len() < 2 {
+                        continue;
+                    }
+                    let mut newer_nc_seen = 0u32;
+                    for idx in 1..chain.len() {
+                        let noncurrent_since_ms = chain[idx - 1].last_modified_ms;
+                        let ver = &chain[idx];
+                        if ver.is_delete_marker {
+                            continue;
+                        }
+                        let cur_newer = newer_nc_seen;
+                        newer_nc_seen = newer_nc_seen.saturating_add(1);
+                        if check_worm_version_delete(
+                            ver.retention,
+                            ver.legal_hold,
+                            false,
+                            false,
+                            now_ms,
+                        )
+                        .is_err()
+                        {
+                            continue;
+                        }
+                        let should_del = lc.rules.iter().any(|rule| {
+                            if rule.status != LifecycleRuleStatus::Enabled {
+                                return false;
+                            }
+                            let Some(nc) = &rule.noncurrent_version_expiration else {
+                                return false;
+                            };
+                            if !rule.matches_object(key, ver.total_size, &ver.tags) {
+                                return false;
+                            }
+                            if let Some(keep) = nc.newer_noncurrent_versions
+                                && cur_newer < keep
+                            {
+                                return false;
+                            }
+                            now_ms.saturating_sub(noncurrent_since_ms)
+                                >= i64::from(nc.noncurrent_days).saturating_mul(day_ms)
+                        });
+                        if should_del {
+                            out.push((key.clone(), ver.seq));
+                        }
+                    }
+                }
+                out
+            };
+
+            for (key, del_seq) in expired_noncurrents {
+                let _kl = self.key_stripe(&bname, &key).lock().await;
+                let still_eligible = {
+                    let cat = self.catalog.read().unwrap();
+                    cat.buckets
+                        .get(&bname)
+                        .and_then(|b| b.objects.get(&key))
+                        .and_then(|c| c.iter().skip(1).find(|v| v.seq == del_seq))
+                        .is_some_and(|v| {
+                            !v.is_delete_marker
+                                && check_worm_version_delete(
+                                    v.retention,
+                                    v.legal_hold,
+                                    false,
+                                    false,
+                                    now_ms,
+                                )
+                                .is_ok()
+                        })
+                };
+                if !still_eligible {
+                    continue;
+                }
+                let _cg = self
+                    .commit_wal(WalOp::DeleteVersionBySeq {
+                        bucket: bname.clone(),
+                        key: key.clone(),
+                        seq: del_seq,
+                    })
+                    .await?;
+                let mut reclaimed = Vec::new();
+                {
+                    let mut cat = self.catalog.write().unwrap();
+                    if let Some(b) = cat.buckets.get_mut(&bname)
+                        && let Some(chain) = b.objects.get_mut(&key)
+                    {
+                        chain.retain(|v| {
+                            if v.seq == del_seq {
+                                reclaimed.extend(v.extents.iter().copied());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        if chain.is_empty() {
+                            b.objects.remove(&key);
+                        }
+                    }
+                }
+                if !reclaimed.is_empty() {
+                    self.adjust_live_bytes(&[], &reclaimed);
+                }
+                drop(_cg);
+            }
+
+            // 3. ExpiredObjectDeleteMarker (runs after NoncurrentVersionExpiration in the same tick!)
+            let expired_sole_dms: Vec<(String, u64)> = {
+                let cat = self.catalog.read().unwrap();
+                let Some(b) = cat.buckets.get(&bname) else {
+                    continue;
+                };
+                let mut out = Vec::new();
+                for (key, chain) in &b.objects {
+                    if chain.len() == 1 && chain[0].is_delete_marker {
+                        let remove_dm = lc.rules.iter().any(|rule| {
+                            rule.status == LifecycleRuleStatus::Enabled
+                                && rule
+                                    .expiration
+                                    .is_some_and(|e| e.expired_object_delete_marker == Some(true))
+                                && rule.matches_key_without_tags_or_size(key)
+                        });
+                        if remove_dm {
+                            out.push((key.clone(), chain[0].seq));
+                        }
+                    }
+                }
+                out
+            };
+
+            for (key, dm_seq) in expired_sole_dms {
+                let _kl = self.key_stripe(&bname, &key).lock().await;
+                let still_sole_dm = {
+                    let cat = self.catalog.read().unwrap();
+                    cat.buckets
+                        .get(&bname)
+                        .and_then(|b| b.objects.get(&key))
+                        .is_some_and(|c| {
+                            c.len() == 1 && c[0].is_delete_marker && c[0].seq == dm_seq
+                        })
+                };
+                if !still_sole_dm {
+                    continue;
+                }
+                let _cg = self
+                    .commit_wal(WalOp::DeleteVersionBySeq {
+                        bucket: bname.clone(),
+                        key: key.clone(),
+                        seq: dm_seq,
+                    })
+                    .await?;
+                {
+                    let mut cat = self.catalog.write().unwrap();
+                    if let Some(b) = cat.buckets.get_mut(&bname)
+                        && let Some(chain) = b.objects.get_mut(&key)
+                    {
+                        chain.retain(|v| v.seq != dm_seq);
+                        if chain.is_empty() {
+                            b.objects.remove(&key);
+                        }
+                    }
+                }
+                drop(_cg);
+            }
+
+            // 4. AbortIncompleteMultipartUpload
+            let expired_uploads: Vec<(String, String)> = {
+                let cat = self.catalog.read().unwrap();
+                let Some(b) = cat.buckets.get(&bname) else {
+                    continue;
+                };
+                b.uploads
+                    .iter()
+                    .filter_map(|((k, uid), up)| {
+                        let should_abort = lc.rules.iter().any(|rule| {
+                            if rule.status != LifecycleRuleStatus::Enabled {
+                                return false;
+                            }
+                            let Some(ab) = &rule.abort_incomplete_multipart_upload else {
+                                return false;
+                            };
+                            rule.matches_key_without_tags_or_size(k)
+                                && now_ms.saturating_sub(up.initiated_ms)
+                                    >= i64::from(ab.days_after_initiation).saturating_mul(day_ms)
+                        });
+                        should_abort.then(|| (k.clone(), uid.clone()))
+                    })
+                    .collect()
+            };
+
+            for (key, uid) in expired_uploads {
+                let _kl = self.key_stripe(&bname, &key).lock().await;
+                let still_open = {
+                    let cat = self.catalog.read().unwrap();
+                    cat.buckets
+                        .get(&bname)
+                        .is_some_and(|b| b.uploads.contains_key(&(key.clone(), uid.clone())))
+                };
+                if !still_open {
+                    continue;
+                }
+                let _cg = self
+                    .commit_wal(WalOp::AbortMultipartUpload {
+                        bucket: bname.clone(),
+                        key: key.clone(),
+                        upload_id: uid.clone(),
+                    })
+                    .await?;
+                let mut reclaimed = Vec::new();
+                {
+                    let mut cat = self.catalog.write().unwrap();
+                    if let Some(b) = cat.buckets.get_mut(&bname)
+                        && let Some(removed_up) = b.uploads.remove(&(key, uid))
+                    {
+                        for p in removed_up.parts.into_values() {
+                            reclaimed.extend(p.extents.iter().copied());
+                        }
+                    }
+                }
+                if !reclaimed.is_empty() {
+                    self.adjust_live_bytes(&[], &reclaimed);
+                }
+                drop(_cg);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -5801,6 +7340,7 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
     };
 
     let instance_uuid = hex::encode(engine.format.instance_uuid);
+    let sse_s3_cipher = Aes256Cipher::new(&derive_sse_s3_master_key(&engine.format.instance_uuid));
 
     // Verify ALL checkpoint files in `ckpt/` (including older ones if any exist)
     if let Ok(entries) = disk.read_dir("ckpt") {
@@ -5844,58 +7384,9 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                 if v.is_delete_marker {
                     continue;
                 }
-                let mut md5_h = Md5::new();
-                let mut full_csum_h = ActiveHasher::new(v.checksum.algorithm);
+
+                // 1. Physical block verification (header + CRC32C + extent uniqueness + size)
                 let mut actual_size = 0u64;
-
-                // Track per-part MD5 & checksum boundaries when `v.parts` is present
-                let mut mp_part_idx = 0usize;
-                let mut mp_part_rem = v
-                    .parts
-                    .as_ref()
-                    .and_then(|ps| ps.first())
-                    .map(|p| p.size)
-                    .unwrap_or(0);
-                let mut mp_part_md5 = Md5::new();
-                let mut mp_md5_concat: Vec<u8> = Vec::new();
-                let mut mp_part_csum_h = v
-                    .parts
-                    .as_ref()
-                    .and_then(|ps| ps.first())
-                    .and_then(|p| p.checksum.as_ref())
-                    .map(|(alg, _)| ActiveHasher::new(*alg));
-                let mut mp_part_csum_b64s: Vec<String> = Vec::new();
-
-                // Advance past any 0-byte leading parts
-                if let Some(parts) = &v.parts {
-                    while mp_part_idx < parts.len() && mp_part_rem == 0 {
-                        let p = &parts[mp_part_idx];
-                        let d: [u8; 16] = std::mem::take(&mut mp_part_md5).finalize().into();
-                        mp_md5_concat.extend_from_slice(&d);
-                        if let Some((alg, ref exp_b64)) = p.checksum {
-                            let calc_b64 = mp_part_csum_h
-                                .take()
-                                .unwrap_or_else(|| ActiveHasher::new(alg))
-                                .finalize_b64();
-                            if &calc_b64 != exp_b64 {
-                                errors.push(format!(
-                                    "{bname}/{key}: part {} checksum mismatch expected {exp_b64}, got {calc_b64}",
-                                    p.part_number
-                                ));
-                            }
-                            mp_part_csum_b64s.push(calc_b64);
-                        }
-                        mp_part_idx += 1;
-                        if mp_part_idx < parts.len() {
-                            mp_part_rem = parts[mp_part_idx].size;
-                            mp_part_csum_h = parts[mp_part_idx]
-                                .checksum
-                                .as_ref()
-                                .map(|(alg, _)| ActiveHasher::new(*alg));
-                        }
-                    }
-                }
-
                 let mut read_ok = true;
                 for ext in v.extents.iter() {
                     if !seen_extents.insert((ext.seg_id, ext.offset)) {
@@ -5928,52 +7419,10 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                                     "{bname}/{key}: block CRC mismatch seg {} off {}",
                                     ext.seg_id, ext.offset
                                 ));
+                                read_ok = false;
                             }
-                            md5_h.update(payload);
-                            full_csum_h.update(payload);
                             actual_size += payload.len() as u64;
                             bytes_verified += payload.len() as u64;
-
-                            if let Some(parts) = &v.parts {
-                                let mut rem_slice = payload;
-                                while !rem_slice.is_empty() && mp_part_idx < parts.len() {
-                                    let take = (mp_part_rem as usize).min(rem_slice.len());
-                                    let chunk = &rem_slice[..take];
-                                    rem_slice = &rem_slice[take..];
-                                    mp_part_md5.update(chunk);
-                                    if let Some(h) = &mut mp_part_csum_h {
-                                        h.update(chunk);
-                                    }
-                                    mp_part_rem -= take as u64;
-                                    while mp_part_idx < parts.len() && mp_part_rem == 0 {
-                                        let p = &parts[mp_part_idx];
-                                        let d: [u8; 16] =
-                                            std::mem::take(&mut mp_part_md5).finalize().into();
-                                        mp_md5_concat.extend_from_slice(&d);
-                                        if let Some((alg, ref exp_b64)) = p.checksum {
-                                            let calc_b64 = mp_part_csum_h
-                                                .take()
-                                                .unwrap_or_else(|| ActiveHasher::new(alg))
-                                                .finalize_b64();
-                                            if &calc_b64 != exp_b64 {
-                                                errors.push(format!(
-                                                    "{bname}/{key}: part {} checksum mismatch expected {exp_b64}, got {calc_b64}",
-                                                    p.part_number
-                                                ));
-                                            }
-                                            mp_part_csum_b64s.push(calc_b64);
-                                        }
-                                        mp_part_idx += 1;
-                                        if mp_part_idx < parts.len() {
-                                            mp_part_rem = parts[mp_part_idx].size;
-                                            mp_part_csum_h = parts[mp_part_idx]
-                                                .checksum
-                                                .as_ref()
-                                                .map(|(alg, _)| ActiveHasher::new(*alg));
-                                        }
-                                    }
-                                }
-                            }
                         }
                         Err(msg) => {
                             errors.push(format!("{bname}/{key}: {msg}"));
@@ -5986,6 +7435,7 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                         "{bname}/{key}: size mismatch expected {}, got {}",
                         v.total_size, actual_size
                     ));
+                    read_ok = false;
                 }
                 if let Some(parts) = &v.parts {
                     let parts_sum: u64 = parts.iter().map(|p| p.size).sum();
@@ -5994,18 +7444,183 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                             "{bname}/{key}: multipart part sizes sum {parts_sum} != {}",
                             v.total_size
                         ));
-                    } else if read_ok {
-                        let outer_md5: [u8; 16] = Md5::digest(&mp_md5_concat).into();
-                        let expected_etag =
-                            format!("\"{}-{}\"", hex::encode(outer_md5), parts.len());
-                        if expected_etag != v.etag {
-                            errors.push(format!(
-                                "{bname}/{key}: multipart ETag mismatch expected {}, got {}",
-                                v.etag, expected_etag
-                            ));
+                        read_ok = false;
+                    }
+                }
+
+                // 2. Plaintext MD5 / ETag / Checksum verification
+                // (SSE-C raw customer keys are NEVER stored on disk, so SSE-C skips plaintext hashing
+                //  except composite checksum combination from stored per-part checksums.)
+                let can_decrypt_plaintext = match v.sse {
+                    SseStoredMeta::None | SseStoredMeta::SseS3 { .. } => true,
+                    SseStoredMeta::SseC { .. } => false,
+                };
+                if read_ok && !can_decrypt_plaintext {
+                    if !v.checksum.value_b64.is_empty()
+                        && v.checksum.checksum_type == ChecksumType::Composite
+                        && let Some(parts) = &v.parts
+                    {
+                        let part_b64s: Vec<String> = parts
+                            .iter()
+                            .filter_map(|p| p.checksum.as_ref().map(|(_, b64)| b64.clone()))
+                            .collect();
+                        match compute_composite_checksum_b64(v.checksum.algorithm, &part_b64s) {
+                            Ok(calc_b64) if calc_b64 != v.checksum.value_b64 => {
+                                errors.push(format!(
+                                    "{bname}/{key}: composite {} checksum mismatch expected {}, got {}",
+                                    v.checksum.algorithm.as_aws_str(),
+                                    v.checksum.value_b64,
+                                    calc_b64
+                                ));
+                            }
+                            Err(e) => errors.push(format!(
+                                "{bname}/{key}: composite checksum compute failed: {e}"
+                            )),
+                            Ok(_) => {}
                         }
                     }
-                } else if read_ok {
+                    continue;
+                }
+
+                if !read_ok {
+                    continue;
+                }
+
+                let ver_iv_opt = match v.sse {
+                    SseStoredMeta::None => None,
+                    SseStoredMeta::SseS3 { iv } => Some(iv),
+                    SseStoredMeta::SseC { .. } => unreachable!(),
+                };
+                let slices = build_extent_read_slices(
+                    &v.extents,
+                    v.parts.as_deref(),
+                    ver_iv_opt,
+                    0,
+                    v.total_size,
+                );
+
+                let mut md5_h = Md5::new();
+                let mut full_csum_h = ActiveHasher::new(v.checksum.algorithm);
+
+                let mut mp_part_idx = 0usize;
+                let mut mp_part_rem = v
+                    .parts
+                    .as_ref()
+                    .and_then(|ps| ps.first())
+                    .map(|p| p.size)
+                    .unwrap_or(0);
+                let mut mp_part_md5 = Md5::new();
+                let mut mp_md5_concat: Vec<u8> = Vec::new();
+                let mut mp_part_csum_h = v
+                    .parts
+                    .as_ref()
+                    .and_then(|ps| ps.first())
+                    .and_then(|p| p.checksum.as_ref())
+                    .map(|(alg, _)| ActiveHasher::new(*alg));
+                let mut mp_part_csum_b64s: Vec<String> = Vec::new();
+
+                if let Some(parts) = &v.parts {
+                    while mp_part_idx < parts.len() && mp_part_rem == 0 {
+                        let p = &parts[mp_part_idx];
+                        let d: [u8; 16] = std::mem::take(&mut mp_part_md5).finalize().into();
+                        mp_md5_concat.extend_from_slice(&d);
+                        if let Some((alg, ref exp_b64)) = p.checksum {
+                            let calc_b64 = mp_part_csum_h
+                                .take()
+                                .unwrap_or_else(|| ActiveHasher::new(alg))
+                                .finalize_b64();
+                            if &calc_b64 != exp_b64 {
+                                errors.push(format!(
+                                    "{bname}/{key}: part {} checksum mismatch expected {exp_b64}, got {calc_b64}",
+                                    p.part_number
+                                ));
+                            }
+                            mp_part_csum_b64s.push(calc_b64);
+                        }
+                        mp_part_idx += 1;
+                        if mp_part_idx < parts.len() {
+                            mp_part_rem = parts[mp_part_idx].size;
+                            mp_part_csum_h = parts[mp_part_idx]
+                                .checksum
+                                .as_ref()
+                                .map(|(alg, _)| ActiveHasher::new(*alg));
+                        }
+                    }
+                }
+
+                let mut cached_ext: Option<(u32, u64)> = None;
+                let mut raw_buf: Vec<u8> = Vec::new();
+                let mut dec_buf: Vec<u8> = Vec::new();
+
+                for rs in slices {
+                    let ext = rs.ext;
+                    if cached_ext != Some((ext.seg_id, ext.offset)) {
+                        let slot = mgr.segments.get(&ext.seg_id).unwrap();
+                        raw_buf.resize(ext.physical_bytes() as usize, 0);
+                        slot.file.read_exact_at(ext.offset, &mut raw_buf).unwrap();
+                        cached_ext = Some((ext.seg_id, ext.offset));
+                    }
+                    dec_buf.clear();
+                    dec_buf.extend_from_slice(&raw_buf[(12 + rs.rel_s)..(12 + rs.rel_e)]);
+                    if let Some((iv, ctr_off)) = rs.ctr {
+                        aes256_ctr_xor_with_cipher(&sse_s3_cipher, &iv, ctr_off, &mut dec_buf);
+                    }
+                    let payload: &[u8] = &dec_buf;
+                    md5_h.update(payload);
+                    full_csum_h.update(payload);
+
+                    if let Some(parts) = &v.parts {
+                        let mut rem_slice = payload;
+                        while !rem_slice.is_empty() && mp_part_idx < parts.len() {
+                            let take = (mp_part_rem as usize).min(rem_slice.len());
+                            let chunk = &rem_slice[..take];
+                            rem_slice = &rem_slice[take..];
+                            mp_part_md5.update(chunk);
+                            if let Some(h) = &mut mp_part_csum_h {
+                                h.update(chunk);
+                            }
+                            mp_part_rem -= take as u64;
+                            while mp_part_idx < parts.len() && mp_part_rem == 0 {
+                                let p = &parts[mp_part_idx];
+                                let d: [u8; 16] =
+                                    std::mem::take(&mut mp_part_md5).finalize().into();
+                                mp_md5_concat.extend_from_slice(&d);
+                                if let Some((alg, ref exp_b64)) = p.checksum {
+                                    let calc_b64 = mp_part_csum_h
+                                        .take()
+                                        .unwrap_or_else(|| ActiveHasher::new(alg))
+                                        .finalize_b64();
+                                    if &calc_b64 != exp_b64 {
+                                        errors.push(format!(
+                                            "{bname}/{key}: part {} checksum mismatch expected {exp_b64}, got {calc_b64}",
+                                            p.part_number
+                                        ));
+                                    }
+                                    mp_part_csum_b64s.push(calc_b64);
+                                }
+                                mp_part_idx += 1;
+                                if mp_part_idx < parts.len() {
+                                    mp_part_rem = parts[mp_part_idx].size;
+                                    mp_part_csum_h = parts[mp_part_idx]
+                                        .checksum
+                                        .as_ref()
+                                        .map(|(alg, _)| ActiveHasher::new(*alg));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(parts) = &v.parts {
+                    let outer_md5: [u8; 16] = Md5::digest(&mp_md5_concat).into();
+                    let expected_etag = format!("\"{}-{}\"", hex::encode(outer_md5), parts.len());
+                    if expected_etag != v.etag {
+                        errors.push(format!(
+                            "{bname}/{key}: multipart ETag mismatch expected {}, got {}",
+                            v.etag, expected_etag
+                        ));
+                    }
+                } else {
                     let expected_etag = format!("\"{}\"", hex::encode(md5_h.finalize()));
                     if expected_etag != v.etag {
                         errors.push(format!(
@@ -6015,7 +7630,7 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                     }
                 }
 
-                if read_ok && !v.checksum.value_b64.is_empty() {
+                if !v.checksum.value_b64.is_empty() {
                     match v.checksum.checksum_type {
                         ChecksumType::FullObject => {
                             let calc_b64 = full_csum_h.finalize_b64();
@@ -6058,6 +7673,13 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                 let mut part_md5 = Md5::new();
                 let mut part_csum_h = p.checksum.as_ref().map(|(alg, _)| ActiveHasher::new(*alg));
                 let mut read_ok = true;
+                let part_sse_s3_iv = match up.sse {
+                    SseStoredMeta::SseS3 { iv } => Some(p.sse_iv.unwrap_or(iv)),
+                    _ => None,
+                };
+                let can_verify_plain = !matches!(up.sse, SseStoredMeta::SseC { .. });
+                let mut plain_off = 0u64;
+
                 for ext in p.extents.iter() {
                     if !seen_extents.insert((ext.seg_id, ext.offset)) {
                         errors.push(format!(
@@ -6085,7 +7707,7 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                     let hdr: [u8; 12] = raw[0..12].try_into().unwrap();
                     match decode_block_header(&hdr) {
                         Ok((len, crc)) => {
-                            let payload = &raw[12..];
+                            let payload = &mut raw[12..];
                             if len != ext.len
                                 || crc != ext.crc32c
                                 || crc32c::crc32c(payload) != ext.crc32c
@@ -6094,11 +7716,23 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                                     "{bname}/{key} upload {uid} part {}: block CRC mismatch",
                                     p.part_number
                                 ));
+                                read_ok = false;
                             }
-                            part_md5.update(payload);
-                            if let Some(h) = &mut part_csum_h {
-                                h.update(payload);
+                            if can_verify_plain {
+                                if let Some(piv) = part_sse_s3_iv {
+                                    aes256_ctr_xor_with_cipher(
+                                        &sse_s3_cipher,
+                                        &piv,
+                                        plain_off,
+                                        payload,
+                                    );
+                                }
+                                part_md5.update(&*payload);
+                                if let Some(h) = &mut part_csum_h {
+                                    h.update(&*payload);
+                                }
                             }
+                            plain_off += payload.len() as u64;
                             part_bytes += payload.len() as u64;
                             bytes_verified += payload.len() as u64;
                         }
@@ -6116,7 +7750,7 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                         "{bname}/{key} upload {uid} part {}: size mismatch expected {}, got {part_bytes}",
                         p.part_number, p.size
                     ));
-                } else if read_ok {
+                } else if read_ok && can_verify_plain {
                     let md5_arr: [u8; 16] = part_md5.finalize().into();
                     if md5_arr != p.md5 {
                         errors.push(format!(

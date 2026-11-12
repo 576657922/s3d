@@ -167,10 +167,11 @@ pub async fn run_production_server(
         "s3d started and ready"
     );
 
-    // Background periodic checkpoint & compaction loop (§8.5, §8.7)
+    // Background periodic lifecycle, checkpoint & compaction loop (§8.5, §8.7, PR-39..40)
     let (maint_stop_tx, mut maint_stop_rx) = watch::channel(false);
     let maint_engine = Arc::clone(&engine);
     let ckpt_interval_dur = Duration::from_millis(ckpt_interval_ms.max(1_000));
+    let lc_debug_interval_secs = cfg.lc_debug_interval_secs;
     let maint_handle = tokio::spawn(async move {
         let mut last_ckpt = Instant::now();
         let mut ticks = 0u64;
@@ -182,6 +183,13 @@ pub async fn run_production_server(
                         continue;
                     }
                     ticks += 1;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    if let Err(e) = maint_engine.run_lifecycle_tick(now_ms, lc_debug_interval_secs).await {
+                        warn!(%e, "background lifecycle tick failed");
+                    }
                     if maint_engine.should_checkpoint() || last_ckpt.elapsed() >= ckpt_interval_dur {
                         if let Err(e) = maint_engine.write_checkpoint().await {
                             warn!(%e, "background checkpoint failed");

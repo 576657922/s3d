@@ -19,9 +19,11 @@ use s3d_engine::format::{
 use s3d_engine::{decode_checkpoint_bytes, decode_continuation_token, encode_continuation_token};
 use s3d_proto::{
     aws_uri_encode, parse_acl_grant_header, parse_acl_xml, parse_and_verify_post_object,
-    parse_bucket_versioning_xml, parse_complete_multipart_xml, parse_content_md5_header,
-    parse_cors_xml, parse_create_bucket_xml, parse_delete_objects_xml,
-    parse_http_or_rfc2822_date_ms, parse_iso8601_compact_ms, parse_multipart_boundary,
+    parse_bucket_encryption_xml, parse_bucket_logging_xml, parse_bucket_versioning_xml,
+    parse_complete_multipart_xml, parse_content_md5_header, parse_cors_xml,
+    parse_create_bucket_xml, parse_delete_objects_xml, parse_http_or_rfc2822_date_ms,
+    parse_iso8601_compact_ms, parse_lifecycle_configuration_xml, parse_multipart_boundary,
+    parse_object_legal_hold_xml, parse_object_lock_configuration_xml, parse_object_retention_xml,
     parse_ownership_controls_xml, parse_public_access_block_xml, parse_s3_uri,
     parse_tagging_header, parse_tagging_xml, AwsChunkedDecoder, SigV4Verifier,
     StreamingDigestVerifier,
@@ -29,8 +31,8 @@ use s3d_proto::{
 use s3d_server::router::parse_copy_source_range;
 use s3d_types::{
     AccessControlPolicy, AccountRecord, BucketPolicyDoc, ChecksumAlgorithm, ChecksumState,
-    ChecksumType, ObjectOwnership, OwnerInfo, ParsedRangeHeader, SecretKey, SystemMeta,
-    VersioningStatus, parse_range_header,
+    ChecksumType, ObjectOwnership, OwnerInfo, ParsedRangeHeader, SecretKey, SseStoredMeta,
+    SystemMeta, VersioningStatus, parse_range_header,
 };
 
 fn shared_verifier() -> &'static SigV4Verifier {
@@ -220,6 +222,12 @@ pub fn fuzz_xml_requests(data: &[u8]) {
     let r7 = parse_tagging_xml(data, 50);
     let r8 = parse_cors_xml(data);
     let r9 = parse_public_access_block_xml(data);
+    let r10 = parse_object_lock_configuration_xml(data);
+    let r11 = parse_object_retention_xml(data);
+    let r12 = parse_object_legal_hold_xml(data);
+    let r13 = parse_lifecycle_configuration_xml(data);
+    let r14 = parse_bucket_encryption_xml(data);
+    let r15 = parse_bucket_logging_xml(data, |_| None, |_| None);
 
     // Live security oracle (`NFR-8`): any `<!DOCTYPE` or `<!ENTITY` MUST be rejected!
     if has_xxe {
@@ -235,6 +243,12 @@ pub fn fuzz_xml_requests(data: &[u8]) {
         assert!(r7.is_err(), "XXE bypass in parse_tagging_xml!");
         assert!(r8.is_err(), "XXE bypass in parse_cors_xml!");
         assert!(r9.is_err(), "XXE bypass in parse_public_access_block_xml!");
+        assert!(r10.is_err(), "XXE bypass in parse_object_lock_configuration_xml!");
+        assert!(r11.is_err(), "XXE bypass in parse_object_retention_xml!");
+        assert!(r12.is_err(), "XXE bypass in parse_object_legal_hold_xml!");
+        assert!(r13.is_err(), "XXE bypass in parse_lifecycle_configuration_xml!");
+        assert!(r14.is_err(), "XXE bypass in parse_bucket_encryption_xml!");
+        assert!(r15.is_err(), "XXE bypass in parse_bucket_logging_xml!");
     }
 
     if let Ok(s) = std::str::from_utf8(data) {
@@ -478,6 +492,7 @@ pub fn initial_seed_corpus(target_name: &str) -> Vec<Vec<u8>> {
                     region: "us-east-1".into(),
                     created_ms: 1_700_000_000_000,
                     explicit_ownership: Some(ObjectOwnership::BucketOwnerEnforced),
+                    object_lock_enabled: true,
                 },
                 &mut wal_seed,
             );
@@ -501,6 +516,11 @@ pub fn initial_seed_corpus(target_name: &str) -> Vec<Vec<u8>> {
                 cors: None,
                 policy: None,
                 public_access_block: None,
+                object_lock_enabled: true,
+                object_lock_config: None,
+                lifecycle: None,
+                encryption: None,
+                logging: None,
                 objects: Default::default(),
                 uploads: Default::default(),
                 completed_uploads: Default::default(),
@@ -527,6 +547,9 @@ pub fn initial_seed_corpus(target_name: &str) -> Vec<Vec<u8>> {
                     last_modified_ms: 1_700_000_000_000,
                     extents: Vec::new().into(),
                     parts: None,
+                    sse: SseStoredMeta::None,
+                    retention: None,
+                    legal_hold: None,
                 }],
             );
             cat.buckets.insert("seed-bkt".into(), bkt);

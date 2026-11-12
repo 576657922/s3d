@@ -20,6 +20,7 @@ pub enum S3ErrorCode {
     InvalidArgument,
     InvalidBucketAclWithObjectOwnership,
     InvalidBucketName,
+    InvalidBucketState,
     InvalidDigest,
     InvalidLocationConstraint,
     InvalidPart,
@@ -27,8 +28,10 @@ pub enum S3ErrorCode {
     InvalidPolicyDocument,
     InvalidRange,
     InvalidRequest,
+    InvalidRetentionPeriod,
     InvalidStorageClass,
     InvalidTag,
+    InvalidTargetBucketForLogging,
     InvalidURI,
     KeyTooLongError,
     MalformedACLError,
@@ -42,16 +45,20 @@ pub enum S3ErrorCode {
     NoSuchBucketPolicy,
     NoSuchCorsConfiguration,
     NoSuchKey,
+    NoSuchLifecycleConfiguration,
+    NoSuchObjectLockConfiguration,
     NoSuchPublicAccessBlockConfiguration,
     NoSuchTagSet,
     NoSuchUpload,
     NoSuchVersion,
     NotImplemented,
     NotModified,
+    ObjectLockConfigurationNotFoundError,
     OwnershipControlsNotFoundError,
     PreconditionFailed,
     RequestHeaderSectionTooLarge,
     RequestTimeTooSkewed,
+    ServerSideEncryptionConfigurationNotFoundError,
     SignatureDoesNotMatch,
     SlowDown,
     TooManyBuckets,
@@ -79,8 +86,10 @@ impl S3ErrorCode {
             | Self::InvalidPartOrder
             | Self::InvalidPolicyDocument
             | Self::InvalidRequest
+            | Self::InvalidRetentionPeriod
             | Self::InvalidStorageClass
             | Self::InvalidTag
+            | Self::InvalidTargetBucketForLogging
             | Self::InvalidURI
             | Self::KeyTooLongError
             | Self::MalformedACLError
@@ -101,16 +110,21 @@ impl S3ErrorCode {
             | Self::NoSuchBucketPolicy
             | Self::NoSuchCorsConfiguration
             | Self::NoSuchKey
+            | Self::NoSuchLifecycleConfiguration
+            | Self::NoSuchObjectLockConfiguration
             | Self::NoSuchPublicAccessBlockConfiguration
             | Self::NoSuchTagSet
             | Self::NoSuchUpload
             | Self::NoSuchVersion
-            | Self::OwnershipControlsNotFoundError => 404,
+            | Self::ObjectLockConfigurationNotFoundError
+            | Self::OwnershipControlsNotFoundError
+            | Self::ServerSideEncryptionConfigurationNotFoundError => 404,
             Self::MethodNotAllowed => 405,
             Self::BucketAlreadyExists
             | Self::BucketAlreadyOwnedByYou
             | Self::BucketNotEmpty
-            | Self::ConditionalRequestConflict => 409,
+            | Self::ConditionalRequestConflict
+            | Self::InvalidBucketState => 409,
             Self::MissingContentLength => 411,
             Self::PreconditionFailed => 412,
             Self::InvalidRange => 416,
@@ -140,6 +154,7 @@ impl S3ErrorCode {
             Self::InvalidArgument => "InvalidArgument",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::InvalidBucketName => "InvalidBucketName",
+            Self::InvalidBucketState => "InvalidBucketState",
             Self::InvalidDigest => "InvalidDigest",
             Self::InvalidLocationConstraint => "InvalidLocationConstraint",
             Self::InvalidPart => "InvalidPart",
@@ -147,8 +162,10 @@ impl S3ErrorCode {
             Self::InvalidPolicyDocument => "InvalidPolicyDocument",
             Self::InvalidRange => "InvalidRange",
             Self::InvalidRequest => "InvalidRequest",
+            Self::InvalidRetentionPeriod => "InvalidRetentionPeriod",
             Self::InvalidStorageClass => "InvalidStorageClass",
             Self::InvalidTag => "InvalidTag",
+            Self::InvalidTargetBucketForLogging => "InvalidTargetBucketForLogging",
             Self::InvalidURI => "InvalidURI",
             Self::KeyTooLongError => "KeyTooLongError",
             Self::MalformedACLError => "MalformedACLError",
@@ -162,16 +179,22 @@ impl S3ErrorCode {
             Self::NoSuchBucketPolicy => "NoSuchBucketPolicy",
             Self::NoSuchCorsConfiguration => "NoSuchCorsConfiguration",
             Self::NoSuchKey => "NoSuchKey",
+            Self::NoSuchLifecycleConfiguration => "NoSuchLifecycleConfiguration",
+            Self::NoSuchObjectLockConfiguration => "NoSuchObjectLockConfiguration",
             Self::NoSuchPublicAccessBlockConfiguration => "NoSuchPublicAccessBlockConfiguration",
             Self::NoSuchTagSet => "NoSuchTagSet",
             Self::NoSuchUpload => "NoSuchUpload",
             Self::NoSuchVersion => "NoSuchVersion",
             Self::NotImplemented => "NotImplemented",
             Self::NotModified => "NotModified",
+            Self::ObjectLockConfigurationNotFoundError => "ObjectLockConfigurationNotFoundError",
             Self::OwnershipControlsNotFoundError => "OwnershipControlsNotFoundError",
             Self::PreconditionFailed => "PreconditionFailed",
             Self::RequestHeaderSectionTooLarge => "RequestHeaderSectionTooLarge",
             Self::RequestTimeTooSkewed => "RequestTimeTooSkewed",
+            Self::ServerSideEncryptionConfigurationNotFoundError => {
+                "ServerSideEncryptionConfigurationNotFoundError"
+            }
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             Self::SlowDown => "SlowDown",
             Self::TooManyBuckets => "TooManyBuckets",

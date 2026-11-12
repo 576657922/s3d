@@ -350,6 +350,71 @@ log_format = "json"
             assert len(versions.get("Versions", [])) == 3  # v1, v2, restored-v3
             assert len(versions.get("DeleteMarkers", [])) == 1
 
+            # ---- Phase 4b: P2 SSE-S3 / SSE-C, Object Lock WORM & Lifecycle ----
+            print("[VR-6 P2] Verifying SSE-S3/SSE-C encryption, Object Lock WORM & Lifecycle via boto3...")
+            s3.create_bucket(Bucket="vr6-lock-bkt", ObjectLockEnabledForBucket=True)
+            s3.put_bucket_encryption(
+                Bucket="vr6-lock-bkt",
+                ServerSideEncryptionConfiguration={
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
+                },
+            )
+            s3.put_bucket_lifecycle_configuration(
+                Bucket="vr6-lock-bkt",
+                LifecycleConfiguration={
+                    "Rules": [
+                        {
+                            "ID": "expire-logs",
+                            "Filter": {"Prefix": "logs/"},
+                            "Status": "Enabled",
+                            "Expiration": {"Days": 7},
+                        }
+                    ]
+                },
+            )
+            def_put = s3.put_object(Bucket="vr6-lock-bkt", Key="logs/default-sse.txt", Body=b"sse-s3-data")
+            assert def_put.get("ServerSideEncryption") == "AES256"
+            assert 'rule-id="expire-logs"' in def_put.get("Expiration", "")
+
+            ssec_key = os.urandom(32)
+            locked_put = s3.put_object(
+                Bucket="vr6-lock-bkt",
+                Key="worm/secret.bin",
+                Body=b"top-secret-worm-payload",
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=ssec_key,
+                ObjectLockMode="GOVERNANCE",
+                ObjectLockRetainUntilDate="2099-01-01T00:00:00Z",
+                ObjectLockLegalHoldStatus="ON",
+            )
+            locked_vid = locked_put["VersionId"]
+            assert s3.get_object(
+                Bucket="vr6-lock-bkt",
+                Key="worm/secret.bin",
+                VersionId=locked_vid,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=ssec_key,
+            )["Body"].read() == b"top-secret-worm-payload"
+
+            try:
+                s3.delete_object(Bucket="vr6-lock-bkt", Key="worm/secret.bin", VersionId=locked_vid)
+                raise AssertionError("Expected 403 AccessDenied on WORM-locked version")
+            except ClientError as e:
+                assert e.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+            s3.put_object_legal_hold(
+                Bucket="vr6-lock-bkt",
+                Key="worm/secret.bin",
+                VersionId=locked_vid,
+                LegalHold={"Status": "OFF"},
+            )
+            s3.delete_object(
+                Bucket="vr6-lock-bkt",
+                Key="worm/secret.bin",
+                VersionId=locked_vid,
+                BypassGovernanceRetention=True,
+            )
+
         finally:
             print("[VR-6 5/5] Graceful SIGTERM shutdown + offline `s3d fsck`...")
             proc.send_signal(signal.SIGTERM)

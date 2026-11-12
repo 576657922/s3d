@@ -59,6 +59,7 @@ fn scenario_gc_vs_rw() {
                 location_constraint: None,
                 object_ownership: None,
                 acl: None,
+                object_lock_enabled: false,
             })
             .await
             .unwrap();
@@ -76,6 +77,8 @@ fn scenario_gc_vs_rw() {
                         tags: None,
                         preconditions: Preconditions::default(),
                         max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
                     },
                     InMemoryVerifiedStream::from_bytes(Bytes::from(vec![0x11; 900]), None),
                 )
@@ -101,6 +104,8 @@ fn scenario_gc_vs_rw() {
                         tags: None,
                         preconditions: Preconditions::default(),
                         max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
                     },
                     InMemoryVerifiedStream::from_bytes(Bytes::from(vec![fill; 900]), None),
                 )
@@ -118,6 +123,7 @@ fn scenario_gc_vs_rw() {
                         part_number: None,
                         preconditions: Preconditions::default(),
                         checksum_mode_enabled: false,
+                        raw_sse: RawSseHeaders::default(),
                     })
                     .await
                     .unwrap();
@@ -159,6 +165,7 @@ fn scenario_multipart_complete_vs_abort() {
                 location_constraint: None,
                 object_ownership: None,
                 acl: None,
+                object_lock_enabled: false,
             })
             .await
             .unwrap();
@@ -174,6 +181,8 @@ fn scenario_multipart_complete_vs_abort() {
                 tags: None,
                 checksum_algorithm: None,
                 checksum_type: None,
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
             })
             .await
             .unwrap();
@@ -192,6 +201,7 @@ fn scenario_multipart_complete_vs_abort() {
                     upload_id: u1,
                     part_number: 1,
                     max_bytes_limit: MAX_PART_SIZE_BYTES,
+                    raw_sse: RawSseHeaders::default(),
                 },
                 InMemoryVerifiedStream::from_bytes(Bytes::from(vec![0xAA; 1024]), None),
             )
@@ -211,6 +221,7 @@ fn scenario_multipart_complete_vs_abort() {
                     upload_id: u2,
                     part_number: 1,
                     max_bytes_limit: MAX_PART_SIZE_BYTES,
+                    raw_sse: RawSseHeaders::default(),
                 },
                 InMemoryVerifiedStream::from_bytes(Bytes::from(vec![0xBB; 2048]), None),
             )
@@ -255,6 +266,7 @@ fn scenario_multipart_complete_vs_abort() {
                 preconditions: Preconditions::default(),
                 expected_object_size: None,
                 expected_checksum: None,
+                raw_sse: RawSseHeaders::default(),
             })
             .await
         });
@@ -285,6 +297,7 @@ fn scenario_multipart_complete_vs_abort() {
                 part_number: None,
                 preconditions: Preconditions::default(),
                 checksum_mode_enabled: false,
+                raw_sse: RawSseHeaders::default(),
             })
             .await;
 
@@ -319,6 +332,7 @@ fn scenario_conditional_write_mutex() {
                 location_constraint: None,
                 object_ownership: None,
                 acl: None,
+                object_lock_enabled: false,
             })
             .await
             .unwrap();
@@ -343,6 +357,8 @@ fn scenario_conditional_write_mutex() {
                             ..Default::default()
                         },
                         max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
                     },
                     InMemoryVerifiedStream::from_bytes(Bytes::from(vec![tid; 64]), None),
                 )
@@ -386,6 +402,8 @@ fn scenario_conditional_write_mutex() {
                             ..Default::default()
                         },
                         max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
                     },
                     InMemoryVerifiedStream::from_bytes(Bytes::from(vec![0x90 + tid; 64]), None),
                 )
@@ -404,6 +422,7 @@ fn scenario_conditional_write_mutex() {
                     key: "mutex-key".into(),
                     version_id: None,
                     if_match: Some(vec![et]),
+                    bypass_governance: false,
                 })
                 .await
                 .map(|_| ())
@@ -424,28 +443,51 @@ fn scenario_conditional_write_mutex() {
     });
 }
 
+fn run_shuttle_random<F>(f: F, iterations: usize)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let mut cfg = shuttle::Config::new();
+    cfg.stack_size = 512 * 1024;
+    let runner = shuttle::Runner::new(shuttle::scheduler::RandomScheduler::new(iterations), cfg);
+    runner.run(f);
+}
+
+fn run_shuttle_seed<F>(f: F, seed: u64, iterations: usize)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let mut cfg = shuttle::Config::new();
+    cfg.stack_size = 512 * 1024;
+    let runner = shuttle::Runner::new(
+        shuttle::scheduler::RandomScheduler::new_from_seed(seed, iterations),
+        cfg,
+    );
+    runner.run(f);
+}
+
 #[test]
 fn shuttle_regression_inflight_segment_rollover_vs_gc_seeds() {
     // Regression seeds discovered during M3 VR-4 that caught newly-sealed segments
     // being reclaimed by GC before in-flight writers completed catalog + live_bytes commit.
-    shuttle::check_random_with_seed(scenario_gc_vs_rw, 13444799941140065528, 1);
-    shuttle::check_random_with_seed(scenario_gc_vs_rw, 3189285914870582412, 1);
+    run_shuttle_seed(scenario_gc_vs_rw, 13444799941140065528, 1);
+    run_shuttle_seed(scenario_gc_vs_rw, 3189285914870582412, 1);
 }
 
 #[test]
 fn shuttle_ci_1000_schedules() {
-    shuttle::check_random(scenario_gc_vs_rw, 340);
-    shuttle::check_random(scenario_multipart_complete_vs_abort, 330);
-    shuttle::check_random(scenario_conditional_write_mutex, 330);
+    run_shuttle_random(scenario_gc_vs_rw, 340);
+    run_shuttle_random(scenario_multipart_complete_vs_abort, 330);
+    run_shuttle_random(scenario_conditional_write_mutex, 330);
 }
 
 #[test]
 #[ignore]
 fn vr4_shuttle_10k_m3_gate() {
     let t0 = std::time::Instant::now();
-    shuttle::check_random(scenario_gc_vs_rw, 3_400);
-    shuttle::check_random(scenario_multipart_complete_vs_abort, 3_300);
-    shuttle::check_random(scenario_conditional_write_mutex, 3_300);
+    run_shuttle_random(scenario_gc_vs_rw, 3_400);
+    run_shuttle_random(scenario_multipart_complete_vs_abort, 3_300);
+    run_shuttle_random(scenario_conditional_write_mutex, 3_300);
     eprintln!(
         "VR-4 Shuttle M3 gate passed: 10,000 randomized concurrency schedules verified in {:.2}s, 0 failures.",
         t0.elapsed().as_secs_f64()

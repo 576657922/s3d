@@ -81,9 +81,10 @@ flowchart LR
   - [x] `VR-5` / `VR-6` / `VR-10` 回归与 `s3d fsck` 零错误：439 项 P0+P1 用例保持 **422 / 439** 零退化（存档 [`reports/m3-junit.xml`](../reports/m3-junit.xml)），`vr6_real_clients.py` 1 GiB 分片上传 **607 MiB/s** / 下载 **1,356 MiB/s** 全绿，全工作区 `unsafe_code = "forbid"`（仅 `s3d-disk/src/os.rs` 两处带 `// SAFETY:` 注释的 POSIX FFI 包装）且通过 `cargo +nightly miri test --workspace --lib`（0 UB / 0 泄漏）与 `cargo clippy --workspace --all-targets -- -D warnings`（0 警告），`s3d fsck` 对全部验收数据集报告 `0` 错误。
 
 ### M4 · P2 企业级特性（选做）
-- **核心交付**：对象锁（Governance / Compliance 保留期与 Legal Hold）、生命周期过期后台执行器（`?lifecycle`）、服务端加密（SSE-S3 与 SSE-C）、桶日志配置（`?logging`）及可选 TLS / 扩展哈希算法。
-- **M4 退出门槛**：
-  - [ ] P2 目标集通过 **≥ 85 / 106**（参数化用例全展开项通过计 1 函数），且 P0/P1/M3 各项指标无退化。
+- **核心交付**：对象锁（Governance / Compliance 保留期与 Legal Hold，含后置开启与版本控制状态联动）、生命周期过期后台执行器（`?lifecycle` v1/v2 双格式、`x-amz-expiration` 动态响应头与 `--lc-debug-interval` 秒级清扫）、服务端加密（`?encryption` 桶默认加密、SSE-S3 与 SSE-C **AES-256-CTR** 寻址流式加密及零明文客户密钥持久化）、桶日志配置（`?logging` 及 `logging.s3.amazonaws.com` 服务主体桶策略校验），并在 `s3d-model`、`VR-2`/`VR-3`、`s3d-fuzz` 与 `VR-6` 中同步完成 1:1 语义闭环。
+- **M4 退出门槛（已全部达成）**：
+  - [x] P2 目标集通过 **104 / 106**（98.1%，远超 **≥ 85 / 106** 门槛；其中 `object_lock` **39 / 39**、`lifecycle` **20 / 20**、`encryption` **41 / 41**［含参数化 `test_copy_enc` 16/16 与 `test_copy_part_enc` 4/4 全展开项全过］、`logging` **4 / 6**，仅余 2 项上游 Ceph RGW `TargetGrants`/`NoSuchKey`/`?requestPayment` 分歧登记于 `docs/deviations.md`）；全量 545 个目标用例累计通过 **526 / 545**（96.5%，P0 保持 **240 / 249**、P1 保持 **182 / 190** 零退化，0 项 `DEFERRED_MILESTONE`，存档 [`reports/m4-junit.xml`](../reports/m4-junit.xml)）；
+  - [x] M3 正确性、安全与离线校验指标零退化：`cargo clippy --workspace --all-targets -- -D warnings` 零警告、`cargo test --workspace` 全绿（含 P2 扩展后的 `VR-2` 差分对拍、`VR-3` 检查点+WAL 随机掉电恢复、`VR-4` Loom/Shuttle/WGL HTTP 线性一致性）、`cargo +nightly miri test --workspace --lib` 零 UB / 零泄漏（覆盖纯安全 Rust `Aes256Cipher` 与 `p2` 核心库）、`s3d-fuzz` 8 目标含 6 个 P2 XML 解析器零崩溃、`vr6_real_clients.py`（含真实 `boto3` SSE-S3/SSE-C、Object Lock WORM、Lifecycle 与 1 GiB 分片吞吐）全绿、`s3d fsck` 全程 `0` 错误。
 
 ---
 
