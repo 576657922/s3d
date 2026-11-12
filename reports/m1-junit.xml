@@ -1,0 +1,455 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="8" skipped="1" tests="249" time="110.931" timestamp="2026-11-12T12:08:11.519038+09:00" hostname="usernoMacBook-Pro.local"><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_empty" time="0.193" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_distinct" time="0.105" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_many" time="0.121" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_many" time="0.119" /><testcase classname="s3tests.functional.test_s3" name="test_basic_key_count" time="0.154" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_basic" time="0.127" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_basic" time="0.131" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_encoding_basic" time="0.130" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_encoding_basic" time="0.123" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_prefix" time="0.210" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_prefix" time="0.176" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_prefix_ends_with_delimiter" time="0.079" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_prefix_ends_with_delimiter" time="0.072" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_alt" time="0.133" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_alt" time="0.132" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_prefix_underscore" time="0.209" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_prefix_underscore" time="0.177" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_percentage" time="0.141" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_percentage" time="0.129" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_whitespace" time="0.132" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_whitespace" time="0.126" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_dot" time="0.137" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_dot" time="0.131" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_unreadable" time="0.135" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_unreadable" time="0.128" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_empty" time="0.136" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_empty" time="0.151" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_none" time="0.167" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_none" time="0.133" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_fetchowner_notempty" time="0.114" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_fetchowner_defaultempty" time="0.119" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_fetchowner_empty" time="0.113" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_not_exist" time="0.133" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_delimiter_not_exist" time="0.144" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_delimiter_not_skip_special" time="19.139" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_basic" time="0.115" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_basic" time="0.119" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_alt" time="0.116" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_alt" time="0.174" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_empty" time="0.112" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_empty" time="0.247" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_none" time="0.124" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_none" time="0.117" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_not_exist" time="0.119" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_not_exist" time="0.118" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_unreadable" time="0.112"><failure message="AssertionError: assert '%0A' == '\n'&#10;  &#10;  Strings contain only whitespace, escaping them using repr()&#10;  - '\n'&#10;  + '%0A'">def test_bucket_list_prefix_unreadable():
+        key_names = ['foo/bar', 'foo/baz', 'quux']
+        bucket_name = _create_objects(keys=key_names)
+        client = get_client()
+    
+        response = client.list_objects(Bucket=bucket_name, Prefix='\x0a')
+&gt;       assert response['Prefix'] == '\x0a'
+E       AssertionError: assert '%0A' == '\n'
+E         
+E         Strings contain only whitespace, escaping them using repr()
+E         - '\n'
+E         + '%0A'
+
+s3tests/functional/test_s3.py:839: AssertionError</failure></testcase><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_unreadable" time="0.115" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_delimiter_basic" time="0.129" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_delimiter_basic" time="0.137" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_delimiter_alt" time="0.130" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_delimiter_alt" time="0.125" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_delimiter_prefix_not_exist" time="0.160" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_delimiter_prefix_not_exist" time="0.123" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_delimiter_delimiter_not_exist" time="0.139" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_delimiter_delimiter_not_exist" time="0.139" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_prefix_delimiter_prefix_delimiter_not_exist" time="0.130" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_prefix_delimiter_prefix_delimiter_not_exist" time="0.129" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_maxkeys_one" time="0.132" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_maxkeys_one" time="0.133" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_maxkeys_zero" time="0.127" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_maxkeys_zero" time="0.130" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_maxkeys_none" time="0.131" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_maxkeys_none" time="0.137" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_maxkeys_invalid" time="0.164" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_marker_none" time="0.133" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_marker_empty" time="0.129" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_continuationtoken_empty" time="0.137" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_continuationtoken" time="0.130" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_both_continuationtoken_startafter" time="0.131" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_marker_unreadable" time="0.140" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_startafter_unreadable" time="0.140" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_marker_not_in_list" time="0.129" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_startafter_not_in_list" time="0.154" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_marker_after_list" time="0.129" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_listv2_startafter_after_list" time="0.135" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_notexist" time="0.034" /><testcase classname="s3tests.functional.test_s3" name="test_bucketv2_notexist" time="0.067" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_delete_notexist" time="0.034" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_delete_nonempty" time="0.077" /><testcase classname="s3tests.functional.test_s3" name="test_object_write_to_nonexist_bucket" time="0.034" /><testcase classname="s3tests.functional.test_s3" name="test_object_write_with_chunked_transfer_encoding" time="0.074" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_delete" time="0.055" /><testcase classname="s3tests.functional.test_s3" name="test_object_read_not_exist" time="0.056" /><testcase classname="s3tests.functional.test_s3" name="test_object_requestid_matches_header_on_error" time="0.057" /><testcase classname="s3tests.functional.test_s3" name="test_multi_object_delete" time="0.136" /><testcase classname="s3tests.functional.test_s3" name="test_expected_bucket_owner" time="0.090" /><testcase classname="s3tests.functional.test_s3" name="test_multi_objectv2_delete" time="0.134" /><testcase classname="s3tests.functional.test_s3" name="test_multi_object_delete_key_limit" time="18.819" /><testcase classname="s3tests.functional.test_s3" name="test_multi_objectv2_delete_key_limit" time="19.204" /><testcase classname="s3tests.functional.test_s3" name="test_object_head_zero_bytes" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_object_write_check_etag" time="0.076" /><testcase classname="s3tests.functional.test_s3" name="test_object_write_cache_control" time="0.079" /><testcase classname="s3tests.functional.test_s3" name="test_object_write_expires" time="0.075" /><testcase classname="s3tests.functional.test_s3" name="test_object_write_read_update_read_delete" time="0.085" /><testcase classname="s3tests.functional.test_s3" name="test_object_set_get_metadata_none_to_good" time="0.079" /><testcase classname="s3tests.functional.test_s3" name="test_object_set_get_metadata_none_to_empty" time="0.075" /><testcase classname="s3tests.functional.test_s3" name="test_object_set_get_metadata_overwrite_to_empty" time="0.094" /><testcase classname="s3tests.functional.test_s3" name="test_object_set_get_unicode_metadata" time="0.081" /><testcase classname="s3tests.functional.test_s3" name="test_object_metadata_replaced_on_put" time="0.083" /><testcase classname="s3tests.functional.test_s3" name="test_object_write_file" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifmatch_good" time="0.077" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifmatch_failed" time="0.121" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifnonematch_good" time="0.086" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifnonematch_failed" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifmodifiedsince_good" time="0.077" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifmodifiedsince_failed" time="1.102" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifunmodifiedsince_good" time="0.084" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_ifunmodifiedsince_failed" time="0.079" /><testcase classname="s3tests.functional.test_s3" name="test_put_object_ifmatch_failed" time="0.084" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_get_bucket_gone" time="0.072" /><testcase classname="s3tests.functional.test_s3" name="test_object_delete_key_bucket_gone" time="0.075" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_get_object_gone" time="0.075" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_head" time="0.057" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_head_notexist" time="0.037" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_response_headers" time="0.102" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_authenticated_bucket_gone" time="0.068" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_authenticated_object_gone" time="0.070" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_get_x_amz_expires_not_expired" time="0.072" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_get_x_amz_expires_out_range_zero" time="0.087" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_get_x_amz_expires_out_max_range" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_get_x_amz_expires_out_positive_range" time="0.071" /><testcase classname="s3tests.functional.test_s3" name="test_object_content_encoding_aws_chunked" time="0.121" /><testcase classname="s3tests.functional.test_s3" name="test_object_put_authenticated" time="0.079" /><testcase classname="s3tests.functional.test_s3" name="test_object_raw_put_authenticated_expired" time="0.077" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_bad_short_one" time="0.034" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_bad_short_two" time="0.041" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_good_long_63" time="0.053" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_exists" time="0.054"><failure message="AttributeError: 'BucketAlreadyOwnedByYou' object has no attribute 'status'">def test_bucket_create_exists():
+        # aws-s3 default region allows recreation of buckets
+        # but all other regions fail with BucketAlreadyOwnedByYou.
+        bucket_name = get_new_bucket_name()
+        client = get_client()
+    
+        client.create_bucket(Bucket=bucket_name)
+        try:
+&gt;           response = client.create_bucket(Bucket=bucket_name)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+s3tests/functional/test_s3.py:3845: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../.venv/lib/python3.14/site-packages/botocore/client.py:606: in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../.venv/lib/python3.14/site-packages/botocore/context.py:123: in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;botocore.client.S3 object at 0x104ecb0e0&gt;
+operation_name = 'CreateBucket'
+api_params = {'Bucket': 's3dtest-c7ejajtbbe473fsrrgz55-126'}
+
+    @with_current_context()
+    def _make_api_call(self, operation_name, api_params):
+        operation_model = self._service_model.operation_model(operation_name)
+        service_name = self._service_model.service_name
+        history_recorder.record(
+            'API_CALL',
+            {
+                'service': service_name,
+                'operation': operation_name,
+                'params': api_params,
+            },
+        )
+        if operation_model.deprecated:
+            logger.debug(
+                'Warning: %s.%s() is deprecated', service_name, operation_name
+            )
+        # If the operation has the `auth` property and the client has a
+        # configured auth scheme preference, use both to compute the
+        # auth type. Otherwise, fallback to auth/auth_type resolution.
+        if operation_model.auth and self.meta.config.auth_scheme_preference:
+            preferred_schemes = self.meta.config.auth_scheme_preference.split(
+                ','
+            )
+            auth_type = resolve_auth_scheme_preference(
+                preferred_schemes, operation_model.auth
+            )
+        else:
+            auth_type = operation_model.resolved_auth_type
+        request_context = {
+            'client_region': self.meta.region_name,
+            'client_config': self.meta.config,
+            'has_streaming_input': operation_model.has_streaming_input,
+            'auth_type': auth_type,
+            'unsigned_payload': operation_model.unsigned_payload,
+            'auth_options': self._service_model.metadata.get('auth'),
+        }
+    
+        api_params = self._emit_api_params(
+            api_params=api_params,
+            operation_model=operation_model,
+            context=request_context,
+        )
+        (
+            endpoint_url,
+            additional_headers,
+            properties,
+        ) = self._resolve_endpoint_ruleset(
+            operation_model, api_params, request_context
+        )
+        if properties:
+            # Pass arbitrary endpoint info with the Request
+            # for use during construction.
+            request_context['endpoint_properties'] = properties
+        request_dict = self._convert_to_request_dict(
+            api_params=api_params,
+            operation_model=operation_model,
+            endpoint_url=endpoint_url,
+            context=request_context,
+            headers=additional_headers,
+        )
+        resolve_checksum_context(request_dict, operation_model, api_params)
+    
+        service_id = self._service_model.service_id.hyphenize()
+        handler, event_response = self.meta.events.emit_until_response(
+            f'before-call.{service_id}.{operation_name}',
+            model=operation_model,
+            params=request_dict,
+            request_signer=self._request_signer,
+            context=request_context,
+        )
+    
+        if event_response is not None:
+            http, parsed_response = event_response
+        else:
+            maybe_compress_request(
+                self.meta.config, request_dict, operation_model
+            )
+            apply_request_checksum(request_dict)
+            http, parsed_response = self._make_request(
+                operation_model, request_dict, request_context
+            )
+    
+        self.meta.events.emit(
+            f'after-call.{service_id}.{operation_name}',
+            http_response=http,
+            parsed=parsed_response,
+            model=operation_model,
+            context=request_context,
+        )
+    
+        if http.status_code &gt;= 300:
+            error_info = parsed_response.get("Error", {})
+            error_code = request_context.get(
+                'error_code_override'
+            ) or error_info.get("Code")
+            error_class = self.exceptions.from_code(error_code)
+&gt;           raise error_class(parsed_response, operation_name)
+E           botocore.errorfactory.BucketAlreadyOwnedByYou: An error occurred (BucketAlreadyOwnedByYou) when calling the CreateBucket operation: Your previous request to create the named bucket succeeded and you already own it.
+
+../../.venv/lib/python3.14/site-packages/botocore/client.py:1094: BucketAlreadyOwnedByYou
+
+During handling of the above exception, another exception occurred:
+
+    def test_bucket_create_exists():
+        # aws-s3 default region allows recreation of buckets
+        # but all other regions fail with BucketAlreadyOwnedByYou.
+        bucket_name = get_new_bucket_name()
+        client = get_client()
+    
+        client.create_bucket(Bucket=bucket_name)
+        try:
+            response = client.create_bucket(Bucket=bucket_name)
+        except ClientError as e:
+            status, error_code = _get_status_and_error_code(e.response)
+&gt;           assert e.status == 409
+                   ^^^^^^^^
+E           AttributeError: 'BucketAlreadyOwnedByYou' object has no attribute 'status'
+
+s3tests/functional/test_s3.py:3848: AttributeError</failure></testcase><testcase classname="s3tests.functional.test_s3" name="test_bucket_get_location" time="0.028"><skipped type="pytest.skip" message="no api_name configured">/Users/user/Workspace/scratch/s3/.cache/s3-tests/s3tests/functional/test_s3.py:3855: no api_name configured</skipped></testcase><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_exists_nonowner" time="0.087" /><testcase classname="s3tests.functional.test_s3" name="test_buckets_create_then_list" time="0.119" /><testcase classname="s3tests.functional.test_s3" name="test_buckets_list_ctime" time="0.113" /><testcase classname="s3tests.functional.test_s3" name="test_list_buckets_invalid_auth" time="0.037" /><testcase classname="s3tests.functional.test_s3" name="test_list_buckets_bad_auth" time="0.035" /><testcase classname="s3tests.functional.test_s3" name="test_list_buckets_paginated" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_good_starts_alpha" time="0.059" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_good_starts_digit" time="0.058" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_good_contains_period" time="0.052" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_good_contains_hyphen" time="0.052" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_recreate_not_overriding" time="0.103"><failure message="botocore.errorfactory.BucketAlreadyOwnedByYou: An error occurred (BucketAlreadyOwnedByYou) when calling the CreateBucket operation: Your previous request to create the named bucket succeeded and you already own it.">def test_bucket_recreate_not_overriding():
+        key_names = ['mykey1', 'mykey2']
+        bucket_name = _create_objects(keys=key_names)
+    
+        objs_list = get_objects_list(bucket_name)
+        assert key_names == objs_list
+    
+        client = get_client()
+&gt;       client.create_bucket(Bucket=bucket_name)
+
+s3tests/functional/test_s3.py:5465: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../.venv/lib/python3.14/site-packages/botocore/client.py:606: in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../.venv/lib/python3.14/site-packages/botocore/context.py:123: in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;botocore.client.S3 object at 0x104ecb0e0&gt;
+operation_name = 'CreateBucket'
+api_params = {'Bucket': 's3dtest-c7ejajtbbe473fsrrgz55-140'}
+
+    @with_current_context()
+    def _make_api_call(self, operation_name, api_params):
+        operation_model = self._service_model.operation_model(operation_name)
+        service_name = self._service_model.service_name
+        history_recorder.record(
+            'API_CALL',
+            {
+                'service': service_name,
+                'operation': operation_name,
+                'params': api_params,
+            },
+        )
+        if operation_model.deprecated:
+            logger.debug(
+                'Warning: %s.%s() is deprecated', service_name, operation_name
+            )
+        # If the operation has the `auth` property and the client has a
+        # configured auth scheme preference, use both to compute the
+        # auth type. Otherwise, fallback to auth/auth_type resolution.
+        if operation_model.auth and self.meta.config.auth_scheme_preference:
+            preferred_schemes = self.meta.config.auth_scheme_preference.split(
+                ','
+            )
+            auth_type = resolve_auth_scheme_preference(
+                preferred_schemes, operation_model.auth
+            )
+        else:
+            auth_type = operation_model.resolved_auth_type
+        request_context = {
+            'client_region': self.meta.region_name,
+            'client_config': self.meta.config,
+            'has_streaming_input': operation_model.has_streaming_input,
+            'auth_type': auth_type,
+            'unsigned_payload': operation_model.unsigned_payload,
+            'auth_options': self._service_model.metadata.get('auth'),
+        }
+    
+        api_params = self._emit_api_params(
+            api_params=api_params,
+            operation_model=operation_model,
+            context=request_context,
+        )
+        (
+            endpoint_url,
+            additional_headers,
+            properties,
+        ) = self._resolve_endpoint_ruleset(
+            operation_model, api_params, request_context
+        )
+        if properties:
+            # Pass arbitrary endpoint info with the Request
+            # for use during construction.
+            request_context['endpoint_properties'] = properties
+        request_dict = self._convert_to_request_dict(
+            api_params=api_params,
+            operation_model=operation_model,
+            endpoint_url=endpoint_url,
+            context=request_context,
+            headers=additional_headers,
+        )
+        resolve_checksum_context(request_dict, operation_model, api_params)
+    
+        service_id = self._service_model.service_id.hyphenize()
+        handler, event_response = self.meta.events.emit_until_response(
+            f'before-call.{service_id}.{operation_name}',
+            model=operation_model,
+            params=request_dict,
+            request_signer=self._request_signer,
+            context=request_context,
+        )
+    
+        if event_response is not None:
+            http, parsed_response = event_response
+        else:
+            maybe_compress_request(
+                self.meta.config, request_dict, operation_model
+            )
+            apply_request_checksum(request_dict)
+            http, parsed_response = self._make_request(
+                operation_model, request_dict, request_context
+            )
+    
+        self.meta.events.emit(
+            f'after-call.{service_id}.{operation_name}',
+            http_response=http,
+            parsed=parsed_response,
+            model=operation_model,
+            context=request_context,
+        )
+    
+        if http.status_code &gt;= 300:
+            error_info = parsed_response.get("Error", {})
+            error_code = request_context.get(
+                'error_code_override'
+            ) or error_info.get("Code")
+            error_class = self.exceptions.from_code(error_code)
+&gt;           raise error_class(parsed_response, operation_name)
+E           botocore.errorfactory.BucketAlreadyOwnedByYou: An error occurred (BucketAlreadyOwnedByYou) when calling the CreateBucket operation: Your previous request to create the named bucket succeeded and you already own it.
+
+../../.venv/lib/python3.14/site-packages/botocore/client.py:1094: BucketAlreadyOwnedByYou</failure></testcase><testcase classname="s3tests.functional.test_s3" name="test_bucket_create_special_key_names" time="0.408" /><testcase classname="s3tests.functional.test_s3" name="test_bucket_list_special_prefix" time="0.156" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_zero_size" time="0.130" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_16m" time="0.228" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_same_bucket" time="0.091" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_verify_contenttype" time="0.093" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_to_itself" time="0.079" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_to_itself_with_metadata" time="0.087" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_diff_bucket" time="0.116" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_not_owned_bucket" time="0.097" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_not_owned_object_bucket" time="0.120" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_retaining_metadata" time="0.171" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_replacing_metadata" time="0.182" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_bucket_not_found" time="0.057" /><testcase classname="s3tests.functional.test_s3" name="test_object_copy_key_not_found" time="0.057" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_empty" time="0.096" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_complete_without_create" time="0.058" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_small" time="0.097" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_copy_small" time="0.195" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_copy_invalid_range" time="0.108" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_copy_improper_range" time="0.092" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_copy_without_range" time="0.147" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_copy_special_names" time="0.525" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload" time="0.505" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_resend_part" time="2.965" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_multiple_sizes" time="0.639" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_copy_multiple_sizes" time="0.696" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_size_too_small" time="0.185" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_contents" time="0.274" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_overwrite_existing_object" time="0.215" /><testcase classname="s3tests.functional.test_s3" name="test_abort_multipart_upload" time="0.165" /><testcase classname="s3tests.functional.test_s3" name="test_abort_multipart_upload_not_found" time="0.075" /><testcase classname="s3tests.functional.test_s3" name="test_list_multipart_upload" time="0.269" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_missing_part" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_incorrect_etag" time="0.120" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_get_part" time="13.652" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_single_get_part" time="1.505" /><testcase classname="s3tests.functional.test_s3" name="test_non_multipart_get_part" time="0.081" /><testcase classname="s3tests.functional.test_s3" name="test_100_continue_error_retry" time="0.076" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_read_1mb" time="0.113" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_read_4mb" time="0.152" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_read_8mb" time="0.209" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_write_1mb" time="0.140" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_write_4mb" time="0.176" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_write_8mb" time="0.241" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_dual_write_1mb" time="0.184" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_dual_write_4mb" time="0.217" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_dual_write_8mb" time="0.327" /><testcase classname="s3tests.functional.test_s3" name="test_atomic_multipart_upload_write" time="0.090" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_resend_first_finishes_last" time="0.143" /><testcase classname="s3tests.functional.test_s3" name="test_ranged_request_response_code" time="0.082" /><testcase classname="s3tests.functional.test_s3" name="test_ranged_big_request_response_code" time="1.804" /><testcase classname="s3tests.functional.test_s3" name="test_ranged_request_skip_leading_bytes_response_code" time="0.072" /><testcase classname="s3tests.functional.test_s3" name="test_ranged_request_return_trailing_bytes_response_code" time="0.077" /><testcase classname="s3tests.functional.test_s3" name="test_ranged_request_invalid_range" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_ranged_request_empty_object" time="0.073" /><testcase classname="s3tests.functional.test_s3" name="test_copy_object_ifmatch_good" time="0.096" /><testcase classname="s3tests.functional.test_s3" name="test_copy_object_ifmatch_failed" time="0.081" /><testcase classname="s3tests.functional.test_s3" name="test_copy_object_ifnonematch_good" time="0.109" /><testcase classname="s3tests.functional.test_s3" name="test_copy_object_ifnonematch_failed" time="0.107" /><testcase classname="s3tests.functional.test_s3" name="test_object_read_unreadable" time="0.056" /><testcase classname="s3tests.functional.test_s3" name="test_object_checksum_sha256" time="0.079" /><testcase classname="s3tests.functional.test_s3" name="test_object_checksum_crc64nvme" time="0.077" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_checksum_sha256" time="0.132" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_reupload_checksum_and_etag" time="0.301" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_use_cksum_helper_sha256" time="0.314" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_use_cksum_helper_crc64nvme" time="0.212" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_use_cksum_helper_crc32" time="0.210" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_use_cksum_helper_crc32c" time="0.212" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_use_cksum_helper_sha1" time="0.246" /><testcase classname="s3tests.functional.test_s3" name="test_get_multipart_checksum_object_attributes" time="1.126" /><testcase classname="s3tests.functional.test_s3" name="test_get_multipart_object_attributes" time="0.378" /><testcase classname="s3tests.functional.test_s3" name="test_get_paginated_multipart_object_attributes" time="0.360" /><testcase classname="s3tests.functional.test_s3" name="test_get_single_multipart_object_attributes" time="0.136" /><testcase classname="s3tests.functional.test_s3" name="test_get_checksum_object_attributes" time="0.085" /><testcase classname="s3tests.functional.test_s3" name="test_get_object_attributes" time="0.078" /><testcase classname="s3tests.functional.test_s3" name="test_upload_part_copy_percent_encoded_key" time="0.111" /><testcase classname="s3tests.functional.test_s3" name="test_put_object_if_match" time="0.128" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_put_object_if_match" time="0.336" /><testcase classname="s3tests.functional.test_s3" name="test_put_current_object_if_none_match" time="0.164" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_put_current_object_if_none_match" time="0.255" /><testcase classname="s3tests.functional.test_s3" name="test_put_current_object_if_match" time="0.119" /><testcase classname="s3tests.functional.test_s3" name="test_multipart_put_current_object_if_match" time="0.230" /><testcase classname="s3tests.functional.test_s3" name="test_put_object_current_if_match" time="0.133" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_md5_invalid_short" time="0.089" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_md5_bad" time="0.055" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_md5_empty" time="0.058" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_md5_none" time="0.089" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_expect_mismatch" time="0.087" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_expect_empty" time="0.084" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_expect_none" time="0.089" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_contentlength_empty" time="0.057" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_contentlength_negative" time="0.059" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_contentlength_none" time="0.077"><failure message="AssertionError: ClientError not raised">@pytest.mark.auth_common
+    # TODO: remove 'fails_on_rgw' and once we have learned how to remove the content-length header
+    @pytest.mark.fails_on_rgw
+    def test_object_create_bad_contentlength_none():
+        remove = 'Content-Length'
+&gt;       e = _remove_header_create_bad_object('Content-Length')
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+s3tests/functional/test_headers.py:228: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+s3tests/functional/test_headers.py:84: in _remove_header_create_bad_object
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key_name, Body='bar')
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+excClass = &lt;class 'botocore.exceptions.ClientError'&gt;
+callableObj = &lt;bound method ClientCreator._create_api_method.&lt;locals&gt;._api_call of &lt;botocore.client.S3 object at 0x104ecb0e0&gt;&gt;
+args = ()
+kwargs = {'Bucket': 's3dtest-sby8tp569kujzdjg0ecnh-242', 'Key': 'foo', 'Body': 'bar'}
+
+    def assert_raises(excClass, callableObj, *args, **kwargs):
+        """
+        Like unittest.TestCase.assertRaises, but returns the exception.
+        """
+        try:
+            callableObj(*args, **kwargs)
+        except excClass as e:
+            return e
+        else:
+            if hasattr(excClass, '__name__'):
+                excName = excClass.__name__
+            else:
+                excName = str(excClass)
+&gt;           raise AssertionError("%s not raised" % excName)
+E           AssertionError: ClientError not raised
+
+s3tests/functional/utils.py:19: AssertionError</failure></testcase><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_contenttype_invalid" time="0.092" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_contenttype_empty" time="0.072" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_contenttype_none" time="0.082" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_authorization_empty" time="0.106"><failure message="AssertionError: ClientError not raised">@pytest.mark.auth_common
+    # TODO: remove 'fails_on_rgw' and once we have learned how to remove the authorization header
+    @pytest.mark.fails_on_rgw
+    def test_object_create_bad_authorization_empty():
+&gt;       e = _add_header_create_bad_object({'Authorization': ''})
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+s3tests/functional/test_headers.py:259: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+s3tests/functional/test_headers.py:47: in _add_header_create_bad_object
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key_name, Body='bar')
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+excClass = &lt;class 'botocore.exceptions.ClientError'&gt;
+callableObj = &lt;bound method ClientCreator._create_api_method.&lt;locals&gt;._api_call of &lt;botocore.client.S3 object at 0x104ecb0e0&gt;&gt;
+args = ()
+kwargs = {'Bucket': 's3dtest-sby8tp569kujzdjg0ecnh-246', 'Key': 'foo', 'Body': 'bar'}
+
+    def assert_raises(excClass, callableObj, *args, **kwargs):
+        """
+        Like unittest.TestCase.assertRaises, but returns the exception.
+        """
+        try:
+            callableObj(*args, **kwargs)
+        except excClass as e:
+            return e
+        else:
+            if hasattr(excClass, '__name__'):
+                excName = excClass.__name__
+            else:
+                excName = str(excClass)
+&gt;           raise AssertionError("%s not raised" % excName)
+E           AssertionError: ClientError not raised
+
+s3tests/functional/utils.py:19: AssertionError</failure></testcase><testcase classname="s3tests.functional.test_headers" name="test_object_create_date_and_amz_date" time="0.084" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_amz_date_and_no_date" time="0.087" /><testcase classname="s3tests.functional.test_headers" name="test_object_create_bad_authorization_none" time="0.077"><failure message="AssertionError: ClientError not raised">@pytest.mark.auth_common
+    # TODO: remove 'fails_on_rgw' and once we have learned how to remove the authorization header
+    @pytest.mark.fails_on_rgw
+    def test_object_create_bad_authorization_none():
+&gt;       e = _remove_header_create_bad_object('Authorization')
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+s3tests/functional/test_headers.py:286: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+s3tests/functional/test_headers.py:84: in _remove_header_create_bad_object
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key_name, Body='bar')
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+excClass = &lt;class 'botocore.exceptions.ClientError'&gt;
+callableObj = &lt;bound method ClientCreator._create_api_method.&lt;locals&gt;._api_call of &lt;botocore.client.S3 object at 0x104ecb0e0&gt;&gt;
+args = ()
+kwargs = {'Bucket': 's3dtest-sby8tp569kujzdjg0ecnh-249', 'Key': 'foo', 'Body': 'bar'}
+
+    def assert_raises(excClass, callableObj, *args, **kwargs):
+        """
+        Like unittest.TestCase.assertRaises, but returns the exception.
+        """
+        try:
+            callableObj(*args, **kwargs)
+        except excClass as e:
+            return e
+        else:
+            if hasattr(excClass, '__name__'):
+                excName = excClass.__name__
+            else:
+                excName = str(excClass)
+&gt;           raise AssertionError("%s not raised" % excName)
+E           AssertionError: ClientError not raised
+
+s3tests/functional/utils.py:19: AssertionError</failure></testcase><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_contentlength_none" time="0.049" /><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_bad_expect_mismatch" time="0.051" /><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_bad_expect_empty" time="0.052" /><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_bad_contentlength_empty" time="0.033" /><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_bad_contentlength_negative" time="0.057" /><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_bad_contentlength_none" time="0.062" /><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_bad_authorization_empty" time="0.050"><failure message="AssertionError: ClientError not raised">@pytest.mark.auth_common
+    # TODO: remove 'fails_on_rgw' and once we have learned how to manipulate the authorization header
+    @pytest.mark.fails_on_rgw
+    def test_bucket_create_bad_authorization_empty():
+        headers = {'Authorization': ''}
+&gt;       e = _add_header_create_bad_bucket(headers)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+s3tests/functional/test_headers.py:371: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+s3tests/functional/test_headers.py:114: in _add_header_create_bad_bucket
+    e = assert_raises(ClientError, client.create_bucket, Bucket=bucket_name)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+excClass = &lt;class 'botocore.exceptions.ClientError'&gt;
+callableObj = &lt;bound method ClientCreator._create_api_method.&lt;locals&gt;._api_call of &lt;botocore.client.S3 object at 0x10572a3c0&gt;&gt;
+args = (), kwargs = {'Bucket': 's3dtest-sby8tp569kujzdjg0ecnh-256'}
+
+    def assert_raises(excClass, callableObj, *args, **kwargs):
+        """
+        Like unittest.TestCase.assertRaises, but returns the exception.
+        """
+        try:
+            callableObj(*args, **kwargs)
+        except excClass as e:
+            return e
+        else:
+            if hasattr(excClass, '__name__'):
+                excName = excClass.__name__
+            else:
+                excName = str(excClass)
+&gt;           raise AssertionError("%s not raised" % excName)
+E           AssertionError: ClientError not raised
+
+s3tests/functional/utils.py:19: AssertionError</failure></testcase><testcase classname="s3tests.functional.test_headers" name="test_bucket_create_bad_authorization_none" time="0.050"><failure message="AssertionError: ClientError not raised">@pytest.mark.auth_common
+    # TODO: remove 'fails_on_rgw' and once we have learned how to manipulate the authorization header
+    @pytest.mark.fails_on_rgw
+    def test_bucket_create_bad_authorization_none():
+&gt;       e = _remove_header_create_bad_bucket('Authorization')
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+s3tests/functional/test_headers.py:380: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+s3tests/functional/test_headers.py:149: in _remove_header_create_bad_bucket
+    e = assert_raises(ClientError, client.create_bucket, Bucket=bucket_name)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+excClass = &lt;class 'botocore.exceptions.ClientError'&gt;
+callableObj = &lt;bound method ClientCreator._create_api_method.&lt;locals&gt;._api_call of &lt;botocore.client.S3 object at 0x10572b4d0&gt;&gt;
+args = (), kwargs = {'Bucket': 's3dtest-sby8tp569kujzdjg0ecnh-257'}
+
+    def assert_raises(excClass, callableObj, *args, **kwargs):
+        """
+        Like unittest.TestCase.assertRaises, but returns the exception.
+        """
+        try:
+            callableObj(*args, **kwargs)
+        except excClass as e:
+            return e
+        else:
+            if hasattr(excClass, '__name__'):
+                excName = excClass.__name__
+            else:
+                excName = str(excClass)
+&gt;           raise AssertionError("%s not raised" % excName)
+E           AssertionError: ClientError not raised
+
+s3tests/functional/utils.py:19: AssertionError</failure></testcase></testsuite></testsuites>

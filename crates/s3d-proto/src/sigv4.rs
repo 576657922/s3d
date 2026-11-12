@@ -67,6 +67,23 @@ impl SigV4Verifier {
         &self.region
     }
 
+    pub fn lookup_by_user_id(&self, user_id: &str) -> Option<OwnerInfo> {
+        self.by_access_key
+            .values()
+            .find(|acc| acc.owner.user_id == user_id)
+            .map(|acc| acc.owner.clone())
+    }
+
+    pub fn lookup_by_email(&self, email: &str) -> Option<OwnerInfo> {
+        if email.is_empty() {
+            return None;
+        }
+        self.by_access_key
+            .values()
+            .find(|acc| !acc.owner.email.is_empty() && acc.owner.email.eq_ignore_ascii_case(email))
+            .map(|acc| acc.owner.clone())
+    }
+
     fn derive_signing_key(&self, account: &AccountRecord, date_yyyymmdd: &str) -> [u8; 32] {
         let cache_key = (account.access_key.clone(), date_yyyymmdd.to_string());
         if let Some(&cached) = self.key_cache.read().unwrap().get(&cache_key) {
@@ -681,26 +698,138 @@ fn extract_request_timestamp(headers: &HeaderMap) -> StoreResult<(String, i64)> 
         let s = amz.to_str().map_err(|_| {
             S3Error::new(S3ErrorCode::AccessDenied, "Invalid x-amz-date header")
         })?;
-        let ms = parse_iso8601_compact_ms(s)
-            .map_err(|_| S3Error::new(S3ErrorCode::AccessDenied, "Invalid x-amz-date format"))?;
-        return Ok((s.trim().to_string(), ms));
+        if let Ok(ms) = parse_iso8601_compact_ms(s) {
+            return Ok((s.trim().to_string(), ms));
+        }
+        // Fallback: HTTP-date / RFC 2822 inside `x-amz-date` (botocore converts it to ISO8601 compact in StringToSign)
+        if let Ok(ms) = parse_http_or_rfc2822_date_ms(s) {
+            return Ok((format_iso8601_compact(ms), ms));
+        }
+        return Err(S3Error::new(
+            S3ErrorCode::AccessDenied,
+            "Invalid x-amz-date format",
+        ));
     }
     if let Some(date_hdr) = headers.get("date") {
         let s = date_hdr
             .to_str()
             .map_err(|_| S3Error::new(S3ErrorCode::AccessDenied, "Invalid Date header"))?;
-        let sys_time = httpdate::parse_http_date(s.trim())
+        let ms = parse_http_or_rfc2822_date_ms(s)
             .map_err(|_| S3Error::new(S3ErrorCode::AccessDenied, "Invalid HTTP Date format"))?;
-        let ms = sys_time
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| S3Error::new(S3ErrorCode::AccessDenied, "Date before epoch"))?
-            .as_millis() as i64;
         return Ok((format_iso8601_compact(ms), ms));
     }
     Err(S3Error::new(
         S3ErrorCode::AccessDenied,
         "AWS authentication requires a valid Date or x-amz-date header",
     ))
+}
+
+/// Parse RFC 7231 HTTP-date OR RFC 2822 date (including `±HHMM` numeric offsets such as `-0000`)
+/// into non-negative Unix epoch milliseconds. Pre-epoch (`< 1970-01-01T00:00:00Z`) returns `Err(())`.
+pub fn parse_http_or_rfc2822_date_ms(s: &str) -> Result<i64, ()> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(());
+    }
+    if let Ok(sys_time) = httpdate::parse_http_date(trimmed) {
+        let dur = sys_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ())?;
+        return Ok(dur.as_millis() as i64);
+    }
+
+    let rest = match trimmed.split_once(',') {
+        Some((dow, after)) => {
+            let dow = dow.trim();
+            if !matches!(
+                dow.to_ascii_lowercase().as_str(),
+                "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"
+                    | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday"
+            ) {
+                return Err(());
+            }
+            after.trim()
+        }
+        None => trimmed,
+    };
+
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.len() != 5 {
+        return Err(());
+    }
+    let day: u32 = parts[0].parse().map_err(|_| ())?;
+    let month: u32 = match parts[1].to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return Err(()),
+    };
+    let year: i64 = parts[2].parse().map_err(|_| ())?;
+    if !(1..=9999).contains(&year) {
+        return Err(());
+    }
+    let max_day = days_in_month(year, month);
+    if !(1..=max_day).contains(&day) {
+        return Err(());
+    }
+
+    let hms: Vec<&str> = parts[3].split(':').collect();
+    if hms.len() != 3 || hms.iter().any(|p| p.len() != 2) {
+        return Err(());
+    }
+    let hour: i64 = hms[0].parse().map_err(|_| ())?;
+    let min: i64 = hms[1].parse().map_err(|_| ())?;
+    let sec: i64 = hms[2].parse().map_err(|_| ())?;
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
+        return Err(());
+    }
+
+    let tz = parts[4];
+    let offset_sec: i64 = match tz.to_ascii_uppercase().as_str() {
+        "GMT" | "UTC" | "UT" | "Z" => 0,
+        _ => {
+            let b = tz.as_bytes();
+            if b.len() != 5 || (b[0] != b'+' && b[0] != b'-') || !b[1..].iter().all(|c| c.is_ascii_digit()) {
+                return Err(());
+            }
+            let sign = if b[0] == b'-' { -1i64 } else { 1i64 };
+            let tz_hh: i64 = tz[1..3].parse().map_err(|_| ())?;
+            let tz_mm: i64 = tz[3..5].parse().map_err(|_| ())?;
+            if tz_hh > 23 || tz_mm > 59 {
+                return Err(());
+            }
+            // Note: `-0000` in RFC 2822 denotes UTC (`offset_sec = 0`)
+            sign * (tz_hh * 3600 + tz_mm * 60)
+        }
+    };
+
+    let days = days_from_civil(year, month, day);
+    let utc_sec = days * 86_400 + hour * 3600 + min * 60 + sec - offset_sec;
+    if utc_sec < 0 {
+        return Err(());
+    }
+    Ok(utc_sec * 1000)
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if is_leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 /// Parse `YYYYMMDDTHHMMSSZ` into Unix epoch milliseconds.

@@ -51,6 +51,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("junit_xml", type=Path)
     ap.add_argument("--baseline", type=Path, default=Path("tests/s3tests-passed.txt"))
+    ap.add_argument("--deviations", type=Path, default=Path("docs/deviations.md"))
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--min-passed", type=int, default=0)
     args = ap.parse_args()
@@ -90,8 +91,30 @@ def main() -> int:
         args.baseline.write_text("\n".join(merged) + "\n", encoding="utf-8")
         print(f"Updated baseline {args.baseline}: {len(merged)} cumulative passing functions")
 
+    if args.deviations.exists():
+        dev_txt = args.deviations.read_text(encoding="utf-8")
+        # Extract Section 2 table (before Section 3 if present)
+        sec2 = dev_txt.split("## 3.", 1)[0]
+        registered: set[str] = set()
+        for line in sec2.splitlines():
+            if line.startswith("| `s3tests/"):
+                cell = line.split("|")[1].strip().strip("`")
+                registered.add(cell)
+        unregistered = sorted(set(not_passed.keys()) - registered)
+        if unregistered:
+            print(f"UNREGISTERED DEVIATIONS ({len(unregistered)} unpassed tests missing from {args.deviations}):", file=sys.stderr)
+            for u in unregistered:
+                print(f"  - {u}", file=sys.stderr)
+            return 3
+        stale_in_sec2 = sorted(passed & registered)
+        if stale_in_sec2:
+            print(f"STALE DEVIATIONS ({len(stale_in_sec2)} passing tests still in active table of {args.deviations}):", file=sys.stderr)
+            for s in stale_in_sec2:
+                print(f"  - {s}", file=sys.stderr)
+            return 4
+
     if not_passed:
-        print("\nUnpassed functions in this run:")
+        print("\nUnpassed functions in this run (all registered in docs/deviations.md):")
         for fn, reason in sorted(not_passed.items()):
             print(f"  - {fn} -> {reason[:140]}")
     return 0

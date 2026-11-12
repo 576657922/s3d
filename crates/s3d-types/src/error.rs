@@ -16,6 +16,7 @@ pub enum S3ErrorCode {
     InternalError,
     InvalidAccessKeyId,
     InvalidArgument,
+    InvalidBucketAclWithObjectOwnership,
     InvalidBucketName,
     InvalidDigest,
     InvalidLocationConstraint,
@@ -27,6 +28,7 @@ pub enum S3ErrorCode {
     InvalidTag,
     InvalidURI,
     KeyTooLongError,
+    MalformedACLError,
     MalformedPolicy,
     MalformedXML,
     MetadataTooLarge,
@@ -42,12 +44,14 @@ pub enum S3ErrorCode {
     NoSuchVersion,
     NotImplemented,
     NotModified,
+    OwnershipControlsNotFoundError,
     PreconditionFailed,
     RequestHeaderSectionTooLarge,
     RequestTimeTooSkewed,
     SignatureDoesNotMatch,
     SlowDown,
     TooManyBuckets,
+    UnresolvableGrantByEmailAddress,
     XAmzContentSHA256Mismatch,
 }
 
@@ -62,6 +66,7 @@ impl S3ErrorCode {
             | Self::EntityTooSmall
             | Self::IncompleteBody
             | Self::InvalidArgument
+            | Self::InvalidBucketAclWithObjectOwnership
             | Self::InvalidBucketName
             | Self::InvalidDigest
             | Self::InvalidLocationConstraint
@@ -72,12 +77,14 @@ impl S3ErrorCode {
             | Self::InvalidTag
             | Self::InvalidURI
             | Self::KeyTooLongError
+            | Self::MalformedACLError
             | Self::MalformedPolicy
             | Self::MalformedXML
             | Self::MetadataTooLarge
             | Self::MissingSecurityHeader
             | Self::RequestHeaderSectionTooLarge
             | Self::TooManyBuckets
+            | Self::UnresolvableGrantByEmailAddress
             | Self::XAmzContentSHA256Mismatch => 400,
             Self::AccessDenied
             | Self::InvalidAccessKeyId
@@ -89,7 +96,8 @@ impl S3ErrorCode {
             | Self::NoSuchKey
             | Self::NoSuchTagSet
             | Self::NoSuchUpload
-            | Self::NoSuchVersion => 404,
+            | Self::NoSuchVersion
+            | Self::OwnershipControlsNotFoundError => 404,
             Self::MethodNotAllowed => 405,
             Self::BucketAlreadyExists
             | Self::BucketAlreadyOwnedByYou
@@ -120,6 +128,7 @@ impl S3ErrorCode {
             Self::InternalError => "InternalError",
             Self::InvalidAccessKeyId => "InvalidAccessKeyId",
             Self::InvalidArgument => "InvalidArgument",
+            Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::InvalidBucketName => "InvalidBucketName",
             Self::InvalidDigest => "InvalidDigest",
             Self::InvalidLocationConstraint => "InvalidLocationConstraint",
@@ -131,6 +140,7 @@ impl S3ErrorCode {
             Self::InvalidTag => "InvalidTag",
             Self::InvalidURI => "InvalidURI",
             Self::KeyTooLongError => "KeyTooLongError",
+            Self::MalformedACLError => "MalformedACLError",
             Self::MalformedPolicy => "MalformedPolicy",
             Self::MalformedXML => "MalformedXML",
             Self::MetadataTooLarge => "MetadataTooLarge",
@@ -146,12 +156,14 @@ impl S3ErrorCode {
             Self::NoSuchVersion => "NoSuchVersion",
             Self::NotImplemented => "NotImplemented",
             Self::NotModified => "NotModified",
+            Self::OwnershipControlsNotFoundError => "OwnershipControlsNotFoundError",
             Self::PreconditionFailed => "PreconditionFailed",
             Self::RequestHeaderSectionTooLarge => "RequestHeaderSectionTooLarge",
             Self::RequestTimeTooSkewed => "RequestTimeTooSkewed",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             Self::SlowDown => "SlowDown",
             Self::TooManyBuckets => "TooManyBuckets",
+            Self::UnresolvableGrantByEmailAddress => "UnresolvableGrantByEmailAddress",
             Self::XAmzContentSHA256Mismatch => "XAmzContentSHA256Mismatch",
         }
     }
@@ -196,6 +208,22 @@ impl S3Error {
         self.resource = Some(format!("/{b}/{k}"));
         self.bucket_name = Some(b);
         self.key = Some(k);
+        self
+    }
+
+    pub fn with_upload(
+        mut self,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        upload_id: impl Into<String>,
+    ) -> Self {
+        let b = bucket.into();
+        let k = key.into();
+        let u = upload_id.into();
+        self.resource = Some(format!("/{b}/{k}"));
+        self.bucket_name = Some(b);
+        self.key = Some(k);
+        self.upload_id = Some(u);
         self
     }
 

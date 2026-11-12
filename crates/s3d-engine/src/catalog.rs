@@ -7,12 +7,13 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use s3d_disk::{Disk, DiskFile};
 use s3d_types::{
-    AsyncByteReader, ChecksumState, ObjectOwnership, OwnerInfo, S3Error, S3ErrorCode, StoreResult,
+    AccessControlPolicy, AsyncByteReader, ChecksumAlgorithm, ChecksumState, ChecksumType,
+    CompleteMultipartUploadResp, ObjectOwnership, OwnerInfo, S3Error, S3ErrorCode, StoreResult,
     SystemMeta, VersioningStatus,
 };
 use tracing::error;
 
-use crate::format::{decode_block_header, Extent, BLOCK_HEADER_LEN};
+use crate::format::{decode_block_header, Extent, PartBoundaryInfo, BLOCK_HEADER_LEN};
 
 pub const SEG_STATE_ACTIVE: u8 = 0;
 pub const SEG_STATE_SEALED: u8 = 1;
@@ -78,20 +79,52 @@ pub struct ObjectVersionEntry {
     pub sys_meta: SystemMeta,
     pub user_meta: Vec<(String, String)>,
     pub owner: OwnerInfo,
+    pub acl: AccessControlPolicy,
     pub last_modified_ms: i64,
     pub extents: Arc<[Extent]>,
-    pub part_sizes: Option<Arc<[u64]>>,
+    pub parts: Option<Arc<[PartBoundaryInfo]>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadPartEntry {
+    pub part_seq: u64,
+    pub part_number: u32,
+    pub last_modified_ms: i64,
+    pub etag: String,
+    pub size: u64,
+    pub md5: [u8; 16],
+    pub crc64_nvme: u64,
+    pub checksum: Option<(ChecksumAlgorithm, String)>,
+    pub extents: Arc<[Extent]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartUploadEntry {
+    pub upload_id: String,
+    pub key: String,
+    pub initiator: OwnerInfo,
+    pub owner: OwnerInfo,
+    pub acl: AccessControlPolicy,
+    pub initiated_ms: i64,
+    pub sys_meta: SystemMeta,
+    pub user_meta: Vec<(String, String)>,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<ChecksumType>,
+    pub parts: BTreeMap<u32, UploadPartEntry>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BucketEntry {
     pub name: String,
     pub owner: OwnerInfo,
+    pub acl: AccessControlPolicy,
     pub region: String,
     pub created_ms: i64,
     pub versioning: VersioningStatus,
     pub ownership: ObjectOwnership,
     pub objects: BTreeMap<String, Vec<ObjectVersionEntry>>, // newest-first
+    pub uploads: BTreeMap<(String, String), MultipartUploadEntry>, // (key, upload_id)
+    pub completed_uploads: BTreeMap<(String, String), (i64, CompleteMultipartUploadResp)>,
 }
 
 #[derive(Default)]

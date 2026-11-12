@@ -3,9 +3,13 @@ use crate::error::{S3Error, S3ErrorCode, StoreResult};
 pub const MAX_KEY_BYTES: usize = 1024;
 pub const MAX_USER_METADATA_BYTES: usize = 2048;
 pub const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+pub const MAX_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
 pub const MIN_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
 pub const MAX_PART_NUMBER: u32 = 10_000;
+pub const MAX_PARTS_COUNT: u32 = 10_000;
 pub const DEFAULT_MAX_OBJECT_SIZE: u64 = 50_000_000_000_000; // ~48.8 TiB / 50 TB
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = DEFAULT_MAX_OBJECT_SIZE;
+pub const MAX_MULTIPART_OBJECT_BYTES: u64 = DEFAULT_MAX_OBJECT_SIZE;
 
 const RESERVED_BUCKET_PREFIXES: &[&str] = &["xn--", "sthree-", "amzn-s3-demo-"];
 const RESERVED_BUCKET_SUFFIXES: &[&str] = &[

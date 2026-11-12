@@ -20,6 +20,8 @@ pub struct ModelConfig {
     pub region: String,
     pub max_buckets_per_account: usize,
     pub default_object_ownership: ObjectOwnership,
+    pub max_object_size: u64,
+    pub completed_upload_retention_ms: i64,
 }
 
 impl Default for ModelConfig {
@@ -28,8 +30,17 @@ impl Default for ModelConfig {
             region: "us-east-1".to_string(),
             max_buckets_per_account: 10_000,
             default_object_ownership: ObjectOwnership::BucketOwnerEnforced,
+            max_object_size: DEFAULT_MAX_OBJECT_BYTES,
+            completed_upload_retention_ms: 24 * 60 * 60 * 1000,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ModelPartBoundary {
+    part_number: u32,
+    size: u64,
+    checksum: Option<(ChecksumAlgorithm, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,19 +55,46 @@ struct ModelVersion {
     sys_meta: SystemMeta,
     user_meta: Vec<(String, String)>,
     owner: OwnerInfo,
+    acl: AccessControlPolicy,
     last_modified_ms: i64,
-    part_sizes: Option<Vec<u64>>,
+    parts: Option<Vec<ModelPartBoundary>>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelUploadPart {
+    part_number: u32,
+    last_modified_ms: i64,
+    etag: String,
+    data: Bytes,
+    md5: [u8; 16],
+    checksum: Option<(ChecksumAlgorithm, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelMultipartUpload {
+    initiator: OwnerInfo,
+    owner: OwnerInfo,
+    acl: AccessControlPolicy,
+    initiated_ms: i64,
+    sys_meta: SystemMeta,
+    user_meta: Vec<(String, String)>,
+    checksum_algorithm: Option<ChecksumAlgorithm>,
+    checksum_type: Option<ChecksumType>,
+    parts: BTreeMap<u32, ModelUploadPart>,
 }
 
 #[derive(Debug, Clone)]
 struct ModelBucket {
     name: String,
     owner: OwnerInfo,
+    acl: AccessControlPolicy,
     region: String,
     created_ms: i64,
     versioning: VersioningStatus,
     ownership: ObjectOwnership,
     objects: BTreeMap<String, Vec<ModelVersion>>, // key -> newest-first versions
+    uploads: BTreeMap<(String, String), ModelMultipartUpload>, // (key, upload_id) -> upload
+    completed_uploads: BTreeMap<(String, String), (i64, CompleteMultipartUploadResp)>,
 }
 
 #[derive(Default)]
@@ -86,14 +124,13 @@ impl ModelStore {
 }
 
 fn require_authenticated(ctx: &CallerContext) -> StoreResult<&OwnerInfo> {
-    // [PR-28] Before P1 ACL/Policy, unauthenticated requests are denied.
     ctx.caller
         .as_ref()
         .filter(|_| ctx.is_authenticated)
         .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Access Denied"))
 }
 
-fn check_bucket_access<'a>(
+fn lookup_bucket_checked<'a>(
     state: &'a ModelState,
     ctx: &CallerContext,
     bucket_name: &str,
@@ -102,21 +139,105 @@ fn check_bucket_access<'a>(
         S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist")
             .with_bucket(bucket_name)
     })?;
-    let caller = require_authenticated(ctx)?;
-    // [PR-29] Expected bucket owner header verification
+    // [PR-29] Expected bucket owner header verification (applies to authenticated and anonymous callers)
     if let Some(expected) = &ctx.expected_bucket_owner {
         if expected != &bucket.owner.user_id {
             return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                 .with_bucket(bucket_name));
         }
     }
-    // [PR-28] Owner-only access in P0
+    Ok(bucket)
+}
+
+fn require_bucket_owner<'a>(
+    state: &'a ModelState,
+    ctx: &CallerContext,
+    bucket_name: &str,
+) -> StoreResult<&'a ModelBucket> {
+    let bucket = lookup_bucket_checked(state, ctx, bucket_name)?;
+    let caller = require_authenticated(ctx)?;
     if caller.user_id != bucket.owner.user_id {
         return Err(
             S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(bucket_name)
         );
     }
     Ok(bucket)
+}
+
+fn has_bucket_perm(bucket: &ModelBucket, ctx: &CallerContext, needed: AclPermission) -> bool {
+    let caller_is_owner = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == bucket.owner.user_id);
+    if bucket.ownership == ObjectOwnership::BucketOwnerEnforced {
+        return caller_is_owner;
+    }
+    if matches!(needed, AclPermission::ReadAcp | AclPermission::WriteAcp) && caller_is_owner {
+        return true;
+    }
+    bucket
+        .acl
+        .allows(ctx.caller.as_ref(), ctx.is_authenticated, needed, false)
+}
+
+fn check_bucket_perm<'a>(
+    state: &'a ModelState,
+    ctx: &CallerContext,
+    bucket_name: &str,
+    needed: AclPermission,
+) -> StoreResult<&'a ModelBucket> {
+    let bucket = lookup_bucket_checked(state, ctx, bucket_name)?;
+    if !has_bucket_perm(bucket, ctx, needed) {
+        return Err(
+            S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(bucket_name)
+        );
+    }
+    Ok(bucket)
+}
+
+fn has_object_perm(
+    bucket: &ModelBucket,
+    ver: &ModelVersion,
+    ctx: &CallerContext,
+    needed: AclPermission,
+) -> bool {
+    if bucket.ownership == ObjectOwnership::BucketOwnerEnforced {
+        return ctx.is_authenticated
+            && ctx
+                .caller
+                .as_ref()
+                .is_some_and(|c| c.user_id == bucket.owner.user_id);
+    }
+    let caller_is_obj_owner = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == ver.owner.user_id);
+    if matches!(needed, AclPermission::ReadAcp | AclPermission::WriteAcp) && caller_is_obj_owner {
+        return true;
+    }
+    ver.acl
+        .allows(ctx.caller.as_ref(), ctx.is_authenticated, needed, false)
+}
+
+fn has_upload_perm(
+    bucket: &ModelBucket,
+    up: &ModelMultipartUpload,
+    ctx: &CallerContext,
+    needed: AclPermission,
+) -> bool {
+    let is_initiator = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == up.initiator.user_id);
+    let is_bucket_owner = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == bucket.owner.user_id);
+    is_initiator || is_bucket_owner || has_bucket_perm(bucket, ctx, needed)
 }
 
 fn map_body_err(err: BodyStreamError) -> S3Error {
@@ -156,6 +277,10 @@ fn head_state_of(versions: Option<&Vec<ModelVersion>>) -> HeadState<'_> {
     }
 }
 
+fn strip_etag_quotes(s: &str) -> &str {
+    s.trim().trim_matches('"')
+}
+
 fn encode_token(bucket: &str, key: &str) -> String {
     let raw = format!("v1:{bucket}:{key}");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
@@ -164,13 +289,58 @@ fn encode_token(bucket: &str, key: &str) -> String {
 fn decode_token(bucket: &str, token: &str) -> StoreResult<String> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
-        .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "The continuation token provided is incorrect"))?;
-    let s = std::str::from_utf8(&bytes)
-        .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "The continuation token provided is incorrect"))?;
+        .map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "The continuation token provided is incorrect",
+            )
+        })?;
+    let s = std::str::from_utf8(&bytes).map_err(|_| {
+        S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The continuation token provided is incorrect",
+        )
+    })?;
     let prefix = format!("v1:{bucket}:");
-    s.strip_prefix(&prefix)
-        .map(|k| k.to_string())
-        .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument, "The continuation token provided is incorrect"))
+    s.strip_prefix(&prefix).map(|k| k.to_string()).ok_or_else(|| {
+        S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The continuation token provided is incorrect",
+        )
+    })
+}
+
+fn compute_composite_checksum_b64(alg: ChecksumAlgorithm, part_b64s: &[String]) -> StoreResult<String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut raw_concat = Vec::new();
+    for p in part_b64s {
+        let decoded = b64
+            .decode(p.trim())
+            .map_err(|_| S3Error::new(S3ErrorCode::BadDigest, "Invalid part checksum encoding"))?;
+        raw_concat.extend_from_slice(&decoded);
+    }
+    let outer = compute_checksum_b64(alg, &raw_concat);
+    Ok(format!("{outer}-{}", part_b64s.len()))
+}
+
+fn insert_version_into_chain(
+    versioning: VersioningStatus,
+    chain: &mut Vec<ModelVersion>,
+    ver: ModelVersion,
+) {
+    match versioning {
+        VersioningStatus::Unversioned => {
+            chain.clear();
+            chain.push(ver);
+        }
+        VersioningStatus::Suspended => {
+            chain.retain(|v| v.version_id.as_deref() != Some("null"));
+            chain.insert(0, ver);
+        }
+        VersioningStatus::Enabled => {
+            chain.insert(0, ver);
+        }
+    }
 }
 
 /// Shared sorted prefix/delimiter collector for V1 and V2 listing (FR-39 ~ FR-44).
@@ -254,8 +424,8 @@ impl ObjectStore for ModelStore {
             }
         }
         let after = match &req.continuation_token {
-            Some(tok) => Some(decode_token("__buckets__", tok)?),
-            None => None,
+            Some(tok) if !tok.is_empty() => Some(decode_token("__buckets__", tok)?),
+            _ => None,
         };
         let max = req.max_buckets.unwrap_or(10_000);
         let guard = self.state.lock().unwrap();
@@ -343,14 +513,35 @@ impl ObjectStore for ModelStore {
         let ownership = req
             .object_ownership
             .unwrap_or(self.cfg.default_object_ownership);
+        let acl = if ownership == ObjectOwnership::BucketOwnerEnforced {
+            if let Some(spec) = &req.acl {
+                if !matches!(spec, AclSpec::Canned(CannedAcl::Private)) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidBucketAclWithObjectOwnership,
+                        "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
+                    )
+                    .with_bucket(&req.bucket));
+                }
+            }
+            AccessControlPolicy::new_private(caller.clone())
+        } else {
+            match &req.acl {
+                None => AccessControlPolicy::new_private(caller.clone()),
+                Some(spec) => resolve_target_acl(&caller, Some(&caller), spec)?,
+            }
+        };
+
         let b = ModelBucket {
             name: req.bucket.clone(),
             owner: caller,
+            acl,
             region: self.cfg.region.clone(),
             created_ms: req.ctx.request_time_ms,
             versioning: VersioningStatus::Unversioned,
             ownership,
             objects: BTreeMap::new(),
+            uploads: BTreeMap::new(),
+            completed_uploads: BTreeMap::new(),
         };
         let snap = BucketMetaSnapshot {
             name: b.name.clone(),
@@ -366,7 +557,7 @@ impl ObjectStore for ModelStore {
 
     async fn head_bucket(&self, req: BucketRef) -> StoreResult<BucketMetaSnapshot> {
         let guard = self.state.lock().unwrap();
-        let b = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Read)?;
         Ok(BucketMetaSnapshot {
             name: b.name.clone(),
             owner: b.owner.clone(),
@@ -379,7 +570,7 @@ impl ObjectStore for ModelStore {
 
     async fn delete_bucket(&self, req: BucketRef) -> StoreResult<()> {
         let mut guard = self.state.lock().unwrap();
-        let b = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
+        let b = require_bucket_owner(&guard, &req.ctx, &req.bucket)?;
         // [FR-50] Any remaining version or delete marker prevents bucket deletion
         if b.objects.values().any(|chain| !chain.is_empty()) {
             return Err(S3Error::new(
@@ -392,6 +583,102 @@ impl ObjectStore for ModelStore {
         Ok(())
     }
 
+    async fn get_bucket_versioning(&self, req: BucketRef) -> StoreResult<VersioningStatus> {
+        let guard = self.state.lock().unwrap();
+        let b = require_bucket_owner(&guard, &req.ctx, &req.bucket)?;
+        Ok(b.versioning)
+    }
+
+    async fn put_bucket_versioning(&self, req: PutBucketVersioningReq) -> StoreResult<()> {
+        // [FR-32] Unversioned -> Enabled <-> Suspended; cannot return to Unversioned
+        if req.status == VersioningStatus::Unversioned {
+            return Err(S3Error::new(
+                S3ErrorCode::MalformedXML,
+                "Invalid versioning status.",
+            ));
+        }
+        let mut guard = self.state.lock().unwrap();
+        let _ = require_bucket_owner(&guard, &req.ctx, &req.bucket)?;
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        b.versioning = req.status;
+        Ok(())
+    }
+
+    async fn get_bucket_acl(&self, req: BucketRef) -> StoreResult<AccessControlPolicy> {
+        let guard = self.state.lock().unwrap();
+        let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::ReadAcp)?;
+        Ok(b.acl.clone())
+    }
+
+    async fn put_bucket_acl(&self, req: PutBucketAclReq) -> StoreResult<()> {
+        let mut guard = self.state.lock().unwrap();
+        let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::WriteAcp)?;
+        if b.ownership == ObjectOwnership::BucketOwnerEnforced {
+            return Err(S3Error::new(
+                S3ErrorCode::AccessControlListNotSupported,
+                "The bucket does not allow ACLs",
+            )
+            .with_bucket(&req.bucket));
+        }
+        let new_acl = resolve_target_acl(&b.owner, Some(&b.owner), &req.acl)?;
+        guard.buckets.get_mut(&req.bucket).unwrap().acl = new_acl;
+        Ok(())
+    }
+
+    async fn get_object_acl(&self, req: GetObjectAclReq) -> StoreResult<GetObjectAclResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let guard = self.state.lock().unwrap();
+        let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_read_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            AclPermission::ReadAcp,
+        )?;
+        Ok(GetObjectAclResp {
+            version_id: ver.version_id.clone().filter(|v| v != "null"),
+            policy: ver.acl.clone(),
+        })
+    }
+
+    async fn put_object_acl(&self, req: PutObjectAclReq) -> StoreResult<Option<String>> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let mut guard = self.state.lock().unwrap();
+        let b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let (target_seq, ver_owner, vid_out) = {
+            let ver = self.lookup_version_for_read_checked(
+                b_ro,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                AclPermission::WriteAcp,
+            )?;
+            (
+                ver.seq,
+                ver.owner.clone(),
+                ver.version_id.clone().filter(|v| v != "null"),
+            )
+        };
+        if b_ro.ownership == ObjectOwnership::BucketOwnerEnforced {
+            return Err(S3Error::new(
+                S3ErrorCode::AccessControlListNotSupported,
+                "The bucket does not allow ACLs",
+            )
+            .with_bucket(&req.bucket));
+        }
+        let new_acl = resolve_target_acl(&ver_owner, Some(&b_ro.owner), &req.acl)?;
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        if let Some(chain) = b.objects.get_mut(&req.key) {
+            if let Some(v) = chain.iter_mut().find(|v| v.seq == target_seq) {
+                v.acl = new_acl;
+            }
+        }
+        Ok(vid_out)
+    }
+
     async fn put_object<S: VerifiedBodyStream>(
         &self,
         req: PutObjectReq,
@@ -400,11 +687,16 @@ impl ObjectStore for ModelStore {
         validate_object_key(&req.bucket, &req.key)?;
         validate_user_metadata(&req.user_meta)?;
 
-        let caller = {
+        {
             let guard = self.state.lock().unwrap();
-            let _ = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
-            require_authenticated(&req.ctx)?.clone()
-        };
+            let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let _ = resolve_object_owner_and_acl(
+                b.ownership,
+                &b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?;
+        }
 
         // [FR-1, PR-21] Stream & verify digests BEFORE touching visible state
         let mut buf = BytesMut::new();
@@ -424,7 +716,15 @@ impl ObjectStore for ModelStore {
 
         // [FR-17] Evaluate preconditions atomically at commit point
         let mut guard = self.state.lock().unwrap();
-        let _ = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
+        let (obj_owner, obj_acl) = {
+            let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Write)?;
+            resolve_object_owner_and_acl(
+                b.ownership,
+                &b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?
+        };
         guard.next_seq += 1;
         let seq = guard.next_seq;
 
@@ -449,25 +749,14 @@ impl ObjectStore for ModelStore {
             checksum: digests.checksum.clone(),
             sys_meta: req.sys_meta,
             user_meta: req.user_meta,
-            owner: caller,
+            owner: obj_owner,
+            acl: obj_acl,
             last_modified_ms: req.ctx.request_time_ms,
-            part_sizes: None,
+            parts: None,
         };
 
         let chain = bucket.objects.entry(req.key).or_default();
-        match bucket.versioning {
-            VersioningStatus::Unversioned => {
-                chain.clear();
-                chain.push(ver);
-            }
-            VersioningStatus::Suspended => {
-                chain.retain(|v| v.version_id.as_deref() != Some("null"));
-                chain.insert(0, ver);
-            }
-            VersioningStatus::Enabled => {
-                chain.insert(0, ver);
-            }
-        }
+        insert_version_into_chain(bucket.versioning, chain, ver);
 
         Ok(PutObjectResp {
             etag,
@@ -489,11 +778,74 @@ impl ObjectStore for ModelStore {
         Ok(meta)
     }
 
+    async fn get_object_attributes(
+        &self,
+        req: GetObjectAttributesReq,
+    ) -> StoreResult<GetObjectAttributesResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let guard = self.state.lock().unwrap();
+        let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_read_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            AclPermission::Read,
+        )?;
+
+        let object_parts = if req.attrs.object_parts {
+            ver.parts.as_ref().map(|all_parts| {
+                let total = all_parts.len() as u32;
+                let max_p = req.max_parts.min(1000);
+                let mut selected = Vec::new();
+                let mut is_truncated = false;
+                for p in all_parts {
+                    if p.part_number <= req.part_number_marker {
+                        continue;
+                    }
+                    if selected.len() == max_p {
+                        is_truncated = true;
+                        break;
+                    }
+                    selected.push(ObjectAttributePartEntry {
+                        part_number: p.part_number,
+                        size: p.size,
+                        checksum: p.checksum.clone(),
+                    });
+                }
+                let next_marker = selected.last().map(|p| p.part_number);
+                ObjectAttributesPartsResp {
+                    total_parts_count: total,
+                    part_number_marker: req.part_number_marker,
+                    next_part_number_marker: next_marker,
+                    max_parts: max_p,
+                    is_truncated,
+                    parts: selected,
+                }
+            })
+        } else {
+            None
+        };
+
+        Ok(GetObjectAttributesResp {
+            version_id: ver.version_id.clone().filter(|v| v != "null"),
+            last_modified_ms: ver.last_modified_ms,
+            etag: req.attrs.etag.then(|| strip_etag_quotes(&ver.etag).to_string()),
+            checksum: req.attrs.checksum.then(|| ver.checksum.clone()),
+            object_parts,
+            storage_class: req.attrs.storage_class.then(|| "STANDARD".to_string()),
+            object_size: req.attrs.object_size.then_some(ver.data.len() as u64),
+        })
+    }
+
     async fn delete_object(&self, req: DeleteObjectReq) -> StoreResult<DeleteObjectResp> {
         validate_object_key(&req.bucket, &req.key)?;
         let mut guard = self.state.lock().unwrap();
-        let _ = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
-        let caller = require_authenticated(&req.ctx)?.clone();
+        let dm_owner = {
+            let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Write)?;
+            req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone())
+        };
         guard.next_seq += 1;
         let seq = guard.next_seq;
         let bucket = guard.buckets.get_mut(&req.bucket).unwrap();
@@ -504,9 +856,10 @@ impl ObjectStore for ModelStore {
         if let Some(vid) = &req.version_id {
             // [FR-36] Permanent version deletion
             if let Some(chain) = bucket.objects.get_mut(&req.key) {
-                if let Some(pos) = chain.iter().position(|v| {
-                    v.version_id.as_deref().unwrap_or("null") == vid.as_str()
-                }) {
+                if let Some(pos) = chain
+                    .iter()
+                    .position(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
+                {
                     let removed = chain.remove(pos);
                     if chain.is_empty() {
                         bucket.objects.remove(&req.key);
@@ -538,6 +891,7 @@ impl ObjectStore for ModelStore {
                 } else {
                     format!("v{seq:016x}")
                 };
+                let dm_acl = AccessControlPolicy::new_private(dm_owner.clone());
                 let dm = ModelVersion {
                     seq,
                     version_id: Some(vid.clone()),
@@ -552,9 +906,10 @@ impl ObjectStore for ModelStore {
                     },
                     sys_meta: SystemMeta::default(),
                     user_meta: Vec::new(),
-                    owner: caller,
+                    owner: dm_owner,
+                    acl: dm_acl,
                     last_modified_ms: req.ctx.request_time_ms,
-                    part_sizes: None,
+                    parts: None,
                 };
                 let chain = bucket.objects.entry(req.key).or_default();
                 if bucket.versioning == VersioningStatus::Suspended {
@@ -580,7 +935,7 @@ impl ObjectStore for ModelStore {
         }
         {
             let guard = self.state.lock().unwrap();
-            let _ = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
+            let _ = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Write)?;
         }
 
         let mut deleted = Vec::new();
@@ -630,6 +985,7 @@ impl ObjectStore for ModelStore {
             && req.src_key == req.dst_key
             && req.src_version_id.is_none()
             && !req.replace_metadata
+            && req.acl.is_none()
         {
             // [FR-20] Self-copy with no changes -> 400 InvalidRequest
             return Err(S3Error::new(
@@ -639,34 +995,27 @@ impl ObjectStore for ModelStore {
         }
 
         let mut guard = self.state.lock().unwrap();
-        let src_b = check_bucket_access(&guard, &req.ctx, &req.src_bucket)?;
-        let _ = check_bucket_access(&guard, &req.ctx, &req.dst_bucket)?;
-        let caller = require_authenticated(&req.ctx)?.clone();
+        let src_b = lookup_bucket_checked(&guard, &req.ctx, &req.src_bucket)?;
+        let src_ver = self
+            .lookup_version_for_copy_checked(
+                src_b,
+                &req.ctx,
+                &req.src_bucket,
+                &req.src_key,
+                req.src_version_id.as_deref(),
+            )?
+            .clone();
 
-        let src_ver = match &req.src_version_id {
-            None => src_b
-                .objects
-                .get(&req.src_key)
-                .and_then(|c| c.first())
-                .filter(|v| !v.is_delete_marker)
-                .cloned(),
-            Some(vid) => src_b.objects.get(&req.src_key).and_then(|c| {
-                c.iter()
-                    .find(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
-                    .cloned()
-            }),
-        }
-        .ok_or_else(|| {
-            S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
-                .with_key(&req.src_bucket, &req.src_key)
-        })?;
+        let (dst_owner, dst_acl) = {
+            let dst_b = check_bucket_perm(&guard, &req.ctx, &req.dst_bucket, AclPermission::Write)?;
+            resolve_object_owner_and_acl(
+                dst_b.ownership,
+                &dst_b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?
+        };
 
-        if src_ver.is_delete_marker {
-            return Err(S3Error::new(
-                S3ErrorCode::InvalidRequest,
-                "The source of a copy request may not specifically refer to a delete marker by version id.",
-            ));
-        }
         if src_ver.data.len() as u64 > MAX_SINGLE_PUT_BYTES {
             // [FR-21] CopyObject > 5 GiB -> 400 InvalidRequest
             return Err(S3Error::new(
@@ -705,47 +1054,736 @@ impl ObjectStore for ModelStore {
         };
         let md5_raw: [u8; 16] = Md5::digest(&src_ver.data).into();
         let etag = format!("\"{}\"", hex::encode(md5_raw));
+        let dst_csum = ChecksumState {
+            algorithm: src_ver.checksum.algorithm,
+            checksum_type: ChecksumType::FullObject,
+            value_b64: compute_checksum_b64(src_ver.checksum.algorithm, &src_ver.data),
+            client_requested: src_ver.checksum.client_requested,
+        };
         let new_ver = ModelVersion {
             seq,
             version_id: dst_vid.clone(),
             is_delete_marker: false,
             data: src_ver.data.clone(),
             etag: etag.clone(),
-            checksum: src_ver.checksum.clone(),
+            checksum: dst_csum.clone(),
             sys_meta,
             user_meta,
-            owner: caller,
+            owner: dst_owner,
+            acl: dst_acl,
             last_modified_ms: req.ctx.request_time_ms,
-            part_sizes: None,
+            parts: None,
         };
 
         let chain = dst_b.objects.entry(req.dst_key).or_default();
-        match dst_b.versioning {
-            VersioningStatus::Unversioned => {
-                chain.clear();
-                chain.push(new_ver);
-            }
-            VersioningStatus::Suspended => {
-                chain.retain(|v| v.version_id.as_deref() != Some("null"));
-                chain.insert(0, new_ver);
-            }
-            VersioningStatus::Enabled => {
-                chain.insert(0, new_ver);
-            }
-        }
+        insert_version_into_chain(dst_b.versioning, chain, new_ver);
 
         Ok(CopyObjectResp {
             etag,
             last_modified_ms: req.ctx.request_time_ms,
             src_version_id: src_ver.version_id,
             dst_version_id: dst_vid,
-            checksum: Some(src_ver.checksum),
+            checksum: dst_csum.client_requested.then_some(dst_csum),
+        })
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: CreateMultipartUploadReq,
+    ) -> StoreResult<CreateMultipartUploadResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        validate_user_metadata(&req.user_meta)?;
+
+        let resolved_type = match (req.checksum_algorithm, req.checksum_type) {
+            (Some(alg), explicit) => Some(alg.resolve_multipart_type(explicit)?),
+            (None, Some(_)) => {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    "x-amz-checksum-type requires x-amz-checksum-algorithm.",
+                ));
+            }
+            (None, None) => None,
+        };
+
+        let mut guard = self.state.lock().unwrap();
+        let (initiator, obj_owner, obj_acl) = {
+            let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let initiator = req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone());
+            let (obj_owner, obj_acl) = resolve_object_owner_and_acl(
+                b.ownership,
+                &b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?;
+            (initiator, obj_owner, obj_acl)
+        };
+        guard.next_seq += 1;
+        let seq = guard.next_seq;
+        // [FR-24] Opaque UploadId
+        let upload_id = format!("mp{seq:032x}");
+
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        b.uploads.insert(
+            (req.key.clone(), upload_id.clone()),
+            ModelMultipartUpload {
+                initiator,
+                owner: obj_owner,
+                acl: obj_acl,
+                initiated_ms: req.ctx.request_time_ms,
+                sys_meta: req.sys_meta,
+                user_meta: req.user_meta,
+                checksum_algorithm: req.checksum_algorithm,
+                checksum_type: resolved_type,
+                parts: BTreeMap::new(),
+            },
+        );
+
+        Ok(CreateMultipartUploadResp {
+            bucket: req.bucket,
+            key: req.key,
+            upload_id,
+            checksum_algorithm: req.checksum_algorithm,
+            checksum_type: resolved_type,
+        })
+    }
+
+    async fn upload_part<S: VerifiedBodyStream>(
+        &self,
+        req: UploadPartReq,
+        mut body: S,
+    ) -> StoreResult<UploadPartResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        // [FR-25] PartNumber 1..=10,000
+        if req.part_number == 0 || req.part_number > MAX_PARTS_COUNT {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Part number must be an integer between 1 and 10000, inclusive",
+            ));
+        }
+
+        let upload_csum_info = {
+            let guard = self.state.lock().unwrap();
+            let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+            let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
+                if has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NoSuchUpload,
+                        "The specified upload does not exist.",
+                    )
+                    .with_upload(&req.bucket, &req.key, &req.upload_id));
+                }
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+                );
+            };
+            if !has_upload_perm(b, up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+                );
+            }
+            (up.checksum_algorithm, up.checksum_type)
+        };
+
+        let mut buf = BytesMut::new();
+        while let Some(chunk) = poll_fn(|cx| body.poll_next_chunk(cx))
+            .await
+            .map_err(map_body_err)?
+        {
+            if (buf.len() + chunk.len()) as u64 > req.max_bytes_limit {
+                return Err(S3Error::new(
+                    S3ErrorCode::EntityTooLarge,
+                    "Your proposed upload exceeds the maximum allowed size",
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let digests = body.finish().map_err(map_body_err)?;
+        let data = buf.freeze();
+
+        if let Some(up_alg) = upload_csum_info.0 {
+            if digests.checksum.client_requested && digests.checksum.algorithm != up_alg {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    format!(
+                        "Checksum algorithm mismatch: upload expects {}",
+                        up_alg.as_aws_str()
+                    ),
+                ));
+            }
+        }
+
+        let part_csum = upload_csum_info
+            .0
+            .map(|alg| (alg, compute_checksum_b64(alg, &data)));
+        let resp_csum = if let Some((alg, val)) = &part_csum {
+            Some(ChecksumState {
+                algorithm: *alg,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: val.clone(),
+                client_requested: true,
+            })
+        } else if digests.checksum.client_requested {
+            Some(digests.checksum)
+        } else {
+            None
+        };
+
+        let etag = format!("\"{}\"", hex::encode(digests.md5));
+        let mut guard = self.state.lock().unwrap();
+        let b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        if let Some(up_ro) = b_ro.uploads.get(&(req.key.clone(), req.upload_id.clone())) {
+            if !has_upload_perm(b_ro, up_ro, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+                );
+            }
+        }
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        let up = b
+            .uploads
+            .get_mut(&(req.key.clone(), req.upload_id.clone()))
+            .ok_or_else(|| {
+                S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.bucket, &req.key, &req.upload_id)
+            })?;
+
+        // [FR-25] Re-uploading same partNumber overwrites previous part
+        up.parts.insert(
+            req.part_number,
+            ModelUploadPart {
+                part_number: req.part_number,
+                last_modified_ms: req.ctx.request_time_ms,
+                etag: etag.clone(),
+                data,
+                md5: digests.md5,
+                checksum: part_csum,
+            },
+        );
+
+        Ok(UploadPartResp {
+            etag,
+            checksum: resp_csum,
+        })
+    }
+
+    async fn upload_part_copy(&self, req: UploadPartCopyReq) -> StoreResult<UploadPartCopyResp> {
+        validate_object_key(&req.dst_bucket, &req.dst_key)?;
+        if req.part_number == 0 || req.part_number > MAX_PARTS_COUNT {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Part number must be an integer between 1 and 10000, inclusive",
+            ));
+        }
+
+        let mut guard = self.state.lock().unwrap();
+        let src_b = lookup_bucket_checked(&guard, &req.ctx, &req.src_bucket)?;
+        let dst_b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.dst_bucket)?;
+        let Some(up_ro) = dst_b_ro
+            .uploads
+            .get(&(req.dst_key.clone(), req.upload_id.clone()))
+        else {
+            if has_bucket_perm(dst_b_ro, &req.ctx, AclPermission::Write) {
+                return Err(S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.dst_bucket, &req.dst_key, &req.upload_id));
+            }
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.dst_bucket)
+            );
+        };
+        if !has_upload_perm(dst_b_ro, up_ro, &req.ctx, AclPermission::Write) {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.dst_bucket)
+            );
+        }
+        let up_alg = up_ro.checksum_algorithm;
+
+        let src_ver = self
+            .lookup_version_for_copy_checked(
+                src_b,
+                &req.ctx,
+                &req.src_bucket,
+                &req.src_key,
+                req.src_version_id.as_deref(),
+            )?
+            .clone();
+
+        evaluate_copy_source_preconditions(
+            &req.src_preconditions,
+            &src_ver.etag,
+            src_ver.last_modified_ms,
+        )?;
+
+        let src_len = src_ver.data.len() as u64;
+        let slice = if let Some((start, end)) = req.src_range {
+            // [FR-31] Out-of-bounds x-amz-copy-source-range -> InvalidRange (or InvalidArgument)
+            if start > end || end >= src_len {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRange,
+                    "Range specified is not valid for source object",
+                ));
+            }
+            if end - start + 1 > MAX_PART_SIZE_BYTES {
+                return Err(S3Error::new(
+                    S3ErrorCode::EntityTooLarge,
+                    "Your proposed upload exceeds the maximum allowed size",
+                ));
+            }
+            src_ver.data.slice(start as usize..(end as usize + 1))
+        } else {
+            if src_len > MAX_PART_SIZE_BYTES {
+                return Err(S3Error::new(
+                    S3ErrorCode::EntityTooLarge,
+                    "Your proposed upload exceeds the maximum allowed size",
+                ));
+            }
+            src_ver.data.clone()
+        };
+
+        let md5: [u8; 16] = Md5::digest(&slice).into();
+        let etag = format!("\"{}\"", hex::encode(md5));
+        let part_csum = up_alg.map(|alg| (alg, compute_checksum_b64(alg, &slice)));
+        let resp_csum = part_csum.as_ref().map(|(alg, val)| ChecksumState {
+            algorithm: *alg,
+            checksum_type: ChecksumType::FullObject,
+            value_b64: val.clone(),
+            client_requested: true,
+        });
+
+        let dst_b = guard.buckets.get_mut(&req.dst_bucket).unwrap();
+        let up = dst_b
+            .uploads
+            .get_mut(&(req.dst_key.clone(), req.upload_id.clone()))
+            .unwrap();
+        up.parts.insert(
+            req.part_number,
+            ModelUploadPart {
+                part_number: req.part_number,
+                last_modified_ms: req.ctx.request_time_ms,
+                etag: etag.clone(),
+                data: slice,
+                md5,
+                checksum: part_csum,
+            },
+        );
+
+        Ok(UploadPartCopyResp {
+            etag,
+            last_modified_ms: req.ctx.request_time_ms,
+            src_version_id: src_ver.version_id,
+            checksum: resp_csum,
+        })
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: CompleteMultipartUploadReq,
+    ) -> StoreResult<CompleteMultipartUploadResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        // [FR-26] Empty parts list -> 400 MalformedXML
+        if req.parts.is_empty() {
+            return Err(S3Error::new(
+                S3ErrorCode::MalformedXML,
+                "The XML you provided was not well-formed or did not validate against our published schema",
+            ));
+        }
+
+        let mut guard = self.state.lock().unwrap();
+        let b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+
+        // [FR-27] 24h idempotent replay of completed UploadId
+        if let Some((completed_ms, cached_resp)) = b_ro
+            .completed_uploads
+            .get(&(req.key.clone(), req.upload_id.clone()))
+            .cloned()
+        {
+            if !has_bucket_perm(b_ro, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+                );
+            }
+            if req.ctx.request_time_ms.saturating_sub(completed_ms)
+                <= self.cfg.completed_upload_retention_ms
+            {
+                return Ok(cached_resp);
+            }
+        }
+
+        let Some(up) = b_ro
+            .uploads
+            .get(&(req.key.clone(), req.upload_id.clone()))
+            .cloned()
+        else {
+            if has_bucket_perm(b_ro, &req.ctx, AclPermission::Write) {
+                return Err(S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.bucket, &req.key, &req.upload_id));
+            }
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+            );
+        };
+        if !has_upload_perm(b_ro, &up, &req.ctx, AclPermission::Write) {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+            );
+        }
+
+        let deduped_parts = dedup_complete_parts(&req.parts)?;
+        let mut concat = BytesMut::new();
+        let mut md5_concat = Vec::with_capacity(deduped_parts.len() * 16);
+        let mut boundaries = Vec::with_capacity(deduped_parts.len());
+        let mut part_csum_b64s = Vec::with_capacity(deduped_parts.len());
+
+        for (idx, spec) in deduped_parts.iter().enumerate() {
+            let Some(uploaded) = up.parts.get(&spec.part_number) else {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidPart,
+                    "One or more of the specified parts could not be found.",
+                ));
+            };
+            if strip_etag_quotes(&spec.etag) != strip_etag_quotes(&uploaded.etag) {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidPart,
+                    "One or more of the specified parts could not be found.",
+                ));
+            }
+
+            let part_len = uploaded.data.len() as u64;
+            let is_last = idx + 1 == deduped_parts.len();
+            if !is_last && part_len < MIN_PART_SIZE_BYTES {
+                // [FR-26] Non-final part < 5 MiB -> 400 EntityTooSmall
+                return Err(S3Error::new(
+                    S3ErrorCode::EntityTooSmall,
+                    "Your proposed upload is smaller than the minimum allowed size",
+                ));
+            }
+
+            if let Some((spec_alg, spec_b64)) = &spec.checksum {
+                match (&up.checksum_algorithm, &uploaded.checksum) {
+                    (Some(up_alg), Some((_, actual_b64))) if spec_alg == up_alg => {
+                        if spec_b64.trim() != actual_b64 {
+                            return Err(S3Error::new(
+                                S3ErrorCode::BadDigest,
+                                "The part checksum did not match.",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(S3Error::new(
+                            S3ErrorCode::BadDigest,
+                            "Unexpected or mismatched part checksum.",
+                        ));
+                    }
+                }
+            }
+
+            if let Some((_, b64_val)) = &uploaded.checksum {
+                part_csum_b64s.push(b64_val.clone());
+            }
+
+            concat.extend_from_slice(&uploaded.data);
+            md5_concat.extend_from_slice(&uploaded.md5);
+            boundaries.push(ModelPartBoundary {
+                part_number: uploaded.part_number,
+                size: part_len,
+                checksum: uploaded.checksum.clone(),
+            });
+        }
+
+        let full_data = concat.freeze();
+        let total_size = full_data.len() as u64;
+        if total_size > self.cfg.max_object_size {
+            return Err(S3Error::new(
+                S3ErrorCode::EntityTooLarge,
+                "Your proposed upload exceeds the maximum allowed size",
+            ));
+        }
+        if let Some(exp_size) = req.expected_object_size {
+            if exp_size != total_size {
+                return Err(S3Error::new(
+                    S3ErrorCode::PreconditionFailed,
+                    "Object size does not match x-amz-mp-object-size.",
+                ));
+            }
+        }
+
+        // [PR-25] Final object checksum (Model computes FULL_OBJECT directly over concatenated bytes!)
+        let final_checksum = match (up.checksum_algorithm, up.checksum_type) {
+            (Some(alg), Some(ChecksumType::Composite)) => ChecksumState {
+                algorithm: alg,
+                checksum_type: ChecksumType::Composite,
+                value_b64: compute_composite_checksum_b64(alg, &part_csum_b64s)?,
+                client_requested: true,
+            },
+            (Some(alg), Some(ChecksumType::FullObject)) => ChecksumState {
+                algorithm: alg,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: compute_checksum_b64(alg, &full_data),
+                client_requested: true,
+            },
+            _ => ChecksumState {
+                algorithm: ChecksumAlgorithm::Crc64Nvme,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: compute_checksum_b64(ChecksumAlgorithm::Crc64Nvme, &full_data),
+                client_requested: false,
+            },
+        };
+
+        if let Some((exp_alg, exp_val)) = &req.expected_checksum {
+            if !final_checksum.client_requested
+                || *exp_alg != final_checksum.algorithm
+                || exp_val.trim() != final_checksum.value_b64
+            {
+                return Err(S3Error::new(
+                    S3ErrorCode::BadDigest,
+                    "The digest you specified did not match the calculated digest.",
+                ));
+            }
+        }
+
+        // [FR-15, FR-17] Evaluate destination preconditions at commit point
+        guard.next_seq += 1;
+        let seq = guard.next_seq;
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        let head = head_state_of(b.objects.get(&req.key));
+        evaluate_write_preconditions(&req.preconditions, &req.bucket, &req.key, head)?;
+
+        // [FR-7] Composite ETag: MD5(concat(part_md5s))-<N>
+        let outer_md5: [u8; 16] = Md5::digest(&md5_concat).into();
+        let etag = format!("\"{}-{}\"", hex::encode(outer_md5), deduped_parts.len());
+        let version_id = match b.versioning {
+            VersioningStatus::Unversioned => None,
+            VersioningStatus::Suspended => Some("null".to_string()),
+            VersioningStatus::Enabled => Some(format!("v{seq:016x}")),
+        };
+
+        let ver = ModelVersion {
+            seq,
+            version_id: version_id.clone(),
+            is_delete_marker: false,
+            data: full_data,
+            etag: etag.clone(),
+            checksum: final_checksum.clone(),
+            sys_meta: up.sys_meta,
+            user_meta: up.user_meta,
+            owner: up.owner,
+            acl: up.acl,
+            last_modified_ms: req.ctx.request_time_ms,
+            parts: Some(boundaries),
+        };
+
+        let chain = b.objects.entry(req.key.clone()).or_default();
+        insert_version_into_chain(b.versioning, chain, ver);
+        b.uploads.remove(&(req.key.clone(), req.upload_id.clone()));
+
+        let resp = CompleteMultipartUploadResp {
+            bucket: req.bucket,
+            key: req.key.clone(),
+            etag,
+            version_id,
+            checksum: final_checksum.client_requested.then_some(final_checksum),
+        };
+        b.completed_uploads.insert(
+            (req.key, req.upload_id),
+            (req.ctx.request_time_ms, resp.clone()),
+        );
+        Ok(resp)
+    }
+
+    async fn abort_multipart_upload(&self, req: AbortMultipartUploadReq) -> StoreResult<()> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let mut guard = self.state.lock().unwrap();
+        let b_ro = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        if let Some(up) = b_ro.uploads.get(&(req.key.clone(), req.upload_id.clone())) {
+            if !has_upload_perm(b_ro, up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+                );
+            }
+        } else {
+            if has_bucket_perm(b_ro, &req.ctx, AclPermission::Write) {
+                return Err(S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.bucket, &req.key, &req.upload_id));
+            }
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+            );
+        }
+        let b = guard.buckets.get_mut(&req.bucket).unwrap();
+        // [FR-28] Repeated Abort returns 404 NoSuchUpload
+        b.uploads.remove(&(req.key, req.upload_id));
+        Ok(())
+    }
+
+    async fn list_parts(&self, req: ListPartsReq) -> StoreResult<ListPartsResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let guard = self.state.lock().unwrap();
+        let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
+            if has_bucket_perm(b, &req.ctx, AclPermission::Read) {
+                return Err(S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.bucket, &req.key, &req.upload_id));
+            }
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+            );
+        };
+        if !has_upload_perm(b, up, &req.ctx, AclPermission::Read) {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(&req.bucket)
+            );
+        }
+
+        let max_p = req.max_parts.min(1000);
+        let mut parts = Vec::new();
+        let mut is_truncated = false;
+        if max_p > 0 {
+            for p in up.parts.values() {
+                if p.part_number <= req.part_number_marker {
+                    continue;
+                }
+                if parts.len() == max_p {
+                    is_truncated = true;
+                    break;
+                }
+                parts.push(PartSummary {
+                    part_number: p.part_number,
+                    last_modified_ms: p.last_modified_ms,
+                    etag: p.etag.clone(),
+                    size: p.data.len() as u64,
+                    checksum: p.checksum.clone(),
+                });
+            }
+        }
+        let next_marker = parts
+            .last()
+            .map(|p| p.part_number)
+            .unwrap_or(req.part_number_marker);
+
+        Ok(ListPartsResp {
+            bucket: req.bucket,
+            key: req.key,
+            upload_id: req.upload_id,
+            initiator: up.initiator.clone(),
+            owner: up.owner.clone(),
+            storage_class: "STANDARD".to_string(),
+            checksum_algorithm: up.checksum_algorithm,
+            checksum_type: up.checksum_type,
+            part_number_marker: req.part_number_marker,
+            next_part_number_marker: next_marker,
+            max_parts: max_p,
+            is_truncated,
+            parts,
+        })
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: ListMultipartUploadsReq,
+    ) -> StoreResult<ListMultipartUploadsResp> {
+        let guard = self.state.lock().unwrap();
+        let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Read)?;
+        let max_u = req.max_uploads.min(1000);
+        let km = req.key_marker.clone().unwrap_or_default();
+        let um = req.upload_id_marker.clone().unwrap_or_default();
+
+        let mut uploads = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut last_cp: Option<String> = None;
+        let mut is_truncated = false;
+        let mut next_km = None;
+        let mut next_um = None;
+
+        if max_u > 0 {
+            for ((key, uid), up) in &b.uploads {
+                if !key.starts_with(&req.prefix) {
+                    continue;
+                }
+                if !km.is_empty() {
+                    if key.as_str() < km.as_str() {
+                        continue;
+                    }
+                    if key == &km && (um.is_empty() || uid.as_str() <= um.as_str()) {
+                        continue;
+                    }
+                }
+                let rest = &key[req.prefix.len()..];
+                if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty()) {
+                    if let Some(pos) = rest.find(delim) {
+                        let cp = format!("{}{}", req.prefix, &rest[..pos + delim.len()]);
+                        if !km.is_empty() && cp.as_str() <= km.as_str() {
+                            continue;
+                        }
+                        if last_cp.as_deref() == Some(cp.as_str()) {
+                            continue;
+                        }
+                        if uploads.len() + common_prefixes.len() == max_u {
+                            is_truncated = true;
+                            break;
+                        }
+                        next_km = Some(cp.clone());
+                        next_um = None;
+                        last_cp = Some(cp.clone());
+                        common_prefixes.push(cp);
+                        continue;
+                    }
+                }
+                if uploads.len() + common_prefixes.len() == max_u {
+                    is_truncated = true;
+                    break;
+                }
+                next_km = Some(key.clone());
+                next_um = Some(uid.clone());
+                uploads.push(MultipartUploadSummary {
+                    key: key.clone(),
+                    upload_id: uid.clone(),
+                    initiator: up.initiator.clone(),
+                    owner: up.owner.clone(),
+                    storage_class: "STANDARD".to_string(),
+                    initiated_ms: up.initiated_ms,
+                    checksum_algorithm: up.checksum_algorithm,
+                    checksum_type: up.checksum_type,
+                });
+            }
+        }
+
+        if !is_truncated {
+            next_km = None;
+            next_um = None;
+        }
+
+        Ok(ListMultipartUploadsResp {
+            bucket: req.bucket,
+            key_marker: km,
+            upload_id_marker: um,
+            next_key_marker: next_km,
+            next_upload_id_marker: next_um,
+            prefix: req.prefix,
+            delimiter: req.delimiter,
+            max_uploads: max_u,
+            is_truncated,
+            uploads,
+            common_prefixes,
         })
     }
 
     async fn list_objects_v1(&self, req: ListObjectsV1Req) -> StoreResult<ListObjectsV1Resp> {
         let guard = self.state.lock().unwrap();
-        let b = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Read)?;
         let max_keys = req.max_keys.min(1000);
         let marker_str = req.marker.clone().unwrap_or_default();
         let (items, is_truncated) = collect_visible_items(
@@ -803,11 +1841,11 @@ impl ObjectStore for ModelStore {
 
     async fn list_objects_v2(&self, req: ListObjectsV2Req) -> StoreResult<ListObjectsV2Resp> {
         let guard = self.state.lock().unwrap();
-        let b = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Read)?;
         let max_keys = req.max_keys.min(1000);
         let token_after = match &req.continuation_token {
-            Some(tok) => Some(decode_token(&req.bucket, tok)?),
-            None => None,
+            Some(tok) if !tok.is_empty() => Some(decode_token(&req.bucket, tok)?),
+            _ => None,
         };
         let effective_after = match (&token_after, &req.start_after) {
             (Some(a), Some(b)) => Some(if a > b { a.as_str() } else { b.as_str() }),
@@ -876,7 +1914,7 @@ impl ObjectStore for ModelStore {
         req: ListObjectVersionsReq,
     ) -> StoreResult<ListObjectVersionsResp> {
         let guard = self.state.lock().unwrap();
-        let b = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&guard, &req.ctx, &req.bucket, AclPermission::Read)?;
         let max_keys = req.max_keys.min(1000);
         let km = req.key_marker.clone().unwrap_or_default();
         let vm = req.version_id_marker.clone().unwrap_or_default();
@@ -986,6 +2024,141 @@ impl ObjectStore for ModelStore {
 }
 
 impl ModelStore {
+    fn lookup_version_for_read<'a>(
+        &self,
+        b: &'a ModelBucket,
+        bucket_name: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> StoreResult<&'a ModelVersion> {
+        match version_id {
+            None => {
+                let Some(head) = b.objects.get(key).and_then(|c| c.first()) else {
+                    return Err(
+                        S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
+                            .with_key(bucket_name, key),
+                    );
+                };
+                if head.is_delete_marker {
+                    // [FR-37] Current version is delete marker -> 404 + x-amz-delete-marker: true
+                    let mut err =
+                        S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
+                            .with_key(bucket_name, key)
+                            .with_header("x-amz-delete-marker", "true");
+                    if let Some(vid) = &head.version_id {
+                        err = err.with_header("x-amz-version-id", vid.clone());
+                    }
+                    return Err(err);
+                }
+                Ok(head)
+            }
+            Some(vid) => {
+                let Some(found) = b.objects.get(key).and_then(|c| {
+                    c.iter()
+                        .find(|v| v.version_id.as_deref().unwrap_or("null") == vid)
+                }) else {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NoSuchVersion,
+                        "The specified version does not exist.",
+                    )
+                    .with_key(bucket_name, key));
+                };
+                if found.is_delete_marker {
+                    // [FR-37] GET/HEAD on delete marker with versionId -> 405 MethodNotAllowed
+                    return Err(S3Error::new(
+                        S3ErrorCode::MethodNotAllowed,
+                        "The specified method is not allowed against this resource.",
+                    )
+                    .with_header("x-amz-delete-marker", "true")
+                    .with_header("Allow", "DELETE"));
+                }
+                Ok(found)
+            }
+        }
+    }
+
+    fn lookup_version_for_read_checked<'a>(
+        &self,
+        b: &'a ModelBucket,
+        ctx: &CallerContext,
+        bucket_name: &str,
+        key: &str,
+        version_id: Option<&str>,
+        needed: AclPermission,
+    ) -> StoreResult<&'a ModelVersion> {
+        match self.lookup_version_for_read(b, bucket_name, key, version_id) {
+            Ok(ver) => {
+                if !has_object_perm(b, ver, ctx, needed) {
+                    return Err(
+                        S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                            .with_key(bucket_name, key),
+                    );
+                }
+                Ok(ver)
+            }
+            Err(err) => {
+                if has_bucket_perm(b, ctx, AclPermission::Read) {
+                    Err(err)
+                } else {
+                    Err(
+                        S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                            .with_key(bucket_name, key),
+                    )
+                }
+            }
+        }
+    }
+
+    fn lookup_version_for_copy_checked<'a>(
+        &self,
+        b: &'a ModelBucket,
+        ctx: &CallerContext,
+        bucket_name: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> StoreResult<&'a ModelVersion> {
+        let ver = match version_id {
+            None => b
+                .objects
+                .get(key)
+                .and_then(|c| c.first())
+                .filter(|v| !v.is_delete_marker),
+            Some(vid) => b.objects.get(key).and_then(|c| {
+                c.iter()
+                    .find(|v| v.version_id.as_deref().unwrap_or("null") == vid)
+            }),
+        };
+        let Some(ver) = ver else {
+            if has_bucket_perm(b, ctx, AclPermission::Read) {
+                return Err(
+                    S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
+                        .with_key(bucket_name, key),
+                );
+            }
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_key(bucket_name, key)
+            );
+        };
+        if ver.is_delete_marker {
+            if !has_bucket_perm(b, ctx, AclPermission::Read) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_key(bucket_name, key),
+                );
+            }
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "The source of a copy request may not specifically refer to a delete marker by version id.",
+            ));
+        }
+        if !has_object_perm(b, ver, ctx, AclPermission::Read) {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_key(bucket_name, key)
+            );
+        }
+        Ok(ver)
+    }
+
     fn read_internal(
         &self,
         req: &GetObjectReq,
@@ -1000,54 +2173,15 @@ impl ModelStore {
         }
 
         let guard = self.state.lock().unwrap();
-        let b = check_bucket_access(&guard, &req.ctx, &req.bucket)?;
-        let ver = match &req.version_id {
-            None => {
-                let Some(head) = b.objects.get(&req.key).and_then(|c| c.first()) else {
-                    return Err(S3Error::new(
-                        S3ErrorCode::NoSuchKey,
-                        "The specified key does not exist.",
-                    )
-                    .with_key(&req.bucket, &req.key));
-                };
-                if head.is_delete_marker {
-                    // [FR-37] Current version is delete marker -> 404 + x-amz-delete-marker: true
-                    let mut err = S3Error::new(
-                        S3ErrorCode::NoSuchKey,
-                        "The specified key does not exist.",
-                    )
-                    .with_key(&req.bucket, &req.key)
-                    .with_header("x-amz-delete-marker", "true");
-                    if let Some(vid) = &head.version_id {
-                        err = err.with_header("x-amz-version-id", vid.clone());
-                    }
-                    return Err(err);
-                }
-                head
-            }
-            Some(vid) => {
-                let Some(found) = b.objects.get(&req.key).and_then(|c| {
-                    c.iter()
-                        .find(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
-                }) else {
-                    return Err(S3Error::new(
-                        S3ErrorCode::NoSuchVersion,
-                        "The specified version does not exist.",
-                    )
-                    .with_key(&req.bucket, &req.key));
-                };
-                if found.is_delete_marker {
-                    // [FR-37] GET/HEAD on delete marker with versionId -> 405 MethodNotAllowed
-                    return Err(S3Error::new(
-                        S3ErrorCode::MethodNotAllowed,
-                        "The specified method is not allowed against this resource.",
-                    )
-                    .with_header("x-amz-delete-marker", "true")
-                    .with_header("Allow", "DELETE"));
-                }
-                found
-            }
-        };
+        let b = lookup_bucket_checked(&guard, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_read_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            AclPermission::Read,
+        )?;
 
         let last_mod_http = httpdate::fmt_http_date(
             std::time::UNIX_EPOCH
@@ -1061,15 +2195,17 @@ impl ModelStore {
         )?;
 
         let total_size = ver.data.len() as u64;
+        let mut part_specific_csum: Option<ChecksumState> = None;
+
         let (start, end, is_partial, parts_count) = if let Some(pn) = req.part_number {
             // [FR-10] partNumber reading
-            if pn == 0 || pn > 10_000 {
+            if pn == 0 || pn > MAX_PARTS_COUNT {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidArgument,
                     "Part number must be an integer between 1 and 10000, inclusive",
                 ));
             }
-            match &ver.part_sizes {
+            match &ver.parts {
                 None => {
                     if pn != 1 {
                         return Err(S3Error::new(
@@ -1078,24 +2214,32 @@ impl ModelStore {
                         ));
                     }
                     if total_size == 0 {
-                        (0, 0, false, Some(1))
+                        (0, 0, false, None)
                     } else {
-                        (0, total_size - 1, true, Some(1))
+                        (0, total_size - 1, true, None)
                     }
                 }
-                Some(sizes) => {
-                    if (pn as usize) > sizes.len() {
+                Some(parts) => {
+                    if (pn as usize) > parts.len() {
                         return Err(S3Error::new(
                             S3ErrorCode::InvalidPart,
                             "The requested partnumber is not satisfiable",
                         ));
                     }
-                    let offset: u64 = sizes[..(pn as usize - 1)].iter().sum();
-                    let len = sizes[pn as usize - 1];
-                    if len == 0 {
-                        (offset, offset, false, Some(sizes.len() as u32))
+                    let offset: u64 = parts[..(pn as usize - 1)].iter().map(|p| p.size).sum();
+                    let pinfo = &parts[pn as usize - 1];
+                    if let Some((alg, b64_val)) = &pinfo.checksum {
+                        part_specific_csum = Some(ChecksumState {
+                            algorithm: *alg,
+                            checksum_type: ver.checksum.checksum_type,
+                            value_b64: b64_val.clone(),
+                            client_requested: true,
+                        });
+                    }
+                    if pinfo.size == 0 {
+                        (offset, offset, false, Some(parts.len() as u32))
                     } else {
-                        (offset, offset + len - 1, true, Some(sizes.len() as u32))
+                        (offset, offset + pinfo.size - 1, true, Some(parts.len() as u32))
                     }
                 }
             }
@@ -1108,7 +2252,13 @@ impl ModelStore {
             (0, total_size - 1, false, None)
         };
 
-        let content_len = if total_size == 0 && !is_partial {
+        let content_len = if req.part_number.is_some() {
+            if let Some(parts) = &ver.parts {
+                parts[req.part_number.unwrap() as usize - 1].size
+            } else {
+                total_size
+            }
+        } else if total_size == 0 && !is_partial {
             0
         } else if is_partial && total_size > 0 {
             end - start + 1
@@ -1116,15 +2266,16 @@ impl ModelStore {
             total_size
         };
 
-        let content_range = if is_partial && total_size > 0 {
+        let content_range = if is_partial && content_len > 0 {
             Some((start, end, total_size))
         } else {
             None
         };
 
-        // [PR-24] Checksum returned only when checksum_mode == ENABLED and reading full object
-        let is_full = content_len == total_size;
-        let checksum = if req.checksum_mode_enabled && is_full {
+        // [PR-24] Full-object checksum returned when checksum_mode == ENABLED; part read returns part checksum if present
+        let checksum = if part_specific_csum.is_some() {
+            part_specific_csum
+        } else if req.checksum_mode_enabled && req.range.is_none() && req.part_number.is_none() {
             Some(ver.checksum.clone())
         } else {
             None

@@ -25,4 +25,9 @@ sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 proptest.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true

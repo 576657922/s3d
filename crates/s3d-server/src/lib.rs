@@ -44,14 +44,19 @@ pub async fn run_production_server(
     let disk = OsDisk::new(&cfg.data_dir)
         .map_err(|e| format!("failed to initialize data_dir {}: {e}", cfg.data_dir.display()))?;
 
+    let retention_ms = cfg.completed_upload_retention_ms()?;
     let engine_cfg = EngineConfig {
         region: cfg.region.clone(),
         segment_size: cfg.segment_size,
         wal_file_size: cfg.wal_file_size,
         reserved_disk_bytes: cfg.reserved_disk_bytes,
         max_buckets_per_account: cfg.max_buckets_per_account,
+        max_object_size: cfg.max_object_size,
+        completed_upload_retention_ms: retention_ms,
         default_object_ownership: ownership,
         gc_live_ratio: cfg.gc_live_ratio,
+        group_commit_window_ms: cfg.group_commit_window_ms,
+        group_commit_max_batch: cfg.group_commit_max_batch,
         ..EngineConfig::default()
     };
 
@@ -172,6 +177,7 @@ where
                 match Arc::clone(&conn_sem).try_acquire_owned() {
                     Ok(permit) => {
                         let st = Arc::clone(&state);
+                        let mut conn_stop_rx = stop_rx.clone();
                         st.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
                         conn_tasks.spawn(async move {
                             let _permit = permit;
@@ -183,12 +189,26 @@ where
                                     Ok::<_, Infallible>(handle_s3_request(st_req, req).await)
                                 }
                             });
-                            let _ = http1::Builder::new()
+                            let conn = http1::Builder::new()
                                 .timer(TokioTimer::new())
                                 .header_read_timeout(Duration::from_secs(30))
                                 .keep_alive(true)
-                                .serve_connection(io, svc)
-                                .await;
+                                .serve_connection(io, svc);
+                            tokio::pin!(conn);
+                            if *conn_stop_rx.borrow() {
+                                conn.as_mut().graceful_shutdown();
+                                let _ = conn.as_mut().await;
+                            } else {
+                                tokio::select! {
+                                    res = conn.as_mut() => {
+                                        let _ = res;
+                                    }
+                                    _ = conn_stop_rx.changed() => {
+                                        conn.as_mut().graceful_shutdown();
+                                        let _ = conn.as_mut().await;
+                                    }
+                                }
+                            }
                             st.metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                         });
                     }

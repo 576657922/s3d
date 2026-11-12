@@ -18,15 +18,12 @@ use crate::metrics::ServerMetrics;
 const MAX_HEADER_SECTION_BYTES: usize = 8192; // PR-19
 
 const UNIMPLEMENTED_BUCKET_SUBRESOURCES: &[&str] = &[
-    "acl",
     "policy",
     "policyStatus",
     "publicAccessBlock",
     "ownershipControls",
-    "versioning",
     "tagging",
     "cors",
-    "uploads",
     "lifecycle",
     "encryption",
     "object-lock",
@@ -43,11 +40,7 @@ const UNIMPLEMENTED_BUCKET_SUBRESOURCES: &[&str] = &[
 ];
 
 const UNIMPLEMENTED_OBJECT_SUBRESOURCES: &[&str] = &[
-    "acl",
     "tagging",
-    "uploads",
-    "uploadId",
-    "attributes",
     "retention",
     "legal-hold",
     "select",
@@ -323,6 +316,175 @@ async fn handle_bucket_target<S: ObjectStore>(
         }
     }
 
+    if has_query_key(query, "acl") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketAcl";
+                drain_empty_or_ignore(incoming).await;
+                let pol = state
+                    .store
+                    .get_bucket_acl(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(StatusCode::OK, render_acl_xml(&pol)));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketAcl";
+                let header_acl = parse_acl_headers(headers, &state.auth)?;
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_body, _) = stream.collect_bounded().await?;
+                let acl = match header_acl {
+                    Some(spec) => {
+                        if !raw_body.is_empty() {
+                            return Err(S3Error::new(
+                                S3ErrorCode::InvalidRequest,
+                                "This request does not support content when ACL headers are provided",
+                            ));
+                        }
+                        spec
+                    }
+                    None => {
+                        if raw_body.is_empty() {
+                            return Err(S3Error::new(
+                                S3ErrorCode::MissingSecurityHeader,
+                                "Your request was missing a required header",
+                            ));
+                        }
+                        let pol = parse_acl_xml(
+                            &raw_body,
+                            |uid| state.auth.lookup_by_user_id(uid),
+                            |em| state.auth.lookup_by_email(em),
+                        )?;
+                        AclSpec::Policy(pol)
+                    }
+                };
+                state
+                    .store
+                    .put_bucket_acl(PutBucketAclReq { ctx, bucket, acl })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "versioning") {
+        match *method {
+            Method::GET => {
+                *op_name = "GetBucketVersioning";
+                drain_empty_or_ignore(incoming).await;
+                let vstate = state
+                    .store
+                    .get_bucket_versioning(BucketRef { ctx, bucket })
+                    .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    render_bucket_versioning_xml(vstate),
+                ));
+            }
+            Method::PUT => {
+                *op_name = "PutBucketVersioning";
+                if headers.contains_key("x-amz-mfa") {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NotImplemented,
+                        "MFA Delete is not supported.",
+                    )
+                    .with_bucket(&bucket));
+                }
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let status = parse_bucket_versioning_xml(&raw_xml)?;
+                state
+                    .store
+                    .put_bucket_versioning(PutBucketVersioningReq {
+                        ctx,
+                        bucket,
+                        status,
+                    })
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0")
+                    .body(S3ResponseBody::empty())
+                    .unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "Method not allowed",
+                ));
+            }
+        }
+    }
+
+    if has_query_key(query, "uploads") {
+        if *method != Method::GET {
+            return Err(S3Error::new(
+                S3ErrorCode::MethodNotAllowed,
+                "Method not allowed",
+            ));
+        }
+        *op_name = "ListMultipartUploads";
+        drain_empty_or_ignore(incoming).await;
+        let url_encode = parse_encoding_type(query)?;
+        let max_uploads = parse_bounded_limit_param(query, "max-uploads", 1000)?;
+        let prefix = get_query_param(query, "prefix")
+            .unwrap_or_default()
+            .to_string();
+        let delimiter = get_query_param(query, "delimiter")
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        let key_marker = get_query_param(query, "key-marker")
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        let upload_id_marker = get_query_param(query, "upload-id-marker")
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+
+        let resp = state
+            .store
+            .list_multipart_uploads(ListMultipartUploadsReq {
+                ctx,
+                bucket,
+                prefix,
+                delimiter,
+                key_marker,
+                upload_id_marker,
+                max_uploads,
+            })
+            .await?;
+        return Ok(xml_response(
+            StatusCode::OK,
+            render_list_multipart_uploads_xml(&resp, url_encode),
+        ));
+    }
+
     if has_query_key(query, "location") {
         if *method != Method::GET {
             return Err(S3Error::new(
@@ -444,7 +606,7 @@ async fn handle_bucket_target<S: ObjectStore>(
     match *method {
         Method::PUT => {
             *op_name = "CreateBucket";
-            validate_canned_acl_header_if_present(headers)?;
+            let acl = parse_acl_headers(headers, &state.auth)?;
             let object_ownership = parse_object_ownership_header(headers)?;
             let expected_md5 = parse_optional_md5(headers)?;
             let header_csum = parse_header_checksum(headers)?;
@@ -468,6 +630,7 @@ async fn handle_bucket_target<S: ObjectStore>(
                     bucket: bucket.clone(),
                     location_constraint,
                     object_ownership,
+                    acl,
                 })
                 .await?;
 
@@ -517,12 +680,6 @@ async fn handle_bucket_target<S: ObjectStore>(
                     let start_after = get_query_param(query, "start-after").map(str::to_string);
                     let continuation_token =
                         get_query_param(query, "continuation-token").map(str::to_string);
-                    if continuation_token.as_deref() == Some("") {
-                        return Err(S3Error::new(
-                            S3ErrorCode::InvalidArgument,
-                            "The continuation token provided is incorrect",
-                        ));
-                    }
                     let fetch_owner = get_query_param(query, "fetch-owner")
                         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
                     let resp = state
@@ -609,10 +766,507 @@ async fn handle_object_target<S: ObjectStore>(
         }
     }
 
+    // 0. `GET/PUT /{b}/{k}?acl` (`PR-32`)
+    if has_query_key(query, "acl") {
+        let version_id = get_query_param(query, "versionId").map(str::to_string);
+        match *method {
+            Method::GET => {
+                *op_name = "GetObjectAcl";
+                drain_empty_or_ignore(incoming).await;
+                let resp = state
+                    .store
+                    .get_object_acl(GetObjectAclReq {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                    })
+                    .await?;
+                let xml = render_acl_xml(&resp.policy);
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/xml")
+                    .header("Content-Length", xml.len().to_string());
+                if let Some(vid) = &resp.version_id {
+                    builder = builder.header("x-amz-version-id", vid);
+                }
+                return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
+            }
+            Method::PUT => {
+                *op_name = "PutObjectAcl";
+                let header_acl = parse_acl_headers(headers, &state.auth)?;
+                let expected_md5 = parse_optional_md5(headers)?;
+                let header_csum = parse_header_checksum(headers)?;
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    header_csum,
+                    64 * 1024,
+                )?;
+                let (raw_body, _) = stream.collect_bounded().await?;
+                let acl = match header_acl {
+                    Some(spec) => {
+                        if !raw_body.is_empty() {
+                            return Err(S3Error::new(
+                                S3ErrorCode::InvalidRequest,
+                                "This request does not support content when ACL headers are provided",
+                            ));
+                        }
+                        spec
+                    }
+                    None => {
+                        if raw_body.is_empty() {
+                            return Err(S3Error::new(
+                                S3ErrorCode::MissingSecurityHeader,
+                                "Your request was missing a required header",
+                            ));
+                        }
+                        let pol = parse_acl_xml(
+                            &raw_body,
+                            |uid| state.auth.lookup_by_user_id(uid),
+                            |em| state.auth.lookup_by_email(em),
+                        )?;
+                        AclSpec::Policy(pol)
+                    }
+                };
+                let vid_out = state
+                    .store
+                    .put_object_acl(PutObjectAclReq {
+                        ctx,
+                        bucket,
+                        key,
+                        version_id,
+                        acl,
+                    })
+                    .await?;
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Length", "0");
+                if let Some(vid) = &vid_out {
+                    builder = builder.header("x-amz-version-id", vid);
+                }
+                return Ok(builder.body(S3ResponseBody::empty()).unwrap());
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::MethodNotAllowed,
+                    "The specified method is not allowed against this resource.",
+                ));
+            }
+        }
+    }
+
+    // 1. `GET /{b}/{k}?attributes` (`FR-47`)
+    if has_query_key(query, "attributes") {
+        if *method != Method::GET {
+            return Err(S3Error::new(
+                S3ErrorCode::MethodNotAllowed,
+                "The specified method is not allowed against this resource.",
+            ));
+        }
+        *op_name = "GetObjectAttributes";
+        drain_empty_or_ignore(incoming).await;
+        let attrs = parse_object_attributes_header(headers)?;
+        let max_parts = parse_optional_max_parts_header(headers)?;
+        let part_number_marker = parse_optional_part_marker_header(headers)?;
+        let version_id = get_query_param(query, "versionId").map(str::to_string);
+
+        let resp = state
+            .store
+            .get_object_attributes(GetObjectAttributesReq {
+                ctx,
+                bucket,
+                key,
+                version_id,
+                attrs,
+                max_parts,
+                part_number_marker,
+            })
+            .await?;
+
+        let last_modified_http = httpdate::fmt_http_date(
+            UNIX_EPOCH + std::time::Duration::from_millis(resp.last_modified_ms.max(0) as u64),
+        );
+        let xml = render_get_object_attributes_xml(&resp);
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .header("Content-Length", xml.len().to_string())
+            .header("Last-Modified", last_modified_http);
+        if let Some(vid) = &resp.version_id {
+            if vid != "null" {
+                builder = builder.header("x-amz-version-id", vid);
+            }
+        }
+        return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
+    }
+
+    // 2. `POST /{b}/{k}?uploads` (`CreateMultipartUpload`, `FR-23`)
+    if has_query_key(query, "uploads") {
+        if *method != Method::POST {
+            return Err(S3Error::new(
+                S3ErrorCode::MethodNotAllowed,
+                "The specified method is not allowed against this resource.",
+            ));
+        }
+        *op_name = "CreateMultipartUpload";
+        validate_storage_class(headers)?;
+        let acl = parse_acl_headers(headers, &state.auth)?;
+        drain_empty_or_ignore(incoming).await;
+
+        let sys_meta = extract_system_meta(headers);
+        let user_meta = extract_user_meta(headers)?;
+        let checksum_algorithm = match headers.get("x-amz-checksum-algorithm") {
+            Some(hv) => {
+                let s = hv
+                    .to_str()
+                    .map_err(|_| {
+                        S3Error::new(
+                            S3ErrorCode::InvalidRequest,
+                            "Invalid x-amz-checksum-algorithm header",
+                        )
+                    })?
+                    .trim();
+                Some(ChecksumAlgorithm::from_aws_str(s).ok_or_else(|| {
+                    S3Error::new(
+                        S3ErrorCode::InvalidRequest,
+                        "Checksum algorithm provided is unsupported.",
+                    )
+                })?)
+            }
+            None => None,
+        };
+        let checksum_type = match headers.get("x-amz-checksum-type") {
+            Some(hv) => {
+                let s = hv
+                    .to_str()
+                    .map_err(|_| {
+                        S3Error::new(
+                            S3ErrorCode::InvalidRequest,
+                            "Invalid x-amz-checksum-type header",
+                        )
+                    })?
+                    .trim();
+                Some(ChecksumType::from_aws_str(s).ok_or_else(|| {
+                    S3Error::new(
+                        S3ErrorCode::InvalidRequest,
+                        "Invalid x-amz-checksum-type header",
+                    )
+                })?)
+            }
+            None => None,
+        };
+
+        let resp = state
+            .store
+            .create_multipart_upload(CreateMultipartUploadReq {
+                ctx,
+                bucket,
+                key,
+                sys_meta,
+                user_meta,
+                checksum_algorithm,
+                checksum_type,
+                acl,
+            })
+            .await?;
+
+        let xml = render_initiate_multipart_xml(&resp);
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .header("Content-Length", xml.len().to_string());
+        if let Some(alg) = resp.checksum_algorithm {
+            builder = builder.header("x-amz-checksum-algorithm", alg.as_aws_str());
+        }
+        if let Some(ct) = resp.checksum_type {
+            builder = builder.header("x-amz-checksum-type", ct.as_aws_str());
+        }
+        return Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap());
+    }
+
+    // 3. `?uploadId=U` (`UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`)
+    if let Some(upload_id_raw) = get_query_param(query, "uploadId") {
+        let upload_id = upload_id_raw.to_string();
+        let part_num_param = get_query_param(query, "partNumber");
+
+        return match (method, part_num_param) {
+            (&Method::PUT, Some(pn_raw)) => {
+                let part_number = pn_raw.parse::<u32>().map_err(|_| {
+                    S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        "Part number must be an integer between 1 and 10000, inclusive",
+                    )
+                })?;
+                if part_number == 0 || part_number > MAX_PARTS_COUNT {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        "Part number must be an integer between 1 and 10000, inclusive",
+                    ));
+                }
+
+                if let Some(copy_src_val) = headers.get("x-amz-copy-source") {
+                    *op_name = "UploadPartCopy";
+                    drain_empty_or_ignore(incoming).await;
+                    let copy_src_raw = copy_src_val.to_str().map_err(|_| {
+                        S3Error::new(S3ErrorCode::InvalidArgument, "Invalid x-amz-copy-source")
+                    })?;
+                    let (src_bucket, src_key, src_version_id) = parse_copy_source(copy_src_raw)?;
+                    let src_range = match headers.get("x-amz-copy-source-range") {
+                        Some(hv) => {
+                            let s = hv.to_str().map_err(|_| {
+                                S3Error::new(
+                                    S3ErrorCode::InvalidArgument,
+                                    "Invalid x-amz-copy-source-range header",
+                                )
+                            })?;
+                            Some(parse_copy_source_range(s)?)
+                        }
+                        None => None,
+                    };
+                    let src_preconditions = extract_copy_source_preconditions(headers)?;
+
+                    let resp = state
+                        .store
+                        .upload_part_copy(UploadPartCopyReq {
+                            ctx,
+                            src_bucket,
+                            src_key,
+                            src_version_id,
+                            src_range,
+                            src_preconditions,
+                            dst_bucket: bucket,
+                            dst_key: key,
+                            upload_id,
+                            part_number,
+                        })
+                        .await?;
+
+                    let xml = render_copy_part_xml(&resp);
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/xml")
+                        .header("Content-Length", xml.len().to_string());
+                    if let Some(sv) = &resp.src_version_id {
+                        if sv != "null" {
+                            builder = builder.header("x-amz-copy-source-version-id", sv);
+                        }
+                    }
+                    Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap())
+                } else {
+                    *op_name = "UploadPart";
+                    let is_streaming_aws_chunked = matches!(
+                        auth_out.payload_mode,
+                        PayloadAuthMode::StreamingSignedChunked { .. }
+                            | PayloadAuthMode::StreamingUnsignedTrailer { .. }
+                    );
+                    let is_http_chunked = headers
+                        .get("transfer-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|s| s.to_ascii_lowercase().contains("chunked"));
+
+                    if content_length.is_none() && !is_streaming_aws_chunked && !is_http_chunked {
+                        return Err(S3Error::new(
+                            S3ErrorCode::MissingContentLength,
+                            "You must provide the Content-Length HTTP header.",
+                        ));
+                    }
+
+                    let expected_md5 = parse_optional_md5(headers)?;
+                    let header_csum = parse_header_checksum(headers)?;
+                    let effective_expected_len = if is_http_chunked && !is_streaming_aws_chunked {
+                        headers
+                            .get("x-amz-decoded-content-length")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                    } else {
+                        content_length
+                    };
+
+                    let stream = HyperVerifiedBodyStream::new(
+                        incoming,
+                        auth_out.payload_mode,
+                        effective_expected_len,
+                        expected_md5,
+                        header_csum,
+                        MAX_PART_SIZE_BYTES,
+                    )?;
+
+                    let resp = state
+                        .store
+                        .upload_part(
+                            UploadPartReq {
+                                ctx,
+                                bucket,
+                                key,
+                                upload_id,
+                                part_number,
+                                max_bytes_limit: MAX_PART_SIZE_BYTES,
+                            },
+                            stream,
+                        )
+                        .await?;
+
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("ETag", &resp.etag)
+                        .header("Content-Length", "0");
+                    if let Some(csum) = &resp.checksum {
+                        builder = builder.header(csum.algorithm.header_name(), &csum.value_b64);
+                    }
+                    Ok(builder.body(S3ResponseBody::empty()).unwrap())
+                }
+            }
+            (&Method::POST, None) => {
+                *op_name = "CompleteMultipartUpload";
+                let expected_object_size = match headers.get("x-amz-mp-object-size") {
+                    Some(hv) => {
+                        let s = hv
+                            .to_str()
+                            .map_err(|_| {
+                                S3Error::new(
+                                    S3ErrorCode::InvalidArgument,
+                                    "Invalid x-amz-mp-object-size header",
+                                )
+                            })?
+                            .trim();
+                        Some(s.parse::<u64>().map_err(|_| {
+                            S3Error::new(
+                                S3ErrorCode::InvalidArgument,
+                                "Invalid x-amz-mp-object-size header",
+                            )
+                        })?)
+                    }
+                    None => None,
+                };
+                let expected_checksum = parse_complete_mp_checksum_header(headers)?;
+                let preconditions = extract_write_preconditions(headers);
+                let expected_md5 = parse_optional_md5(headers)?;
+
+                // Note: Do NOT pass `x-amz-checksum-*` into `HyperVerifiedBodyStream` here,
+                // because on `CompleteMultipartUpload` `x-amz-checksum-*` specifies the target
+                // assembled object's checksum, NOT the XML request body's checksum!
+                let stream = HyperVerifiedBodyStream::new(
+                    incoming,
+                    auth_out.payload_mode,
+                    content_length,
+                    expected_md5,
+                    None,
+                    2 * 1024 * 1024, // 2 MiB (`NFR-8`)
+                )?;
+                let (raw_xml, _) = stream.collect_bounded().await?;
+                let parts = parse_complete_multipart_xml(&raw_xml)?;
+
+                let resp = state
+                    .store
+                    .complete_multipart_upload(CompleteMultipartUploadReq {
+                        ctx,
+                        bucket,
+                        key,
+                        upload_id,
+                        parts,
+                        expected_checksum,
+                        expected_object_size,
+                        preconditions,
+                    })
+                    .await?;
+
+                let host_str = headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("localhost");
+                let location = format!(
+                    "http://{host_str}/{}/{}",
+                    aws_uri_encode(&resp.bucket, true),
+                    aws_uri_encode(&resp.key, false)
+                );
+                let xml = render_complete_multipart_xml(&location, &resp);
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/xml")
+                    .header("Content-Length", xml.len().to_string());
+                if let Some(vid) = &resp.version_id {
+                    if vid != "null" {
+                        builder = builder.header("x-amz-version-id", vid);
+                    }
+                }
+                if let Some(csum) = &resp.checksum {
+                    builder = builder
+                        .header(csum.algorithm.header_name(), &csum.value_b64)
+                        .header("x-amz-checksum-type", csum.checksum_type.as_aws_str());
+                }
+                Ok(builder.body(S3ResponseBody::from_bytes(xml)).unwrap())
+            }
+            (&Method::DELETE, None) => {
+                *op_name = "AbortMultipartUpload";
+                drain_empty_or_ignore(incoming).await;
+                state
+                    .store
+                    .abort_multipart_upload(AbortMultipartUploadReq {
+                        ctx,
+                        bucket,
+                        key,
+                        upload_id,
+                    })
+                    .await?;
+                Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(S3ResponseBody::empty())
+                    .unwrap())
+            }
+            (&Method::GET, None) => {
+                *op_name = "ListParts";
+                drain_empty_or_ignore(incoming).await;
+                let url_encode = parse_encoding_type(query)?;
+                let max_parts = parse_bounded_limit_param(query, "max-parts", 1000)?;
+                let part_number_marker = match get_query_param(query, "part-number-marker") {
+                    None | Some("") => 0u32,
+                    Some(raw) => {
+                        let v = raw.parse::<i64>().map_err(|_| {
+                            S3Error::new(
+                                S3ErrorCode::InvalidArgument,
+                                "Argument partNumberMarker must be an integer between 0 and 10000",
+                            )
+                        })?;
+                        if !(0..=2_147_483_647).contains(&v) {
+                            return Err(S3Error::new(
+                                S3ErrorCode::InvalidArgument,
+                                "Argument partNumberMarker must be an integer between 0 and 10000",
+                            ));
+                        }
+                        v as u32
+                    }
+                };
+
+                let resp = state
+                    .store
+                    .list_parts(ListPartsReq {
+                        ctx,
+                        bucket,
+                        key,
+                        upload_id,
+                        max_parts,
+                        part_number_marker,
+                    })
+                    .await?;
+                Ok(xml_response(
+                    StatusCode::OK,
+                    render_list_parts_xml(&resp, url_encode),
+                ))
+            }
+            _ => Err(S3Error::new(
+                S3ErrorCode::MethodNotAllowed,
+                "The specified method is not allowed against this resource.",
+            )),
+        };
+    }
+
     match *method {
         Method::PUT => {
             validate_storage_class(headers)?;
-            validate_canned_acl_header_if_present(headers)?;
+            let acl = parse_acl_headers(headers, &state.auth)?;
 
             if let Some(copy_src_val) = headers.get("x-amz-copy-source") {
                 *op_name = "CopyObject";
@@ -653,6 +1307,7 @@ async fn handle_object_target<S: ObjectStore>(
                         user_meta,
                         src_preconditions,
                         dst_preconditions,
+                        acl,
                     })
                     .await?;
 
@@ -726,6 +1381,7 @@ async fn handle_object_target<S: ObjectStore>(
                         sys_meta,
                         user_meta,
                         preconditions,
+                        acl,
                         max_bytes_limit: max_put,
                     },
                     stream,
@@ -1110,24 +1766,200 @@ fn parse_encoding_type(query: &[(String, String)]) -> StoreResult<bool> {
 }
 
 fn parse_max_keys(query: &[(String, String)]) -> StoreResult<usize> {
-    match get_query_param(query, "max-keys") {
-        None => Ok(1000),
+    parse_bounded_limit_param(query, "max-keys", 1000)
+}
+
+fn parse_bounded_limit_param(
+    query: &[(String, String)],
+    param_name: &str,
+    cap: usize,
+) -> StoreResult<usize> {
+    match get_query_param(query, param_name) {
+        None => Ok(cap),
         Some(raw) => {
             let val = raw.parse::<i64>().map_err(|_| {
                 S3Error::new(
                     S3ErrorCode::InvalidArgument,
-                    "Argument maxKeys must be an integer between 0 and 2147483647",
+                    format!("Argument {param_name} must be an integer between 0 and 2147483647"),
                 )
             })?;
             if !(0..=2_147_483_647).contains(&val) {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidArgument,
-                    "Argument maxKeys must be an integer between 0 and 2147483647",
+                    format!("Argument {param_name} must be an integer between 0 and 2147483647"),
                 ));
             }
-            Ok((val as usize).min(1000))
+            Ok((val as usize).min(cap))
         }
     }
+}
+
+fn parse_copy_source_range(raw: &str) -> StoreResult<(u64, u64)> {
+    let s = raw.trim();
+    let Some(rest) = s.strip_prefix("bytes=") else {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The x-amz-copy-source-range value must be of the form bytes=first-last",
+        ));
+    };
+    if rest.contains(',') {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The x-amz-copy-source-range value must be of the form bytes=first-last",
+        ));
+    }
+    let Some((start_s, end_s)) = rest.split_once('-') else {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The x-amz-copy-source-range value must be of the form bytes=first-last",
+        ));
+    };
+    if start_s.is_empty() || end_s.is_empty() {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The x-amz-copy-source-range value must be of the form bytes=first-last",
+        ));
+    }
+    let start = start_s.parse::<u64>().map_err(|_| {
+        S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The x-amz-copy-source-range value must be of the form bytes=first-last",
+        )
+    })?;
+    let end = end_s.parse::<u64>().map_err(|_| {
+        S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The x-amz-copy-source-range value must be of the form bytes=first-last",
+        )
+    })?;
+    if start > end {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "The first byte position must be less than or equal to the last byte position.",
+        ));
+    }
+    Ok((start, end))
+}
+
+fn parse_object_attributes_header(headers: &HeaderMap) -> StoreResult<ObjectAttributesMask> {
+    let mut mask = ObjectAttributesMask::default();
+    let mut any = false;
+    for hv in headers.get_all("x-amz-object-attributes") {
+        let s = hv.to_str().map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Invalid x-amz-object-attributes header",
+            )
+        })?;
+        for tok in s.split(',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            any = true;
+            match t {
+                "ETag" => mask.etag = true,
+                "Checksum" => mask.checksum = true,
+                "ObjectParts" => mask.object_parts = true,
+                "StorageClass" => mask.storage_class = true,
+                "ObjectSize" => mask.object_size = true,
+                _ => {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        "Invalid attribute name specified.",
+                    ))
+                }
+            }
+        }
+    }
+    if !any {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "At least one attribute must be specified in x-amz-object-attributes.",
+        ));
+    }
+    Ok(mask)
+}
+
+fn parse_optional_max_parts_header(headers: &HeaderMap) -> StoreResult<usize> {
+    let Some(hv) = headers.get("x-amz-max-parts") else {
+        return Ok(1000);
+    };
+    let s = hv
+        .to_str()
+        .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid x-amz-max-parts"))?
+        .trim();
+    let v = s
+        .parse::<i64>()
+        .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid x-amz-max-parts"))?;
+    if !(0..=2_147_483_647).contains(&v) {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "Invalid x-amz-max-parts",
+        ));
+    }
+    Ok((v as usize).min(1000))
+}
+
+fn parse_optional_part_marker_header(headers: &HeaderMap) -> StoreResult<u32> {
+    let Some(hv) = headers.get("x-amz-part-number-marker") else {
+        return Ok(0);
+    };
+    let s = hv
+        .to_str()
+        .map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Invalid x-amz-part-number-marker",
+            )
+        })?
+        .trim();
+    if s.is_empty() {
+        return Ok(0);
+    }
+    let v = s.parse::<i64>().map_err(|_| {
+        S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "Invalid x-amz-part-number-marker",
+        )
+    })?;
+    if !(0..=2_147_483_647).contains(&v) {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "Invalid x-amz-part-number-marker",
+        ));
+    }
+    Ok(v as u32)
+}
+
+fn parse_complete_mp_checksum_header(
+    headers: &HeaderMap,
+) -> StoreResult<Option<(ChecksumAlgorithm, String)>> {
+    let candidates = [
+        (ChecksumAlgorithm::Crc32, "x-amz-checksum-crc32"),
+        (ChecksumAlgorithm::Crc32c, "x-amz-checksum-crc32c"),
+        (ChecksumAlgorithm::Crc64Nvme, "x-amz-checksum-crc64nvme"),
+        (ChecksumAlgorithm::Sha1, "x-amz-checksum-sha1"),
+        (ChecksumAlgorithm::Sha256, "x-amz-checksum-sha256"),
+    ];
+    let mut found: Option<(ChecksumAlgorithm, String)> = None;
+    for (alg, hname) in candidates {
+        if let Some(hv) = headers.get(hname) {
+            if found.is_some() {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    "Expecting a single x-amz-checksum- header.",
+                ));
+            }
+            let s = hv
+                .to_str()
+                .map_err(|_| S3Error::new(S3ErrorCode::BadDigest, "Invalid checksum header"))?
+                .trim()
+                .to_string();
+            found = Some((alg, s));
+        }
+    }
+    Ok(found)
 }
 
 fn parse_optional_content_length(headers: &HeaderMap) -> StoreResult<Option<u64>> {
@@ -1240,27 +2072,56 @@ fn validate_storage_class(headers: &HeaderMap) -> StoreResult<()> {
     Ok(())
 }
 
-fn validate_canned_acl_header_if_present(headers: &HeaderMap) -> StoreResult<()> {
-    if let Some(acl) = headers.get("x-amz-acl") {
-        let s = acl.to_str().unwrap_or("").trim();
-        if !matches!(
-            s,
-            "private"
-                | "public-read"
-                | "public-read-write"
-                | "authenticated-read"
-                | "aws-exec-read"
-                | "bucket-owner-read"
-                | "bucket-owner-full-control"
-                | "log-delivery-write"
-        ) {
-            return Err(S3Error::new(
-                S3ErrorCode::InvalidArgument,
-                "Invalid canned ACL",
-            ));
+fn parse_acl_headers(headers: &HeaderMap, auth: &SigV4Verifier) -> StoreResult<Option<AclSpec>> {
+    let canned = match headers.get("x-amz-acl") {
+        Some(hv) => {
+            let s = hv
+                .to_str()
+                .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid canned ACL"))?
+                .trim();
+            Some(
+                CannedAcl::from_aws_str(s)
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid canned ACL"))?,
+            )
+        }
+        None => None,
+    };
+
+    let grant_headers = [
+        ("x-amz-grant-read", AclPermission::Read),
+        ("x-amz-grant-write", AclPermission::Write),
+        ("x-amz-grant-read-acp", AclPermission::ReadAcp),
+        ("x-amz-grant-write-acp", AclPermission::WriteAcp),
+        ("x-amz-grant-full-control", AclPermission::FullControl),
+    ];
+    let resolve_id = |uid: &str| auth.lookup_by_user_id(uid);
+    let resolve_email = |em: &str| auth.lookup_by_email(em);
+
+    let mut grants = Vec::new();
+    let mut saw_grant_hdr = false;
+    for (hname, perm) in grant_headers {
+        for hv in headers.get_all(hname) {
+            saw_grant_hdr = true;
+            let raw = hv.to_str().map_err(|_| {
+                S3Error::new(
+                    S3ErrorCode::InvalidArgument,
+                    format!("Invalid {hname} header"),
+                )
+            })?;
+            let parsed = parse_acl_grant_header(raw, perm, &resolve_id, &resolve_email)?;
+            grants.extend(parsed);
         }
     }
-    Ok(())
+
+    match (canned, saw_grant_hdr) {
+        (Some(_), true) => Err(S3Error::new(
+            S3ErrorCode::InvalidRequest,
+            "Specifying both Canned ACLs and Header Grants is not allowed",
+        )),
+        (Some(c), false) => Ok(Some(AclSpec::Canned(c))),
+        (None, true) => Ok(Some(AclSpec::Grants(grants))),
+        (None, false) => Ok(None),
+    }
 }
 
 fn parse_object_ownership_header(headers: &HeaderMap) -> StoreResult<Option<ObjectOwnership>> {
@@ -1346,9 +2207,8 @@ fn parse_etag_list_header(headers: &HeaderMap, name: &str) -> Option<Vec<String>
 fn parse_http_date_sec_header(headers: &HeaderMap, name: &str) -> Option<i64> {
     let hv = headers.get(name)?;
     let s = hv.to_str().ok()?.trim();
-    let st = httpdate::parse_http_date(s).ok()?;
-    let dur = st.duration_since(UNIX_EPOCH).ok()?;
-    Some(dur.as_secs() as i64)
+    let ms = parse_http_or_rfc2822_date_ms(s).ok()?;
+    Some(ms.div_euclid(1000))
 }
 
 fn extract_read_preconditions(headers: &HeaderMap) -> StoreResult<Preconditions> {

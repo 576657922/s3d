@@ -265,7 +265,7 @@ pub fn render_list_objects_v1_xml(resp: &ListObjectsV1Resp, url_encode: bool) ->
     if let Some(d) = &resp.delimiter {
         xml.push_str(&format!(
             "<Delimiter>{}</Delimiter>",
-            encode_field(d, url_encode, true)
+            encode_field(d, url_encode, false)
         ));
     }
     if url_encode {
@@ -339,7 +339,7 @@ pub fn render_list_objects_v2_xml(
     if let Some(d) = &resp.delimiter {
         xml.push_str(&format!(
             "<Delimiter>{}</Delimiter>",
-            encode_field(d, url_encode, true)
+            encode_field(d, url_encode, false)
         ));
     }
     if url_encode {
@@ -412,7 +412,7 @@ pub fn render_list_object_versions_xml(resp: &ListObjectVersionsResp, url_encode
     if let Some(d) = &resp.delimiter {
         xml.push_str(&format!(
             "<Delimiter>{}</Delimiter>",
-            encode_field(d, url_encode, true)
+            encode_field(d, url_encode, false)
         ));
     }
     if url_encode {
@@ -523,17 +523,778 @@ pub fn render_copy_object_xml(resp: &CopyObjectResp) -> String {
         format_iso8601_millis(resp.last_modified_ms)
     ));
     if let Some(csum) = &resp.checksum {
-        let tag = match csum.algorithm {
-            ChecksumAlgorithm::Crc32 => "ChecksumCRC32",
-            ChecksumAlgorithm::Crc32c => "ChecksumCRC32C",
-            ChecksumAlgorithm::Crc64Nvme => "ChecksumCRC64NVME",
-            ChecksumAlgorithm::Sha1 => "ChecksumSHA1",
-            ChecksumAlgorithm::Sha256 => "ChecksumSHA256",
-        };
+        let tag = csum.algorithm.xml_tag_name();
         xml.push_str(&format!("<{tag}>{}</{tag}>", xml_escape(&csum.value_b64)));
     }
     xml.push_str("</CopyObjectResult>");
     xml
+}
+
+/// Parse `PUT /{b}?versioning` XML body (`FR-34`).
+pub fn parse_bucket_versioning_xml(body: &[u8]) -> StoreResult<VersioningStatus> {
+    if body.is_empty() || body.len() > 64 * 1024 {
+        return Err(malformed_xml());
+    }
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut saw_root = false;
+    let mut cur_tag = String::new();
+    let mut status_str: Option<String> = None;
+    let mut mfa_delete_str: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if name == "VersioningConfiguration" {
+                    saw_root = true;
+                } else if saw_root {
+                    cur_tag = name;
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                if e.local_name().as_ref() == b"VersioningConfiguration" {
+                    saw_root = true;
+                }
+            }
+            Ok(Event::Text(t)) if saw_root => {
+                let txt = t.unescape().map_err(|_| malformed_xml())?.to_string();
+                match cur_tag.as_str() {
+                    "Status" => status_str = Some(txt),
+                    "MfaDelete" => mfa_delete_str = Some(txt),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(_)) => {
+                cur_tag.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return Err(malformed_xml()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if !saw_root {
+        return Err(malformed_xml());
+    }
+
+    if let Some(mfa) = mfa_delete_str.as_deref() {
+        match mfa {
+            "Disabled" => {}
+            "Enabled" => {
+                return Err(S3Error::new(
+                    S3ErrorCode::NotImplemented,
+                    "MFA Delete is not supported.",
+                ));
+            }
+            _ => return Err(malformed_xml()),
+        }
+    }
+
+    match status_str.as_deref() {
+        Some("Enabled") => Ok(VersioningStatus::Enabled),
+        Some("Suspended") => Ok(VersioningStatus::Suspended),
+        _ => Err(malformed_xml()),
+    }
+}
+
+/// Render `GET /{b}?versioning` XML response (`FR-34`).
+pub fn render_bucket_versioning_xml(state: VersioningStatus) -> String {
+    match state {
+        VersioningStatus::Unversioned => format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"{S3_XML_NS}\"/>"
+        ),
+        VersioningStatus::Enabled => format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"{S3_XML_NS}\"><Status>Enabled</Status></VersioningConfiguration>"
+        ),
+        VersioningStatus::Suspended => format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"{S3_XML_NS}\"><Status>Suspended</Status></VersioningConfiguration>"
+        ),
+    }
+}
+
+/// Render `CreateMultipartUpload` (`POST /{b}/{k}?uploads`) XML response (`FR-23`).
+pub fn render_initiate_multipart_xml(resp: &CreateMultipartUploadResp) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"{S3_XML_NS}\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+        xml_escape(&resp.bucket),
+        xml_escape(&resp.key),
+        xml_escape(&resp.upload_id),
+    )
+}
+
+/// Parse `CompleteMultipartUpload` (`POST /{b}/{k}?uploadId=U`) XML body (`FR-25`, `NFR-8`: <= 2 MiB).
+pub fn parse_complete_multipart_xml(body: &[u8]) -> StoreResult<Vec<CompletePartSpec>> {
+    if body.is_empty() || body.len() > 2 * 1024 * 1024 {
+        return Err(malformed_xml());
+    }
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut saw_root = false;
+    let mut in_part = false;
+    let mut cur_tag = String::new();
+
+    let mut cur_part_num: Option<u32> = None;
+    let mut cur_etag: Option<String> = None;
+    let mut cur_csum: Option<(ChecksumAlgorithm, String)> = None;
+    let mut parts = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                match name.as_str() {
+                    "CompleteMultipartUpload" => saw_root = true,
+                    "Part" if saw_root => {
+                        in_part = true;
+                        cur_part_num = None;
+                        cur_etag = None;
+                        cur_csum = None;
+                    }
+                    _ if in_part => cur_tag = name,
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) if in_part => {
+                let txt = t.unescape().map_err(|_| malformed_xml())?.to_string();
+                match cur_tag.as_str() {
+                    "PartNumber" => {
+                        let pn = txt.trim().parse::<u32>().map_err(|_| malformed_xml())?;
+                        cur_part_num = Some(pn);
+                    }
+                    "ETag" => {
+                        cur_etag = Some(txt.trim().to_string());
+                    }
+                    "ChecksumCRC32" => cur_csum = Some((ChecksumAlgorithm::Crc32, txt.trim().to_string())),
+                    "ChecksumCRC32C" => cur_csum = Some((ChecksumAlgorithm::Crc32c, txt.trim().to_string())),
+                    "ChecksumCRC64NVME" => cur_csum = Some((ChecksumAlgorithm::Crc64Nvme, txt.trim().to_string())),
+                    "ChecksumSHA1" => cur_csum = Some((ChecksumAlgorithm::Sha1, txt.trim().to_string())),
+                    "ChecksumSHA256" => cur_csum = Some((ChecksumAlgorithm::Sha256, txt.trim().to_string())),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if name == "Part" && in_part {
+                    let part_number = cur_part_num.take().ok_or_else(malformed_xml)?;
+                    let etag = cur_etag.take().ok_or_else(malformed_xml)?;
+                    parts.push(CompletePartSpec {
+                        part_number,
+                        etag,
+                        checksum: cur_csum.take(),
+                    });
+                    in_part = false;
+                }
+                cur_tag.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return Err(malformed_xml()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if !saw_root || parts.is_empty() {
+        return Err(malformed_xml());
+    }
+    Ok(parts)
+}
+
+/// Render `CompleteMultipartUpload` XML response (`FR-25`).
+pub fn render_complete_multipart_xml(location: &str, resp: &CompleteMultipartUploadResp) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"{S3_XML_NS}\">"
+    );
+    xml.push_str(&format!("<Location>{}</Location>", xml_escape(location)));
+    xml.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(&resp.bucket)));
+    xml.push_str(&format!("<Key>{}</Key>", xml_escape(&resp.key)));
+    xml.push_str(&format!("<ETag>{}</ETag>", xml_escape(&resp.etag)));
+    if let Some(csum) = &resp.checksum {
+        let tag = csum.algorithm.xml_tag_name();
+        xml.push_str(&format!("<{tag}>{}</{tag}>", xml_escape(&csum.value_b64)));
+        xml.push_str(&format!(
+            "<ChecksumType>{}</ChecksumType>",
+            csum.checksum_type.as_aws_str()
+        ));
+    }
+    xml.push_str("</CompleteMultipartUploadResult>");
+    xml
+}
+
+/// Render `UploadPartCopy` (`CopyPartResult`) XML response (`FR-24`).
+pub fn render_copy_part_xml(resp: &UploadPartCopyResp) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyPartResult xmlns=\"{S3_XML_NS}\">"
+    );
+    xml.push_str(&format!("<ETag>{}</ETag>", xml_escape(&resp.etag)));
+    xml.push_str(&format!(
+        "<LastModified>{}</LastModified>",
+        format_iso8601_millis(resp.last_modified_ms)
+    ));
+    if let Some(csum) = &resp.checksum {
+        let tag = csum.algorithm.xml_tag_name();
+        xml.push_str(&format!("<{tag}>{}</{tag}>", xml_escape(&csum.value_b64)));
+    }
+    xml.push_str("</CopyPartResult>");
+    xml
+}
+
+/// Render `ListParts` (`GET /{b}/{k}?uploadId=U`) XML response (`FR-29`).
+pub fn render_list_parts_xml(resp: &ListPartsResp, url_encode: bool) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"{S3_XML_NS}\">"
+    );
+    xml.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(&resp.bucket)));
+    xml.push_str(&format!(
+        "<Key>{}</Key>",
+        encode_field(&resp.key, url_encode, false)
+    ));
+    xml.push_str(&format!(
+        "<UploadId>{}</UploadId>",
+        xml_escape(&resp.upload_id)
+    ));
+    xml.push_str(&format!(
+        "<Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>",
+        xml_escape(&resp.initiator.user_id),
+        xml_escape(&resp.initiator.display_name)
+    ));
+    xml.push_str(&format!(
+        "<Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+        xml_escape(&resp.owner.user_id),
+        xml_escape(&resp.owner.display_name)
+    ));
+    xml.push_str(&format!(
+        "<StorageClass>{}</StorageClass>",
+        xml_escape(&resp.storage_class)
+    ));
+    if let Some(alg) = resp.checksum_algorithm {
+        xml.push_str(&format!(
+            "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
+            alg.as_aws_str()
+        ));
+    }
+    if let Some(ct) = resp.checksum_type {
+        xml.push_str(&format!(
+            "<ChecksumType>{}</ChecksumType>",
+            ct.as_aws_str()
+        ));
+    }
+    xml.push_str(&format!(
+        "<PartNumberMarker>{}</PartNumberMarker>",
+        resp.part_number_marker
+    ));
+    xml.push_str(&format!(
+        "<NextPartNumberMarker>{}</NextPartNumberMarker>",
+        resp.next_part_number_marker
+    ));
+    xml.push_str(&format!("<MaxParts>{}</MaxParts>", resp.max_parts));
+    xml.push_str(&format!("<IsTruncated>{}</IsTruncated>", resp.is_truncated));
+    if url_encode {
+        xml.push_str("<EncodingType>url</EncodingType>");
+    }
+
+    for part in &resp.parts {
+        xml.push_str("<Part>");
+        xml.push_str(&format!("<PartNumber>{}</PartNumber>", part.part_number));
+        xml.push_str(&format!(
+            "<LastModified>{}</LastModified>",
+            format_iso8601_millis(part.last_modified_ms)
+        ));
+        xml.push_str(&format!("<ETag>{}</ETag>", xml_escape(&part.etag)));
+        xml.push_str(&format!("<Size>{}</Size>", part.size));
+        if let Some((alg, val_b64)) = &part.checksum {
+            let tag = alg.xml_tag_name();
+            xml.push_str(&format!("<{tag}>{}</{tag}>", xml_escape(val_b64)));
+        }
+        xml.push_str("</Part>");
+    }
+
+    xml.push_str("</ListPartsResult>");
+    xml
+}
+
+/// Render `ListMultipartUploads` (`GET /{b}?uploads`) XML response (`FR-30`).
+pub fn render_list_multipart_uploads_xml(
+    resp: &ListMultipartUploadsResp,
+    url_encode: bool,
+) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"{S3_XML_NS}\">"
+    );
+    xml.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(&resp.bucket)));
+    xml.push_str(&format!(
+        "<KeyMarker>{}</KeyMarker>",
+        encode_field(&resp.key_marker, url_encode, false)
+    ));
+    xml.push_str(&format!(
+        "<UploadIdMarker>{}</UploadIdMarker>",
+        xml_escape(&resp.upload_id_marker)
+    ));
+    if let Some(nkm) = &resp.next_key_marker {
+        xml.push_str(&format!(
+            "<NextKeyMarker>{}</NextKeyMarker>",
+            encode_field(nkm, url_encode, false)
+        ));
+    }
+    xml.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        encode_field(&resp.prefix, url_encode, false)
+    ));
+    if let Some(d) = &resp.delimiter {
+        xml.push_str(&format!(
+            "<Delimiter>{}</Delimiter>",
+            encode_field(d, url_encode, false)
+        ));
+    }
+    if let Some(num) = &resp.next_upload_id_marker {
+        xml.push_str(&format!(
+            "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+            xml_escape(num)
+        ));
+    }
+    xml.push_str(&format!("<MaxUploads>{}</MaxUploads>", resp.max_uploads));
+    xml.push_str(&format!("<IsTruncated>{}</IsTruncated>", resp.is_truncated));
+    if url_encode {
+        xml.push_str("<EncodingType>url</EncodingType>");
+    }
+
+    for up in &resp.uploads {
+        xml.push_str("<Upload>");
+        xml.push_str(&format!(
+            "<Key>{}</Key>",
+            encode_field(&up.key, url_encode, false)
+        ));
+        xml.push_str(&format!(
+            "<UploadId>{}</UploadId>",
+            xml_escape(&up.upload_id)
+        ));
+        xml.push_str(&format!(
+            "<Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>",
+            xml_escape(&up.initiator.user_id),
+            xml_escape(&up.initiator.display_name)
+        ));
+        xml.push_str(&format!(
+            "<Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+            xml_escape(&up.owner.user_id),
+            xml_escape(&up.owner.display_name)
+        ));
+        xml.push_str(&format!(
+            "<StorageClass>{}</StorageClass>",
+            xml_escape(&up.storage_class)
+        ));
+        xml.push_str(&format!(
+            "<Initiated>{}</Initiated>",
+            format_iso8601_millis(up.initiated_ms)
+        ));
+        if let Some(alg) = up.checksum_algorithm {
+            xml.push_str(&format!(
+                "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
+                alg.as_aws_str()
+            ));
+        }
+        if let Some(ct) = up.checksum_type {
+            xml.push_str(&format!(
+                "<ChecksumType>{}</ChecksumType>",
+                ct.as_aws_str()
+            ));
+        }
+        xml.push_str("</Upload>");
+    }
+
+    for cp in &resp.common_prefixes {
+        xml.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            encode_field(cp, url_encode, false)
+        ));
+    }
+
+    xml.push_str("</ListMultipartUploadsResult>");
+    xml
+}
+
+/// Render `GetObjectAttributes` (`GET /{b}/{k}?attributes`) XML response (`FR-47`).
+pub fn render_get_object_attributes_xml(resp: &GetObjectAttributesResp) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"{S3_XML_NS}\">"
+    );
+    if let Some(etag) = &resp.etag {
+        let unquoted = etag.trim_matches('"');
+        xml.push_str(&format!("<ETag>{}</ETag>", xml_escape(unquoted)));
+    }
+    if let Some(csum) = &resp.checksum {
+        let tag = csum.algorithm.xml_tag_name();
+        xml.push_str("<Checksum>");
+        xml.push_str(&format!("<{tag}>{}</{tag}>", xml_escape(&csum.value_b64)));
+        xml.push_str(&format!(
+            "<ChecksumType>{}</ChecksumType>",
+            csum.checksum_type.as_aws_str()
+        ));
+        xml.push_str("</Checksum>");
+    }
+    if let Some(op) = &resp.object_parts {
+        xml.push_str("<ObjectParts>");
+        xml.push_str(&format!("<PartsCount>{}</PartsCount>", op.total_parts_count));
+        xml.push_str(&format!(
+            "<PartNumberMarker>{}</PartNumberMarker>",
+            op.part_number_marker
+        ));
+        if let Some(npm) = op.next_part_number_marker {
+            xml.push_str(&format!(
+                "<NextPartNumberMarker>{npm}</NextPartNumberMarker>"
+            ));
+        }
+        xml.push_str(&format!("<MaxParts>{}</MaxParts>", op.max_parts));
+        xml.push_str(&format!("<IsTruncated>{}</IsTruncated>", op.is_truncated));
+        for p in &op.parts {
+            xml.push_str("<Part>");
+            xml.push_str(&format!("<PartNumber>{}</PartNumber>", p.part_number));
+            xml.push_str(&format!("<Size>{}</Size>", p.size));
+            if let Some((alg, val_b64)) = &p.checksum {
+                let tag = alg.xml_tag_name();
+                xml.push_str(&format!("<{tag}>{}</{tag}>", xml_escape(val_b64)));
+            }
+            xml.push_str("</Part>");
+        }
+        xml.push_str("</ObjectParts>");
+    }
+    if let Some(sc) = &resp.storage_class {
+        xml.push_str(&format!("<StorageClass>{}</StorageClass>", xml_escape(sc)));
+    }
+    if let Some(sz) = resp.object_size {
+        xml.push_str(&format!("<ObjectSize>{sz}</ObjectSize>"));
+    }
+    xml.push_str("</GetObjectAttributesResponse>");
+    xml
+}
+
+/// Render `AccessControlPolicy` XML response (`GetBucketAcl` / `GetObjectAcl`, `PR-32`).
+pub fn render_acl_xml(policy: &AccessControlPolicy) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AccessControlPolicy xmlns=\"{S3_XML_NS}\">"
+    );
+    xml.push_str(&format!(
+        "<Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+        xml_escape(&policy.owner.user_id),
+        xml_escape(&policy.owner.display_name)
+    ));
+    xml.push_str("<AccessControlList>");
+    for grant in &policy.grants {
+        xml.push_str("<Grant>");
+        match &grant.grantee {
+            AclGrantee::CanonicalUser(u) => {
+                xml.push_str(
+                    "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">",
+                );
+                xml.push_str(&format!(
+                    "<ID>{}</ID><DisplayName>{}</DisplayName>",
+                    xml_escape(&u.user_id),
+                    xml_escape(&u.display_name)
+                ));
+                xml.push_str("</Grantee>");
+            }
+            AclGrantee::Group(uri) => {
+                xml.push_str(
+                    "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\">",
+                );
+                xml.push_str(&format!("<URI>{}</URI>", xml_escape(uri)));
+                xml.push_str("</Grantee>");
+            }
+        }
+        xml.push_str(&format!(
+            "<Permission>{}</Permission>",
+            grant.permission.as_aws_str()
+        ));
+        xml.push_str("</Grant>");
+    }
+    xml.push_str("</AccessControlList></AccessControlPolicy>");
+    xml
+}
+
+fn is_valid_acl_group_uri(uri: &str) -> bool {
+    matches!(
+        uri,
+        GROUP_ALL_USERS | GROUP_AUTHENTICATED_USERS | GROUP_LOG_DELIVERY
+    )
+}
+
+/// Parse `AccessControlPolicy` XML body (`PutBucketAcl` / `PutObjectAcl`, `PR-32`).
+pub fn parse_acl_xml<FId, FEmail>(
+    body: &[u8],
+    resolve_id: FId,
+    resolve_email: FEmail,
+) -> StoreResult<AccessControlPolicy>
+where
+    FId: Fn(&str) -> Option<OwnerInfo>,
+    FEmail: Fn(&str) -> Option<OwnerInfo>,
+{
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut saw_root = false;
+    let mut in_owner = false;
+    let mut in_acl_list = false;
+    let mut in_grant = false;
+    let mut in_grantee = false;
+    let mut cur_tag: Option<String> = None;
+
+    let mut owner_id: Option<String> = None;
+    let mut owner_display: Option<String> = None;
+
+    let mut grantee_type: Option<String> = None;
+    let mut grantee_id: Option<String> = None;
+    let mut grantee_email: Option<String> = None;
+    let mut grantee_uri: Option<String> = None;
+    let mut grant_perm: Option<String> = None;
+
+    let mut raw_grants: Vec<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
+
+    let malformed_acl = || {
+        S3Error::new(
+            S3ErrorCode::MalformedACLError,
+            "The XML you provided was not well-formed or did not validate against our published schema",
+        )
+    };
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "AccessControlPolicy" if !saw_root => saw_root = true,
+                    "Owner" if saw_root && !in_acl_list => in_owner = true,
+                    "AccessControlList" if saw_root && !in_owner => in_acl_list = true,
+                    "Grant" if in_acl_list && !in_grant => {
+                        in_grant = true;
+                        grantee_type = None;
+                        grantee_id = None;
+                        grantee_email = None;
+                        grantee_uri = None;
+                        grant_perm = None;
+                    }
+                    "Grantee" if in_grant && !in_grantee => {
+                        in_grantee = true;
+                        for attr in e.attributes().flatten() {
+                            let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+                            if key == "type" || key.ends_with(":type") {
+                                if let Ok(v) = attr.unescape_value() {
+                                    grantee_type = Some(v.into_owned());
+                                }
+                            }
+                        }
+                    }
+                    "ID" | "DisplayName" | "EmailAddress" | "URI" | "Permission" => {
+                        cur_tag = Some(local.to_string());
+                    }
+                    _ => return Err(malformed_acl()),
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "AccessControlList" if saw_root && !in_owner => {}
+                    "DisplayName" => {}
+                    _ => return Err(malformed_acl()),
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let val = t.unescape().map_err(|_| malformed_acl())?.into_owned();
+                match cur_tag.as_deref() {
+                    Some("ID") if in_owner => owner_id = Some(val),
+                    Some("DisplayName") if in_owner => owner_display = Some(val),
+                    Some("ID") if in_grantee => grantee_id = Some(val),
+                    Some("DisplayName") if in_grantee => {}
+                    Some("EmailAddress") if in_grantee => grantee_email = Some(val),
+                    Some("URI") if in_grantee => grantee_uri = Some(val),
+                    Some("Permission") if in_grant && !in_grantee => grant_perm = Some(val),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local_bytes = e.local_name();
+                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                match local {
+                    "Owner" => in_owner = false,
+                    "AccessControlList" => in_acl_list = false,
+                    "Grantee" => in_grantee = false,
+                    "Grant" => {
+                        in_grant = false;
+                        raw_grants.push((
+                            grantee_type.take(),
+                            grantee_id.take(),
+                            grantee_email.take(),
+                            grantee_uri.take(),
+                            grant_perm.take(),
+                        ));
+                    }
+                    "ID" | "DisplayName" | "EmailAddress" | "URI" | "Permission" => {
+                        cur_tag = None;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => return Err(malformed_acl()),
+        }
+        buf.clear();
+    }
+
+    if !saw_root {
+        return Err(malformed_acl());
+    }
+    let Some(oid) = owner_id.filter(|s| !s.is_empty()) else {
+        return Err(malformed_acl());
+    };
+    let owner = resolve_id(&oid).ok_or_else(|| {
+        S3Error::new(S3ErrorCode::InvalidArgument, "Invalid id")
+    })?;
+    let _ = owner_display;
+
+    let mut grants = Vec::with_capacity(raw_grants.len());
+    for (g_type, g_id, g_email, g_uri, g_perm) in raw_grants {
+        let perm_str = g_perm.ok_or_else(malformed_acl)?;
+        let permission = AclPermission::from_aws_str(&perm_str).ok_or_else(malformed_acl)?;
+
+        let effective_type = match g_type.as_deref() {
+            Some(t) => t,
+            None if g_id.is_some() => "CanonicalUser",
+            None if g_email.is_some() => "AmazonCustomerByEmail",
+            None if g_uri.is_some() => "Group",
+            None => return Err(malformed_acl()),
+        };
+
+        let grantee = match effective_type {
+            "CanonicalUser" => {
+                let uid = g_id.filter(|s| !s.is_empty()).ok_or_else(malformed_acl)?;
+                let user = resolve_id(&uid)
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid id"))?;
+                AclGrantee::CanonicalUser(user)
+            }
+            "AmazonCustomerByEmail" => {
+                let email = g_email
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(malformed_acl)?;
+                let user = resolve_email(&email).ok_or_else(|| {
+                    S3Error::new(
+                        S3ErrorCode::UnresolvableGrantByEmailAddress,
+                        "The e-mail address you provided does not match any account on record.",
+                    )
+                })?;
+                AclGrantee::CanonicalUser(user)
+            }
+            "Group" => {
+                let uri = g_uri.filter(|s| !s.is_empty()).ok_or_else(malformed_acl)?;
+                if !is_valid_acl_group_uri(&uri) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        "Invalid group uri",
+                    ));
+                }
+                AclGrantee::Group(uri)
+            }
+            _ => return Err(malformed_acl()),
+        };
+
+        grants.push(AclGrant {
+            grantee,
+            permission,
+        });
+    }
+
+    Ok(AccessControlPolicy { owner, grants })
+}
+
+/// Parse an `x-amz-grant-{read,write,read-acp,write-acp,full-control}` header value (`PR-32`).
+pub fn parse_acl_grant_header<FId, FEmail>(
+    raw_value: &str,
+    permission: AclPermission,
+    resolve_id: &FId,
+    resolve_email: &FEmail,
+) -> StoreResult<Vec<AclGrant>>
+where
+    FId: Fn(&str) -> Option<OwnerInfo>,
+    FEmail: Fn(&str) -> Option<OwnerInfo>,
+{
+    let mut out = Vec::new();
+    for item in raw_value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = item.split_once('=') else {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Invalid x-amz-grant header value",
+            ));
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = v.trim().trim_matches('"');
+        if val.is_empty() {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Empty grantee value in x-amz-grant header",
+            ));
+        }
+        let grantee = match key.as_str() {
+            "id" => {
+                let user = resolve_id(val)
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid id"))?;
+                AclGrantee::CanonicalUser(user)
+            }
+            "emailaddress" => {
+                let user = resolve_email(val).ok_or_else(|| {
+                    S3Error::new(
+                        S3ErrorCode::UnresolvableGrantByEmailAddress,
+                        "The e-mail address you provided does not match any account on record.",
+                    )
+                })?;
+                AclGrantee::CanonicalUser(user)
+            }
+            "uri" => {
+                if !is_valid_acl_group_uri(val) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidArgument,
+                        "Invalid group uri",
+                    ));
+                }
+                AclGrantee::Group(val.to_string())
+            }
+            _ => {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidArgument,
+                    "Unsupported grantee type in x-amz-grant header",
+                ));
+            }
+        };
+        out.push(AclGrant {
+            grantee,
+            permission,
+        });
+    }
+    if out.is_empty() {
+        return Err(S3Error::new(
+            S3ErrorCode::InvalidArgument,
+            "Empty x-amz-grant header",
+        ));
+    }
+    Ok(out)
 }
 
 fn malformed_xml() -> S3Error {

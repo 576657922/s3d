@@ -113,20 +113,14 @@ pub fn evaluate_write_preconditions(
     }
 
     if let Some(if_none_match) = &cond.if_none_match {
-        let is_star = if_none_match.len() == 1 && if_none_match[0].trim() == "*";
-        if !is_star {
-            return Err(S3Error::new(
-                S3ErrorCode::InvalidRequest,
-                "If-None-Match only supports '*' for write operations.",
-            )
-            .with_key(bucket, key));
-        }
-        if matches!(head, HeadState::Present { .. }) {
-            return Err(S3Error::new(
-                S3ErrorCode::PreconditionFailed,
-                "At least one of the pre-conditions you specified did not hold",
-            )
-            .with_key(bucket, key));
+        if let HeadState::Present { etag } = head {
+            if etag_list_matches(if_none_match, etag) {
+                return Err(S3Error::new(
+                    S3ErrorCode::PreconditionFailed,
+                    "At least one of the pre-conditions you specified did not hold",
+                )
+                .with_key(bucket, key));
+            }
         }
     }
 

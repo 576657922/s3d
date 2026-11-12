@@ -82,6 +82,8 @@ impl ServerConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         let _ = self.parsed_object_ownership()?;
+        let _ = self.completed_upload_retention_ms()?;
+        let _ = parse_duration_ms(&self.checkpoint_interval)?;
         if self.region.trim().is_empty() {
             return Err("region cannot be empty".into());
         }
@@ -96,6 +98,39 @@ impl ServerConfig {
         }
         Ok(())
     }
+
+    pub fn completed_upload_retention_ms(&self) -> Result<i64, String> {
+        parse_duration_ms(&self.completed_upload_retention)
+    }
+}
+
+pub fn parse_duration_ms(raw: &str) -> Result<i64, String> {
+    let s = raw.trim();
+    if let Some(num) = s.strip_suffix("ms") {
+        let n = num
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("invalid duration '{raw}'"))?;
+        return Ok(n.max(0));
+    }
+    let (num_str, mult_ms) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1_000i64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000i64)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000i64)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400_000i64)
+    } else {
+        return Err(format!(
+            "invalid duration '{raw}'; expected suffix ms, s, m, h, or d"
+        ));
+    };
+    let n = num_str
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("invalid duration '{raw}'"))?;
+    Ok((n * mult_ms).max(0))
 }
 
 #[derive(Deserialize)]

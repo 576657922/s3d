@@ -71,13 +71,13 @@ pub fn validate_checksum_b64_format(alg: ChecksumAlgorithm, b64_val: &str) -> St
         .decode(b64_val.trim())
         .map_err(|_| {
             S3Error::new(
-                S3ErrorCode::InvalidRequest,
+                S3ErrorCode::BadDigest,
                 format!("Value for {} header is invalid.", alg.header_name()),
             )
         })?;
     if decoded.len() != expected_len {
         return Err(S3Error::new(
-            S3ErrorCode::InvalidRequest,
+            S3ErrorCode::BadDigest,
             format!("Value for {} header is invalid.", alg.header_name()),
         ));
     }

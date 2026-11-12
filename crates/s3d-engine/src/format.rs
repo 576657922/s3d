@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use s3d_types::{
-    ChecksumState, ObjectOwnership, OwnerInfo, SystemMeta, VersioningStatus,
+    AccessControlPolicy, ChecksumAlgorithm, ChecksumState, ChecksumType,
+    CompleteMultipartUploadResp, ObjectOwnership, OwnerInfo, SystemMeta, VersioningStatus,
 };
 
 pub const FORMAT_MAGIC: &[u8; 8] = b"S3DFMT01";
@@ -167,10 +168,30 @@ impl Extent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartBoundaryInfo {
+    pub part_number: u32,
+    pub size: u64,
+    pub checksum: Option<(ChecksumAlgorithm, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelocatedExtent {
     pub bucket: String,
     pub key: String,
     pub seq: u64,
+    pub extent_idx: usize,
+    pub old_seg_id: u32,
+    pub old_offset: u64,
+    pub new_extent: Extent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocatedPartExtent {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub part_number: u32,
+    pub part_seq: u64,
     pub extent_idx: usize,
     pub old_seg_id: u32,
     pub old_offset: u64,
@@ -182,6 +203,7 @@ pub enum WalOp {
     CreateBucket {
         name: String,
         owner: OwnerInfo,
+        acl: AccessControlPolicy,
         region: String,
         created_ms: i64,
         ownership: ObjectOwnership,
@@ -189,6 +211,10 @@ pub enum WalOp {
     UpdateBucketVersioning {
         name: String,
         versioning: VersioningStatus,
+    },
+    UpdateBucketAcl {
+        name: String,
+        acl: AccessControlPolicy,
     },
     DeleteBucket {
         name: String,
@@ -205,20 +231,80 @@ pub enum WalOp {
         sys_meta: SystemMeta,
         user_meta: Vec<(String, String)>,
         owner: OwnerInfo,
+        acl: AccessControlPolicy,
         last_modified_ms: i64,
         extents: Vec<Extent>,
-        part_sizes: Option<Vec<u64>>,
+        #[serde(default)]
+        parts: Option<Vec<PartBoundaryInfo>>,
+    },
+    UpdateObjectAcl {
+        bucket: String,
+        key: String,
+        seq: u64,
+        acl: AccessControlPolicy,
     },
     DeleteVersion {
         bucket: String,
         key: String,
         version_id: Option<String>,
     },
+    CreateMultipartUpload {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        initiator: OwnerInfo,
+        owner: OwnerInfo,
+        acl: AccessControlPolicy,
+        initiated_ms: i64,
+        sys_meta: SystemMeta,
+        user_meta: Vec<(String, String)>,
+        checksum_algorithm: Option<ChecksumAlgorithm>,
+        checksum_type: Option<ChecksumType>,
+    },
+    PutUploadPart {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        part_seq: u64,
+        part_number: u32,
+        last_modified_ms: i64,
+        etag: String,
+        size: u64,
+        md5: [u8; 16],
+        crc64_nvme: u64,
+        checksum: Option<(ChecksumAlgorithm, String)>,
+        extents: Vec<Extent>,
+    },
+    CompleteMultipartUpload {
+        bucket: String,
+        key: String,
+        upload_id: String,
+        seq: u64,
+        version_id: Option<String>,
+        total_size: u64,
+        etag: String,
+        checksum: ChecksumState,
+        sys_meta: SystemMeta,
+        user_meta: Vec<(String, String)>,
+        owner: OwnerInfo,
+        acl: AccessControlPolicy,
+        completed_ms: i64,
+        extents: Vec<Extent>,
+        parts: Vec<PartBoundaryInfo>,
+        resp: CompleteMultipartUploadResp,
+    },
+    AbortMultipartUpload {
+        bucket: String,
+        key: String,
+        upload_id: String,
+    },
     CreateSegment {
         seg_id: u32,
     },
     RelocateExtents {
         items: Vec<RelocatedExtent>,
+        #[serde(default)]
+        part_items: Vec<RelocatedPartExtent>,
     },
     DeleteSegment {
         seg_id: u32,
@@ -231,8 +317,14 @@ impl WalOp {
             Self::CreateBucket { .. } => 0x10,
             Self::UpdateBucketVersioning { .. } => 0x11,
             Self::DeleteBucket { .. } => 0x12,
+            Self::UpdateBucketAcl { .. } => 0x13,
             Self::PutVersion { .. } => 0x20,
             Self::DeleteVersion { .. } => 0x21,
+            Self::UpdateObjectAcl { .. } => 0x22,
+            Self::CreateMultipartUpload { .. } => 0x30,
+            Self::PutUploadPart { .. } => 0x31,
+            Self::CompleteMultipartUpload { .. } => 0x32,
+            Self::AbortMultipartUpload { .. } => 0x33,
             Self::CreateSegment { .. } => 0x40,
             Self::RelocateExtents { .. } => 0x41,
             Self::DeleteSegment { .. } => 0x42,

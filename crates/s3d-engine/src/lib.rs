@@ -1,13 +1,14 @@
 //! Crash-safe log-structured object storage engine (`s3d-engine`).
 
 pub mod catalog;
+mod checksum_util;
 pub mod format;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use bytes::BytesMut;
@@ -20,8 +21,13 @@ use thiserror::Error;
 use tracing::{error, warn};
 
 use crate::catalog::{
-    BucketEntry, EngineByteReader, MemoryCatalog, ObjectVersionEntry, SegmentPin, SegmentSlot,
-    SEG_STATE_ACTIVE, SEG_STATE_PENDING_DELETE, SEG_STATE_SEALED,
+    BucketEntry, EngineByteReader, MemoryCatalog, MultipartUploadEntry, ObjectVersionEntry,
+    SegmentPin, SegmentSlot, UploadPartEntry, SEG_STATE_ACTIVE, SEG_STATE_PENDING_DELETE,
+    SEG_STATE_SEALED,
+};
+use crate::checksum_util::{
+    combine_crc32, combine_crc32c, combine_crc64_nvme, compute_composite_checksum_b64,
+    decode_u32_be_b64, encode_u32_be_b64, encode_u64_be_b64, ActiveHasher,
 };
 use crate::format::*;
 
@@ -35,8 +41,12 @@ pub struct EngineConfig {
     pub max_block_payload: usize,
     pub reserved_disk_bytes: u64,
     pub max_buckets_per_account: usize,
+    pub max_object_size: u64,
+    pub completed_upload_retention_ms: i64,
     pub default_object_ownership: ObjectOwnership,
     pub gc_live_ratio: f64,
+    pub group_commit_window_ms: u64,
+    pub group_commit_max_batch: usize,
 }
 
 impl Default for EngineConfig {
@@ -48,8 +58,12 @@ impl Default for EngineConfig {
             max_block_payload: DEFAULT_MAX_BLOCK_PAYLOAD,
             reserved_disk_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB (NFR-16)
             max_buckets_per_account: 10_000,
+            max_object_size: MAX_MULTIPART_OBJECT_BYTES,
+            completed_upload_retention_ms: 24 * 60 * 60 * 1000,
             default_object_ownership: ObjectOwnership::BucketOwnerEnforced,
             gc_live_ratio: 0.5,
+            group_commit_window_ms: 0,
+            group_commit_max_batch: 64,
         }
     }
 }
@@ -70,6 +84,12 @@ struct WalWriterState<D: Disk> {
     synced_lsn: u64,
 }
 
+#[derive(Default)]
+struct GroupCommitQueue {
+    leader_active: bool,
+    pending: Vec<(WalOp, tokio::sync::oneshot::Sender<StoreResult<u64>>)>,
+}
+
 struct SegmentManager<D: Disk> {
     active_seg_id: u32,
     next_seg_id: u32,
@@ -82,9 +102,11 @@ pub struct Engine<D: Disk> {
     format: FormatFile,
     _lock_guard: Box<dyn Send + Sync>,
     read_only_poisoned: AtomicBool,
+    next_seq: AtomicU64,
     catalog: RwLock<MemoryCatalog>,
     seg_mgr: Mutex<SegmentManager<D>>,
     wal: Mutex<WalWriterState<D>>,
+    group_commit_queue: Mutex<GroupCommitQueue>,
     key_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
@@ -278,13 +300,25 @@ impl<D: Disk> Engine<D> {
             }
         };
 
-        // 5. Reconcile segment files & verify referenced extents
+        // 5. Reconcile segment files & verify referenced extents (both objects AND active uploads!)
         let mut live_bytes_map: BTreeMap<u32, u64> = BTreeMap::new();
         let mut max_ref_end: BTreeMap<u32, u64> = BTreeMap::new();
         for b in catalog.buckets.values() {
             for chain in b.objects.values() {
                 for v in chain {
                     for ext in v.extents.iter() {
+                        *live_bytes_map.entry(ext.seg_id).or_default() += ext.physical_bytes();
+                        let end = ext.offset + ext.physical_bytes();
+                        let entry = max_ref_end.entry(ext.seg_id).or_default();
+                        if end > *entry {
+                            *entry = end;
+                        }
+                    }
+                }
+            }
+            for up in b.uploads.values() {
+                for p in up.parts.values() {
+                    for ext in p.extents.iter() {
                         *live_bytes_map.entry(ext.seg_id).or_default() += ext.physical_bytes();
                         let end = ext.offset + ext.physical_bytes();
                         let entry = max_ref_end.entry(ext.seg_id).or_default();
@@ -384,12 +418,15 @@ impl<D: Disk> Engine<D> {
             .map(|_| tokio::sync::Mutex::new(()))
             .collect();
 
+        let initial_next_seq = catalog.next_seq + 1;
+
         Ok(Arc::new(Self {
             disk,
             cfg,
             format,
             _lock_guard: lock_guard,
             read_only_poisoned: AtomicBool::new(false),
+            next_seq: AtomicU64::new(initial_next_seq),
             catalog: RwLock::new(catalog),
             seg_mgr: Mutex::new(SegmentManager {
                 active_seg_id,
@@ -397,8 +434,13 @@ impl<D: Disk> Engine<D> {
                 segments,
             }),
             wal: Mutex::new(wal_state),
+            group_commit_queue: Mutex::new(GroupCommitQueue::default()),
             key_locks,
         }))
+    }
+
+    fn alloc_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn is_read_only_poisoned(&self) -> bool {
@@ -500,26 +542,37 @@ impl<D: Disk> Engine<D> {
         ))
     }
 
-    /// Persist a WAL operation (`fdatasync`ing WAL; on `EIO`, immediately poisons read-only WITHOUT
-    /// touching in-memory catalog per §10 hard rule!).
-    fn append_and_sync_wal(&self, op: &WalOp) -> StoreResult<u64> {
+    /// Flush a batch of WAL operations in a single `write_all_at` + `sync_data` (`fdatasync`).
+    /// On `EIO`, immediately poisons read-only WITHOUT updating `synced_lsn` or catalog (§10).
+    fn flush_wal_batch(&self, ops: &[WalOp]) -> Vec<StoreResult<u64>> {
+        if ops.is_empty() {
+            return Vec::new();
+        }
         if self.is_read_only_poisoned() {
-            return Err(S3Error::new(
+            let err = S3Error::new(
                 S3ErrorCode::InternalError,
                 "Storage engine is in read-only failed state.",
-            ));
+            );
+            return vec![Err(err); ops.len()];
         }
         let mut wal = self.wal.lock().unwrap();
         if self.is_read_only_poisoned() {
-            return Err(S3Error::new(
+            let err = S3Error::new(
                 S3ErrorCode::InternalError,
                 "Storage engine is in read-only failed state.",
-            ));
+            );
+            return vec![Err(err); ops.len()];
         }
 
-        let mut encoded = Vec::with_capacity(256);
-        let lsn = wal.next_lsn;
-        encode_wal_record(lsn, wal.synced_lsn, op, &mut encoded);
+        let first_lsn = wal.next_lsn;
+        let prev_synced = wal.synced_lsn;
+        let mut encoded = Vec::with_capacity(256 * ops.len());
+        let mut lsns = Vec::with_capacity(ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            let lsn = first_lsn + i as u64;
+            encode_wal_record(lsn, prev_synced, op, &mut encoded);
+            lsns.push(lsn);
+        }
 
         // Roll WAL file if current file exceeds wal_file_size
         if wal.write_pos > WAL_HEADER_LEN
@@ -527,42 +580,147 @@ impl<D: Disk> Engine<D> {
         {
             let new_seq = wal.wal_seq + 1;
             let rel_path = format!("wal/{new_seq:08}.log");
-            let new_file = self
-                .disk
-                .open(&rel_path, OpenOpts::create_truncate_rw())
-                .map_err(|e| self.poison_read_only("wal_roll_open", e))?;
-            let hdr = encode_wal_header(new_seq, lsn, self.format.uuid_lo());
-            new_file
-                .write_all_at(0, &hdr)
-                .map_err(|e| self.poison_read_only("wal_roll_hdr_write", e))?;
-            new_file
-                .sync_data()
-                .map_err(|e| self.poison_read_only("wal_roll_hdr_sync", e))?;
-            self.disk
-                .sync_dir("wal")
-                .map_err(|e| self.poison_read_only("wal_roll_dir_sync", e))?;
-
-            wal.wal_seq = new_seq;
-            wal.file = new_file;
-            wal.write_pos = WAL_HEADER_LEN;
+            let roll_res: Result<D::File, S3Error> = (|| {
+                let nf = self
+                    .disk
+                    .open(&rel_path, OpenOpts::create_truncate_rw())
+                    .map_err(|e| self.poison_read_only("wal_roll_open", e))?;
+                let hdr = encode_wal_header(new_seq, first_lsn, self.format.uuid_lo());
+                nf.write_all_at(0, &hdr)
+                    .map_err(|e| self.poison_read_only("wal_roll_hdr_write", e))?;
+                nf.sync_data()
+                    .map_err(|e| self.poison_read_only("wal_roll_hdr_sync", e))?;
+                self.disk
+                    .sync_dir("wal")
+                    .map_err(|e| self.poison_read_only("wal_roll_dir_sync", e))?;
+                Ok(nf)
+            })();
+            match roll_res {
+                Ok(new_file) => {
+                    wal.wal_seq = new_seq;
+                    wal.file = new_file;
+                    wal.write_pos = WAL_HEADER_LEN;
+                }
+                Err(err) => return vec![Err(err); ops.len()],
+            }
         }
 
         let offset = wal.write_pos;
-        wal.file
-            .write_all_at(offset, &encoded)
-            .map_err(|e| self.poison_read_only("wal_write", e))?;
-        wal.file
-            .sync_data()
-            .map_err(|e| self.poison_read_only("wal_fdatasync", e))?;
+        if let Err(e) = wal.file.write_all_at(offset, &encoded) {
+            let err = self.poison_read_only("wal_write", e);
+            return vec![Err(err); ops.len()];
+        }
+        if let Err(e) = wal.file.sync_data() {
+            let err = self.poison_read_only("wal_fdatasync", e);
+            return vec![Err(err); ops.len()];
+        }
 
+        let last_lsn = *lsns.last().unwrap();
         wal.write_pos += encoded.len() as u64;
-        wal.next_lsn = lsn + 1;
-        wal.synced_lsn = lsn;
-        Ok(lsn)
+        wal.next_lsn = last_lsn + 1;
+        wal.synced_lsn = last_lsn;
+        lsns.into_iter().map(Ok).collect()
+    }
+
+    fn drain_pending_group_commits_sync(&self) {
+        let max_batch = self.cfg.group_commit_max_batch.max(1);
+        loop {
+            let chunk: Vec<(WalOp, tokio::sync::oneshot::Sender<StoreResult<u64>>)> = {
+                let mut q = self.group_commit_queue.lock().unwrap();
+                if q.pending.is_empty() {
+                    q.leader_active = false;
+                    return;
+                }
+                let take = q.pending.len().min(max_batch);
+                q.pending.drain(..take).collect()
+            };
+            let ops: Vec<WalOp> = chunk.iter().map(|(op, _)| op.clone()).collect();
+            let results = self.flush_wal_batch(&ops);
+            for ((_, tx), res) in chunk.into_iter().zip(results) {
+                let _ = tx.send(res);
+            }
+        }
+    }
+
+    /// Group-Commit WAL append + `fdatasync` (§8.3). Concurrent callers batch into a single `fdatasync`.
+    async fn commit_wal(&self, op: WalOp) -> StoreResult<u64> {
+        if self.is_read_only_poisoned() {
+            return Err(S3Error::new(
+                S3ErrorCode::InternalError,
+                "Storage engine is in read-only failed state.",
+            ));
+        }
+
+        let follower_rx = {
+            let mut q = self.group_commit_queue.lock().unwrap();
+            if q.leader_active {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                q.pending.push((op.clone(), tx));
+                Some(rx)
+            } else {
+                q.leader_active = true;
+                None
+            }
+        };
+
+        if let Some(rx) = follower_rx {
+            return rx.await.unwrap_or_else(|_| {
+                Err(S3Error::new(
+                    S3ErrorCode::InternalError,
+                    "Group commit channel closed",
+                ))
+            });
+        }
+
+        struct LeaderDropGuard<'a, D: Disk> {
+            engine: &'a Engine<D>,
+            disarmed: bool,
+        }
+        impl<D: Disk> Drop for LeaderDropGuard<'_, D> {
+            fn drop(&mut self) {
+                if !self.disarmed {
+                    self.engine.drain_pending_group_commits_sync();
+                }
+            }
+        }
+
+        let mut guard = LeaderDropGuard {
+            engine: self,
+            disarmed: false,
+        };
+
+        if self.cfg.group_commit_window_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.cfg.group_commit_window_ms)).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
+
+        let max_followers = self.cfg.group_commit_max_batch.max(1).saturating_sub(1);
+        let followers: Vec<(WalOp, tokio::sync::oneshot::Sender<StoreResult<u64>>)> = {
+            let mut q = self.group_commit_queue.lock().unwrap();
+            let take = q.pending.len().min(max_followers);
+            q.pending.drain(..take).collect()
+        };
+
+        let mut batch_ops = Vec::with_capacity(1 + followers.len());
+        batch_ops.push(op);
+        for (fop, _) in &followers {
+            batch_ops.push(fop.clone());
+        }
+
+        let mut results = self.flush_wal_batch(&batch_ops);
+        let my_res = results.remove(0);
+        for ((_, tx), res) in followers.into_iter().zip(results) {
+            let _ = tx.send(res);
+        }
+
+        self.drain_pending_group_commits_sync();
+        guard.disarmed = true;
+        my_res
     }
 
     /// Trigger online segment compaction / GC (`s3d compact`, §8.5).
-    pub async fn compact(&self) -> StoreResult< usize > {
+    pub async fn compact(&self) -> StoreResult<usize> {
         self.check_writable(false)?;
         let candidates: Vec<Arc<SegmentSlot<D>>> = {
             let mgr = self.seg_mgr.lock().unwrap();
@@ -583,8 +741,9 @@ impl<D: Disk> Engine<D> {
         let mut compacted = 0usize;
         for old_slot in candidates {
             let old_id = old_slot.seg_id;
-            // Collect live references pointing to `old_id`
-            let mut to_move = Vec::new();
+            // Collect live references pointing to `old_id` across both objects and active uploads
+            let mut to_move_obj = Vec::new();
+            let mut to_move_part = Vec::new();
             {
                 let cat = self.catalog.read().unwrap();
                 for (bname, b) in &cat.buckets {
@@ -592,7 +751,24 @@ impl<D: Disk> Engine<D> {
                         for v in chain {
                             for (eidx, ext) in v.extents.iter().enumerate() {
                                 if ext.seg_id == old_id {
-                                    to_move.push((bname.clone(), key.clone(), v.seq, eidx, *ext));
+                                    to_move_obj.push((bname.clone(), key.clone(), v.seq, eidx, *ext));
+                                }
+                            }
+                        }
+                    }
+                    for ((key, uid), up) in &b.uploads {
+                        for p in up.parts.values() {
+                            for (eidx, ext) in p.extents.iter().enumerate() {
+                                if ext.seg_id == old_id {
+                                    to_move_part.push((
+                                        bname.clone(),
+                                        key.clone(),
+                                        uid.clone(),
+                                        p.part_number,
+                                        p.part_seq,
+                                        eidx,
+                                        *ext,
+                                    ));
                                 }
                             }
                         }
@@ -601,9 +777,10 @@ impl<D: Disk> Engine<D> {
             }
 
             let mut touched_new_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
-            let mut copied = Vec::with_capacity(to_move.len());
+            let mut copied_obj = Vec::with_capacity(to_move_obj.len());
+            let mut copied_part = Vec::with_capacity(to_move_part.len());
 
-            for (bname, key, seq, eidx, ext) in to_move {
+            for (bname, key, seq, eidx, ext) in to_move_obj {
                 let mut raw = vec![0u8; ext.physical_bytes() as usize];
                 old_slot
                     .file
@@ -618,7 +795,25 @@ impl<D: Disk> Engine<D> {
                 }
                 let (new_ext, new_slot) = self.write_data_block(payload)?;
                 touched_new_slots.insert(new_slot.seg_id, new_slot);
-                copied.push((bname, key, seq, eidx, ext, new_ext));
+                copied_obj.push((bname, key, seq, eidx, ext, new_ext));
+            }
+
+            for (bname, key, uid, pn, pseq, eidx, ext) in to_move_part {
+                let mut raw = vec![0u8; ext.physical_bytes() as usize];
+                old_slot
+                    .file
+                    .read_exact_at(ext.offset, &mut raw)
+                    .map_err(|_| S3Error::new(S3ErrorCode::InternalError, "GC read failed"))?;
+                let payload = &raw[12..];
+                if crc32c::crc32c(payload) != ext.crc32c {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InternalError,
+                        "GC detected block CRC mismatch",
+                    ));
+                }
+                let (new_ext, new_slot) = self.write_data_block(payload)?;
+                touched_new_slots.insert(new_slot.seg_id, new_slot);
+                copied_part.push((bname, key, uid, pn, pseq, eidx, ext, new_ext));
             }
 
             for slot in touched_new_slots.values() {
@@ -628,8 +823,7 @@ impl<D: Disk> Engine<D> {
             }
 
             // Re-verify under key stripe lock / catalog write lock and relocate still-live extents
-            let mut relocated_ops = Vec::new();
-            for (bname, key, seq, eidx, old_ext, new_ext) in copied {
+            for (bname, key, seq, eidx, old_ext, new_ext) in copied_obj {
                 let _kl = self.key_stripe(&bname, &key).lock().await;
                 let still_live = {
                     let cat = self.catalog.read().unwrap();
@@ -652,9 +846,11 @@ impl<D: Disk> Engine<D> {
                         old_offset: old_ext.offset,
                         new_extent: new_ext,
                     };
-                    self.append_and_sync_wal(&WalOp::RelocateExtents {
-                        items: vec![rel.clone()],
-                    })?;
+                    self.commit_wal(WalOp::RelocateExtents {
+                        items: vec![rel],
+                        part_items: Vec::new(),
+                    })
+                    .await?;
                     {
                         let mut cat = self.catalog.write().unwrap();
                         if let Some(v) = cat
@@ -675,13 +871,68 @@ impl<D: Disk> Engine<D> {
                         ns.live_bytes
                             .fetch_add(new_ext.physical_bytes(), Ordering::AcqRel);
                     }
-                    relocated_ops.push(rel);
+                }
+            }
+
+            for (bname, key, uid, pn, pseq, eidx, old_ext, new_ext) in copied_part {
+                let _kl = self.key_stripe(&bname, &key).lock().await;
+                let still_live = {
+                    let cat = self.catalog.read().unwrap();
+                    cat.buckets
+                        .get(&bname)
+                        .and_then(|b| b.uploads.get(&(key.clone(), uid.clone())))
+                        .and_then(|up| up.parts.get(&pn))
+                        .filter(|p| p.part_seq == pseq)
+                        .and_then(|p| p.extents.get(eidx))
+                        .is_some_and(|cur| {
+                            cur.seg_id == old_ext.seg_id && cur.offset == old_ext.offset
+                        })
+                };
+                if still_live {
+                    let rel = RelocatedPartExtent {
+                        bucket: bname.clone(),
+                        key: key.clone(),
+                        upload_id: uid.clone(),
+                        part_number: pn,
+                        part_seq: pseq,
+                        extent_idx: eidx,
+                        old_seg_id: old_ext.seg_id,
+                        old_offset: old_ext.offset,
+                        new_extent: new_ext,
+                    };
+                    self.commit_wal(WalOp::RelocateExtents {
+                        items: Vec::new(),
+                        part_items: vec![rel],
+                    })
+                    .await?;
+                    {
+                        let mut cat = self.catalog.write().unwrap();
+                        if let Some(p) = cat
+                            .buckets
+                            .get_mut(&bname)
+                            .and_then(|b| b.uploads.get_mut(&(key, uid)))
+                            .and_then(|up| up.parts.get_mut(&pn))
+                            .filter(|p| p.part_seq == pseq)
+                        {
+                            let mut exts = p.extents.to_vec();
+                            exts[eidx] = new_ext;
+                            p.extents = exts.into();
+                        }
+                    }
+                    old_slot
+                        .live_bytes
+                        .fetch_sub(old_ext.physical_bytes(), Ordering::AcqRel);
+                    if let Some(ns) = touched_new_slots.get(&new_ext.seg_id) {
+                        ns.live_bytes
+                            .fetch_add(new_ext.physical_bytes(), Ordering::AcqRel);
+                    }
                 }
             }
 
             if old_slot.live_bytes.load(Ordering::Acquire) == 0 {
                 // [ST-7] Record deletion intent in WAL BEFORE unlinking file!
-                self.append_and_sync_wal(&WalOp::DeleteSegment { seg_id: old_id })?;
+                self.commit_wal(WalOp::DeleteSegment { seg_id: old_id })
+                    .await?;
                 old_slot
                     .state
                     .store(SEG_STATE_PENDING_DELETE, Ordering::Release);
@@ -721,6 +972,36 @@ fn create_segment_slot<D: Disk>(
     }))
 }
 
+fn insert_version_chain(
+    versioning: VersioningStatus,
+    chain: &mut Vec<ObjectVersionEntry>,
+    entry: ObjectVersionEntry,
+    reclaimed: &mut Vec<Extent>,
+) {
+    match versioning {
+        VersioningStatus::Unversioned => {
+            for old in chain.drain(..) {
+                reclaimed.extend(old.extents.iter().copied());
+            }
+            chain.push(entry);
+        }
+        VersioningStatus::Suspended => {
+            chain.retain(|old| {
+                if old.version_id.as_deref() == Some("null") {
+                    reclaimed.extend(old.extents.iter().copied());
+                    false
+                } else {
+                    true
+                }
+            });
+            chain.insert(0, entry);
+        }
+        VersioningStatus::Enabled => {
+            chain.insert(0, entry);
+        }
+    }
+}
+
 fn apply_wal_op(
     catalog: &mut MemoryCatalog,
     created_segments: &mut BTreeSet<u32>,
@@ -731,6 +1012,7 @@ fn apply_wal_op(
         WalOp::CreateBucket {
             name,
             owner,
+            acl,
             region,
             created_ms,
             ownership,
@@ -740,17 +1022,25 @@ fn apply_wal_op(
                 BucketEntry {
                     name,
                     owner,
+                    acl,
                     region,
                     created_ms,
                     versioning: VersioningStatus::Unversioned,
                     ownership,
                     objects: BTreeMap::new(),
+                    uploads: BTreeMap::new(),
+                    completed_uploads: BTreeMap::new(),
                 },
             );
         }
         WalOp::UpdateBucketVersioning { name, versioning } => {
             if let Some(b) = catalog.buckets.get_mut(&name) {
                 b.versioning = versioning;
+            }
+        }
+        WalOp::UpdateBucketAcl { name, acl } => {
+            if let Some(b) = catalog.buckets.get_mut(&name) {
+                b.acl = acl;
             }
         }
         WalOp::DeleteBucket { name } => {
@@ -768,9 +1058,10 @@ fn apply_wal_op(
             sys_meta,
             user_meta,
             owner,
+            acl,
             last_modified_ms,
             extents,
-            part_sizes,
+            parts,
         } => {
             if seq > catalog.next_seq {
                 catalog.next_seq = seq;
@@ -786,24 +1077,29 @@ fn apply_wal_op(
                     sys_meta,
                     user_meta,
                     owner,
+                    acl,
                     last_modified_ms,
                     extents: extents.into(),
-                    part_sizes: part_sizes.map(Into::into),
+                    parts: parts.map(Into::into),
                 };
                 let chain = b.objects.entry(key).or_default();
-                match b.versioning {
-                    VersioningStatus::Unversioned => {
-                        chain.clear();
-                        chain.push(entry);
-                    }
-                    VersioningStatus::Suspended => {
-                        chain.retain(|v| v.version_id.as_deref() != Some("null"));
-                        chain.insert(0, entry);
-                    }
-                    VersioningStatus::Enabled => {
-                        chain.insert(0, entry);
-                    }
-                }
+                let mut _unused = Vec::new();
+                insert_version_chain(b.versioning, chain, entry, &mut _unused);
+            }
+        }
+        WalOp::UpdateObjectAcl {
+            bucket,
+            key,
+            seq,
+            acl,
+        } => {
+            if let Some(v) = catalog
+                .buckets
+                .get_mut(&bucket)
+                .and_then(|b| b.objects.get_mut(&key))
+                .and_then(|c| c.iter_mut().find(|v| v.seq == seq))
+            {
+                v.acl = acl;
             }
         }
         WalOp::DeleteVersion {
@@ -829,10 +1125,134 @@ fn apply_wal_op(
                 }
             }
         }
+        WalOp::CreateMultipartUpload {
+            bucket,
+            key,
+            upload_id,
+            initiator,
+            owner,
+            acl,
+            initiated_ms,
+            sys_meta,
+            user_meta,
+            checksum_algorithm,
+            checksum_type,
+        } => {
+            if let Some(b) = catalog.buckets.get_mut(&bucket) {
+                b.uploads.insert(
+                    (key.clone(), upload_id.clone()),
+                    MultipartUploadEntry {
+                        upload_id,
+                        key,
+                        initiator,
+                        owner,
+                        acl,
+                        initiated_ms,
+                        sys_meta,
+                        user_meta,
+                        checksum_algorithm,
+                        checksum_type,
+                        parts: BTreeMap::new(),
+                    },
+                );
+            }
+        }
+        WalOp::PutUploadPart {
+            bucket,
+            key,
+            upload_id,
+            part_seq,
+            part_number,
+            last_modified_ms,
+            etag,
+            size,
+            md5,
+            crc64_nvme,
+            checksum,
+            extents,
+        } => {
+            if part_seq > catalog.next_seq {
+                catalog.next_seq = part_seq;
+            }
+            if let Some(up) = catalog
+                .buckets
+                .get_mut(&bucket)
+                .and_then(|b| b.uploads.get_mut(&(key, upload_id)))
+            {
+                up.parts.insert(
+                    part_number,
+                    UploadPartEntry {
+                        part_seq,
+                        part_number,
+                        last_modified_ms,
+                        etag,
+                        size,
+                        md5,
+                        crc64_nvme,
+                        checksum,
+                        extents: extents.into(),
+                    },
+                );
+            }
+        }
+        WalOp::CompleteMultipartUpload {
+            bucket,
+            key,
+            upload_id,
+            seq,
+            version_id,
+            total_size,
+            etag,
+            checksum,
+            sys_meta,
+            user_meta,
+            owner,
+            acl,
+            completed_ms,
+            extents,
+            parts,
+            resp,
+        } => {
+            if seq > catalog.next_seq {
+                catalog.next_seq = seq;
+            }
+            if let Some(b) = catalog.buckets.get_mut(&bucket) {
+                let entry = ObjectVersionEntry {
+                    seq,
+                    version_id,
+                    is_delete_marker: false,
+                    total_size,
+                    etag,
+                    checksum,
+                    sys_meta,
+                    user_meta,
+                    owner,
+                    acl,
+                    last_modified_ms: completed_ms,
+                    extents: extents.into(),
+                    parts: Some(parts.into()),
+                };
+                let chain = b.objects.entry(key.clone()).or_default();
+                let mut _unused = Vec::new();
+                insert_version_chain(b.versioning, chain, entry, &mut _unused);
+                b.uploads.remove(&(key.clone(), upload_id.clone()));
+                b.completed_uploads
+                    .insert((key, upload_id), (completed_ms, resp));
+            }
+        }
+        WalOp::AbortMultipartUpload {
+            bucket,
+            key,
+            upload_id,
+        } => {
+            if let Some(b) = catalog.buckets.get_mut(&bucket) {
+                b.uploads.remove(&(key, upload_id));
+            }
+        }
         WalOp::CreateSegment { seg_id } => {
             created_segments.insert(seg_id);
         }
-        WalOp::RelocateExtents { items } => {
+        WalOp::RelocateExtents { items, part_items } => {
             for item in items {
                 if let Some(v) = catalog
                     .buckets
@@ -845,6 +1265,23 @@ fn apply_wal_op(
                             let mut exts = v.extents.to_vec();
                             exts[item.extent_idx] = item.new_extent;
                             v.extents = exts.into();
+                        }
+                    }
+                }
+            }
+            for pitem in part_items {
+                if let Some(p) = catalog
+                    .buckets
+                    .get_mut(&pitem.bucket)
+                    .and_then(|b| b.uploads.get_mut(&(pitem.key, pitem.upload_id)))
+                    .and_then(|up| up.parts.get_mut(&pitem.part_number))
+                    .filter(|p| p.part_seq == pitem.part_seq)
+                {
+                    if let Some(cur) = p.extents.get(pitem.extent_idx) {
+                        if cur.seg_id == pitem.old_seg_id && cur.offset == pitem.old_offset {
+                            let mut exts = p.extents.to_vec();
+                            exts[pitem.extent_idx] = pitem.new_extent;
+                            p.extents = exts.into();
                         }
                     }
                 }
@@ -870,7 +1307,7 @@ fn require_authenticated(ctx: &CallerContext) -> StoreResult<&OwnerInfo> {
         .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied, "Access Denied"))
 }
 
-fn check_bucket_access<'a>(
+fn lookup_bucket_checked<'a>(
     cat: &'a MemoryCatalog,
     ctx: &CallerContext,
     bucket_name: &str,
@@ -879,19 +1316,104 @@ fn check_bucket_access<'a>(
         S3Error::new(S3ErrorCode::NoSuchBucket, "The specified bucket does not exist")
             .with_bucket(bucket_name)
     })?;
-    let caller = require_authenticated(ctx)?;
     if let Some(expected) = &ctx.expected_bucket_owner {
         if expected != &b.owner.user_id {
             return Err(S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
                 .with_bucket(bucket_name));
         }
     }
+    Ok(b)
+}
+
+fn require_bucket_owner<'a>(
+    cat: &'a MemoryCatalog,
+    ctx: &CallerContext,
+    bucket_name: &str,
+) -> StoreResult<&'a BucketEntry> {
+    let b = lookup_bucket_checked(cat, ctx, bucket_name)?;
+    let caller = require_authenticated(ctx)?;
     if caller.user_id != b.owner.user_id {
         return Err(
             S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(bucket_name)
         );
     }
     Ok(b)
+}
+
+fn has_bucket_perm(bucket: &BucketEntry, ctx: &CallerContext, needed: AclPermission) -> bool {
+    let caller_is_owner = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == bucket.owner.user_id);
+    if bucket.ownership == ObjectOwnership::BucketOwnerEnforced {
+        return caller_is_owner;
+    }
+    if matches!(needed, AclPermission::ReadAcp | AclPermission::WriteAcp) && caller_is_owner {
+        return true;
+    }
+    bucket
+        .acl
+        .allows(ctx.caller.as_ref(), ctx.is_authenticated, needed, false)
+}
+
+fn check_bucket_perm<'a>(
+    cat: &'a MemoryCatalog,
+    ctx: &CallerContext,
+    bucket_name: &str,
+    needed: AclPermission,
+) -> StoreResult<&'a BucketEntry> {
+    let b = lookup_bucket_checked(cat, ctx, bucket_name)?;
+    if !has_bucket_perm(b, ctx, needed) {
+        return Err(
+            S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_bucket(bucket_name)
+        );
+    }
+    Ok(b)
+}
+
+fn has_object_perm(
+    bucket: &BucketEntry,
+    ver: &ObjectVersionEntry,
+    ctx: &CallerContext,
+    needed: AclPermission,
+) -> bool {
+    if bucket.ownership == ObjectOwnership::BucketOwnerEnforced {
+        return ctx.is_authenticated
+            && ctx
+                .caller
+                .as_ref()
+                .is_some_and(|c| c.user_id == bucket.owner.user_id);
+    }
+    let caller_is_obj_owner = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == ver.owner.user_id);
+    if matches!(needed, AclPermission::ReadAcp | AclPermission::WriteAcp) && caller_is_obj_owner {
+        return true;
+    }
+    ver.acl
+        .allows(ctx.caller.as_ref(), ctx.is_authenticated, needed, false)
+}
+
+fn has_upload_perm(
+    bucket: &BucketEntry,
+    up: &MultipartUploadEntry,
+    ctx: &CallerContext,
+    needed: AclPermission,
+) -> bool {
+    let is_initiator = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == up.initiator.user_id);
+    let is_bucket_owner = ctx.is_authenticated
+        && ctx
+            .caller
+            .as_ref()
+            .is_some_and(|c| c.user_id == bucket.owner.user_id);
+    is_initiator || is_bucket_owner || has_bucket_perm(bucket, ctx, needed)
 }
 
 fn head_state_of(versions: Option<&Vec<ObjectVersionEntry>>) -> HeadState<'_> {
@@ -1025,6 +1547,10 @@ fn collect_visible_items<'a>(
     (items, is_truncated)
 }
 
+fn strip_etag_quotes(s: &str) -> &str {
+    s.trim().trim_matches('"')
+}
+
 impl<D: Disk> ObjectStore for Engine<D> {
     type Reader = EngineByteReader<D>;
 
@@ -1039,8 +1565,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
         }
         let after = match &req.continuation_token {
-            Some(tok) => Some(decode_token("__buckets__", tok)?),
-            None => None,
+            Some(tok) if !tok.is_empty() => Some(decode_token("__buckets__", tok)?),
+            _ => None,
         };
         let max = req.max_buckets.unwrap_or(10_000);
         let cat = self.catalog.read().unwrap();
@@ -1128,14 +1654,33 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let ownership = req
             .object_ownership
             .unwrap_or(self.cfg.default_object_ownership);
+        let acl = if ownership == ObjectOwnership::BucketOwnerEnforced {
+            if let Some(spec) = &req.acl {
+                if !matches!(spec, AclSpec::Canned(CannedAcl::Private)) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidBucketAclWithObjectOwnership,
+                        "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting",
+                    )
+                    .with_bucket(&req.bucket));
+                }
+            }
+            AccessControlPolicy::new_private(caller.clone())
+        } else {
+            match &req.acl {
+                None => AccessControlPolicy::new_private(caller.clone()),
+                Some(spec) => resolve_target_acl(&caller, Some(&caller), spec)?,
+            }
+        };
+
         let op = WalOp::CreateBucket {
             name: req.bucket.clone(),
             owner: caller.clone(),
+            acl: acl.clone(),
             region: self.cfg.region.clone(),
             created_ms: req.ctx.request_time_ms,
             ownership,
         };
-        self.append_and_sync_wal(&op)?;
+        self.commit_wal(op).await?;
 
         let mut cat = self.catalog.write().unwrap();
         cat.buckets.insert(
@@ -1143,11 +1688,14 @@ impl<D: Disk> ObjectStore for Engine<D> {
             BucketEntry {
                 name: req.bucket.clone(),
                 owner: caller.clone(),
+                acl,
                 region: self.cfg.region.clone(),
                 created_ms: req.ctx.request_time_ms,
                 versioning: VersioningStatus::Unversioned,
                 ownership,
                 objects: BTreeMap::new(),
+                uploads: BTreeMap::new(),
+                completed_uploads: BTreeMap::new(),
             },
         );
 
@@ -1163,7 +1711,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn head_bucket(&self, req: BucketRef) -> StoreResult<BucketMetaSnapshot> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
         Ok(BucketMetaSnapshot {
             name: b.name.clone(),
             owner: b.owner.clone(),
@@ -1179,7 +1727,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let _kl = self.key_stripe(&req.bucket, "").lock().await;
         {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
+            let b = require_bucket_owner(&cat, &req.ctx, &req.bucket)?;
             if b.objects.values().any(|c| !c.is_empty()) {
                 return Err(S3Error::new(
                     S3ErrorCode::BucketNotEmpty,
@@ -1188,12 +1736,154 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .with_bucket(&req.bucket));
             }
         }
-        self.append_and_sync_wal(&WalOp::DeleteBucket {
+        self.commit_wal(WalOp::DeleteBucket {
             name: req.bucket.clone(),
-        })?;
-        let mut cat = self.catalog.write().unwrap();
-        cat.buckets.remove(&req.bucket);
+        })
+        .await?;
+        let mut reclaimed = Vec::new();
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(removed) = cat.buckets.remove(&req.bucket) {
+                for up in removed.uploads.into_values() {
+                    for p in up.parts.into_values() {
+                        reclaimed.extend(p.extents.iter().copied());
+                    }
+                }
+            }
+        }
+        if !reclaimed.is_empty() {
+            self.adjust_live_bytes(&[], &reclaimed);
+        }
         Ok(())
+    }
+
+    async fn get_bucket_versioning(&self, req: BucketRef) -> StoreResult<VersioningStatus> {
+        let cat = self.catalog.read().unwrap();
+        let b = require_bucket_owner(&cat, &req.ctx, &req.bucket)?;
+        Ok(b.versioning)
+    }
+
+    async fn put_bucket_versioning(&self, req: PutBucketVersioningReq) -> StoreResult<()> {
+        if req.status == VersioningStatus::Unversioned {
+            return Err(S3Error::new(
+                S3ErrorCode::MalformedXML,
+                "Invalid versioning status.",
+            ));
+        }
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let _ = require_bucket_owner(&cat, &req.ctx, &req.bucket)?;
+        }
+        self.commit_wal(WalOp::UpdateBucketVersioning {
+            name: req.bucket.clone(),
+            versioning: req.status,
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.versioning = req.status;
+        }
+        Ok(())
+    }
+
+    async fn get_bucket_acl(&self, req: BucketRef) -> StoreResult<AccessControlPolicy> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::ReadAcp)?;
+        Ok(b.acl.clone())
+    }
+
+    async fn put_bucket_acl(&self, req: PutBucketAclReq) -> StoreResult<()> {
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, "").lock().await;
+        let new_acl = {
+            let cat = self.catalog.read().unwrap();
+            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::WriteAcp)?;
+            if b.ownership == ObjectOwnership::BucketOwnerEnforced {
+                return Err(S3Error::new(
+                    S3ErrorCode::AccessControlListNotSupported,
+                    "The bucket does not allow ACLs",
+                )
+                .with_bucket(&req.bucket));
+            }
+            resolve_target_acl(&b.owner, Some(&b.owner), &req.acl)?
+        };
+        self.commit_wal(WalOp::UpdateBucketAcl {
+            name: req.bucket.clone(),
+            acl: new_acl.clone(),
+        })
+        .await?;
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+            b.acl = new_acl;
+        }
+        Ok(())
+    }
+
+    async fn get_object_acl(&self, req: GetObjectAclReq) -> StoreResult<GetObjectAclResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let cat = self.catalog.read().unwrap();
+        let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_read_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            AclPermission::ReadAcp,
+        )?;
+        Ok(GetObjectAclResp {
+            version_id: ver.version_id.clone().filter(|v| v != "null"),
+            policy: ver.acl.clone(),
+        })
+    }
+
+    async fn put_object_acl(&self, req: PutObjectAclReq) -> StoreResult<Option<String>> {
+        validate_object_key(&req.bucket, &req.key)?;
+        self.check_writable(false)?;
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let (target_seq, new_acl, vid_out) = {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let ver = self.lookup_version_for_read_checked(
+                b,
+                &req.ctx,
+                &req.bucket,
+                &req.key,
+                req.version_id.as_deref(),
+                AclPermission::WriteAcp,
+            )?;
+            if b.ownership == ObjectOwnership::BucketOwnerEnforced {
+                return Err(S3Error::new(
+                    S3ErrorCode::AccessControlListNotSupported,
+                    "The bucket does not allow ACLs",
+                )
+                .with_bucket(&req.bucket));
+            }
+            let acl = resolve_target_acl(&ver.owner, Some(&b.owner), &req.acl)?;
+            let vid = ver.version_id.clone().filter(|v| v != "null");
+            (ver.seq, acl, vid)
+        };
+
+        self.commit_wal(WalOp::UpdateObjectAcl {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            seq: target_seq,
+            acl: new_acl.clone(),
+        })
+        .await?;
+
+        let mut cat = self.catalog.write().unwrap();
+        if let Some(v) = cat
+            .buckets
+            .get_mut(&req.bucket)
+            .and_then(|b| b.objects.get_mut(&req.key))
+            .and_then(|c| c.iter_mut().find(|v| v.seq == target_seq))
+        {
+            v.acl = new_acl;
+        }
+        Ok(vid_out)
     }
 
     async fn put_object<S: VerifiedBodyStream>(
@@ -1205,11 +1895,16 @@ impl<D: Disk> ObjectStore for Engine<D> {
         validate_user_metadata(&req.user_meta)?;
         self.check_writable(true)?;
 
-        let caller = {
+        {
             let cat = self.catalog.read().unwrap();
-            let _ = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
-            require_authenticated(&req.ctx)?.clone()
-        };
+            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let _ = resolve_object_owner_and_acl(
+                b.ownership,
+                &b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?;
+        }
 
         // 1. Stream data into segment blocks (<= max_block_payload) while computing digests
         let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
@@ -1259,15 +1954,22 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 .map_err(|e| self.poison_read_only("put_seg_fdatasync", e))?;
         }
 
-        // 4. Acquire KeyLock, re-evaluate preconditions at commit point (FR-17), write & sync WAL
+        // 4. Acquire KeyLock, re-evaluate preconditions & ACL at commit point (FR-17), write & sync WAL
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
-        let (seq, versioning) = {
+        let (versioning, obj_owner, obj_acl) = {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
+            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let (owner, acl) = resolve_object_owner_and_acl(
+                b.ownership,
+                &b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?;
             let head = head_state_of(b.objects.get(&req.key));
             evaluate_write_preconditions(&req.preconditions, &req.bucket, &req.key, head)?;
-            (cat.next_seq + 1, b.versioning)
+            (b.versioning, owner, acl)
         };
+        let seq = self.alloc_seq();
 
         let etag = format!("\"{}\"", hex::encode(digests.md5));
         let version_id = match versioning {
@@ -1287,12 +1989,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
             checksum: digests.checksum.clone(),
             sys_meta: req.sys_meta.clone(),
             user_meta: req.user_meta.clone(),
-            owner: caller.clone(),
+            owner: obj_owner.clone(),
+            acl: obj_acl.clone(),
             last_modified_ms: req.ctx.request_time_ms,
             extents: extents.clone(),
-            part_sizes: None,
+            parts: None,
         };
-        self.append_and_sync_wal(&op)?;
+        self.commit_wal(op).await?;
 
         // 5. Commit to in-memory catalog & update live_bytes accounting
         let mut reclaimed_extents: Vec<Extent> = Vec::new();
@@ -1303,73 +2006,22 @@ impl<D: Disk> ObjectStore for Engine<D> {
             }
             if let Some(b) = cat.buckets.get_mut(&req.bucket) {
                 let chain = b.objects.entry(req.key).or_default();
-                match b.versioning {
-                    VersioningStatus::Unversioned => {
-                        for old in chain.drain(..) {
-                            reclaimed_extents.extend(old.extents.iter().copied());
-                        }
-                        chain.push(ObjectVersionEntry {
-                            seq,
-                            version_id: version_id.clone(),
-                            is_delete_marker: false,
-                            total_size: digests.total_bytes,
-                            etag: etag.clone(),
-                            checksum: digests.checksum.clone(),
-                            sys_meta: req.sys_meta,
-                            user_meta: req.user_meta,
-                            owner: caller,
-                            last_modified_ms: req.ctx.request_time_ms,
-                            extents: extents.clone().into(),
-                            part_sizes: None,
-                        });
-                    }
-                    VersioningStatus::Suspended => {
-                        chain.retain(|old| {
-                            if old.version_id.as_deref() == Some("null") {
-                                reclaimed_extents.extend(old.extents.iter().copied());
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                        chain.insert(
-                            0,
-                            ObjectVersionEntry {
-                                seq,
-                                version_id: version_id.clone(),
-                                is_delete_marker: false,
-                                total_size: digests.total_bytes,
-                                etag: etag.clone(),
-                                checksum: digests.checksum.clone(),
-                                sys_meta: req.sys_meta,
-                                user_meta: req.user_meta,
-                                owner: caller,
-                                last_modified_ms: req.ctx.request_time_ms,
-                                extents: extents.clone().into(),
-                                part_sizes: None,
-                            },
-                        );
-                    }
-                    VersioningStatus::Enabled => {
-                        chain.insert(
-                            0,
-                            ObjectVersionEntry {
-                                seq,
-                                version_id: version_id.clone(),
-                                is_delete_marker: false,
-                                total_size: digests.total_bytes,
-                                etag: etag.clone(),
-                                checksum: digests.checksum.clone(),
-                                sys_meta: req.sys_meta,
-                                user_meta: req.user_meta,
-                                owner: caller,
-                                last_modified_ms: req.ctx.request_time_ms,
-                                extents: extents.clone().into(),
-                                part_sizes: None,
-                            },
-                        );
-                    }
-                }
+                let entry = ObjectVersionEntry {
+                    seq,
+                    version_id: version_id.clone(),
+                    is_delete_marker: false,
+                    total_size: digests.total_bytes,
+                    etag: etag.clone(),
+                    checksum: digests.checksum.clone(),
+                    sys_meta: req.sys_meta,
+                    user_meta: req.user_meta,
+                    owner: obj_owner,
+                    acl: obj_acl,
+                    last_modified_ms: req.ctx.request_time_ms,
+                    extents: extents.clone().into(),
+                    parts: None,
+                };
+                insert_version_chain(b.versioning, chain, entry, &mut reclaimed_extents);
             }
         }
 
@@ -1392,26 +2044,89 @@ impl<D: Disk> ObjectStore for Engine<D> {
         Ok(meta)
     }
 
+    async fn get_object_attributes(
+        &self,
+        req: GetObjectAttributesReq,
+    ) -> StoreResult<GetObjectAttributesResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let cat = self.catalog.read().unwrap();
+        let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+        let ver = self.lookup_version_for_read_checked(
+            b,
+            &req.ctx,
+            &req.bucket,
+            &req.key,
+            req.version_id.as_deref(),
+            AclPermission::Read,
+        )?;
+
+        let object_parts = if req.attrs.object_parts {
+            ver.parts.as_ref().map(|all_parts| {
+                let total = all_parts.len() as u32;
+                let max_p = req.max_parts.min(1000);
+                let mut selected = Vec::new();
+                let mut is_truncated = false;
+                for p in all_parts.iter() {
+                    if p.part_number <= req.part_number_marker {
+                        continue;
+                    }
+                    if selected.len() == max_p {
+                        is_truncated = true;
+                        break;
+                    }
+                    selected.push(ObjectAttributePartEntry {
+                        part_number: p.part_number,
+                        size: p.size,
+                        checksum: p.checksum.clone(),
+                    });
+                }
+                let next_marker = selected.last().map(|p| p.part_number);
+                ObjectAttributesPartsResp {
+                    total_parts_count: total,
+                    part_number_marker: req.part_number_marker,
+                    next_part_number_marker: next_marker,
+                    max_parts: max_p,
+                    is_truncated,
+                    parts: selected,
+                }
+            })
+        } else {
+            None
+        };
+
+        Ok(GetObjectAttributesResp {
+            version_id: ver.version_id.clone().filter(|v| v != "null"),
+            last_modified_ms: ver.last_modified_ms,
+            etag: req.attrs.etag.then(|| strip_etag_quotes(&ver.etag).to_string()),
+            checksum: req.attrs.checksum.then(|| ver.checksum.clone()),
+            object_parts,
+            storage_class: req.attrs.storage_class.then(|| "STANDARD".to_string()),
+            object_size: req.attrs.object_size.then_some(ver.total_size),
+        })
+    }
+
     async fn delete_object(&self, req: DeleteObjectReq) -> StoreResult<DeleteObjectResp> {
         validate_object_key(&req.bucket, &req.key)?;
         self.check_writable(false)?;
 
         let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
-        let (seq, versioning, caller) = {
+        let (versioning, dm_owner) = {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
-            let caller = require_authenticated(&req.ctx)?.clone();
+            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let dm_owner = req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone());
             let head = head_state_of(b.objects.get(&req.key));
             evaluate_delete_preconditions(req.if_match.as_deref(), &req.bucket, &req.key, head)?;
-            (cat.next_seq + 1, b.versioning, caller)
+            (b.versioning, dm_owner)
         };
+        let seq = self.alloc_seq();
 
         if let Some(vid) = &req.version_id {
-            self.append_and_sync_wal(&WalOp::DeleteVersion {
+            self.commit_wal(WalOp::DeleteVersion {
                 bucket: req.bucket.clone(),
                 key: req.key.clone(),
                 version_id: Some(vid.clone()),
-            })?;
+            })
+            .await?;
             let mut reclaimed = Vec::new();
             let mut out_resp = DeleteObjectResp {
                 version_id: Some(vid.clone()),
@@ -1443,11 +2158,12 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         match versioning {
             VersioningStatus::Unversioned => {
-                self.append_and_sync_wal(&WalOp::DeleteVersion {
+                self.commit_wal(WalOp::DeleteVersion {
                     bucket: req.bucket.clone(),
                     key: req.key.clone(),
                     version_id: None,
-                })?;
+                })
+                .await?;
                 let mut reclaimed = Vec::new();
                 {
                     let mut cat = self.catalog.write().unwrap();
@@ -1477,7 +2193,8 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     value_b64: String::new(),
                     client_requested: false,
                 };
-                self.append_and_sync_wal(&WalOp::PutVersion {
+                let dm_acl = AccessControlPolicy::new_private(dm_owner.clone());
+                self.commit_wal(WalOp::PutVersion {
                     bucket: req.bucket.clone(),
                     key: req.key.clone(),
                     seq,
@@ -1488,11 +2205,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     checksum: dummy_csum.clone(),
                     sys_meta: SystemMeta::default(),
                     user_meta: Vec::new(),
-                    owner: caller.clone(),
+                    owner: dm_owner.clone(),
+                    acl: dm_acl.clone(),
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: Vec::new(),
-                    part_sizes: None,
-                })?;
+                    parts: None,
+                })
+                .await?;
 
                 let mut reclaimed = Vec::new();
                 {
@@ -1523,10 +2242,11 @@ impl<D: Disk> ObjectStore for Engine<D> {
                                 checksum: dummy_csum,
                                 sys_meta: SystemMeta::default(),
                                 user_meta: Vec::new(),
-                                owner: caller,
+                                owner: dm_owner,
+                                acl: dm_acl,
                                 last_modified_ms: req.ctx.request_time_ms,
                                 extents: Arc::new([]),
-                                part_sizes: None,
+                                parts: None,
                             },
                         );
                     }
@@ -1551,7 +2271,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         self.check_writable(false)?;
         {
             let cat = self.catalog.read().unwrap();
-            let _ = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
+            let _ = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
         }
 
         let mut deleted = Vec::new();
@@ -1601,6 +2321,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
             && req.src_key == req.dst_key
             && req.src_version_id.is_none()
             && !req.replace_metadata
+            && req.acl.is_none()
         {
             return Err(S3Error::new(
                 S3ErrorCode::InvalidRequest,
@@ -1612,32 +2333,24 @@ impl<D: Disk> ObjectStore for Engine<D> {
         // 1. Lock-free snapshot read of source metadata & pin its segments
         let (src_ver, src_pins) = {
             let cat = self.catalog.read().unwrap();
-            let src_b = check_bucket_access(&cat, &req.ctx, &req.src_bucket)?;
-            let _ = check_bucket_access(&cat, &req.ctx, &req.dst_bucket)?;
-            let found = match &req.src_version_id {
-                None => src_b
-                    .objects
-                    .get(&req.src_key)
-                    .and_then(|c| c.first())
-                    .filter(|v| !v.is_delete_marker)
-                    .cloned(),
-                Some(vid) => src_b.objects.get(&req.src_key).and_then(|c| {
-                    c.iter()
-                        .find(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
-                        .cloned()
-                }),
-            }
-            .ok_or_else(|| {
-                S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
-                    .with_key(&req.src_bucket, &req.src_key)
-            })?;
+            let src_b = lookup_bucket_checked(&cat, &req.ctx, &req.src_bucket)?;
+            let found = self
+                .lookup_version_for_copy_checked(
+                    src_b,
+                    &req.ctx,
+                    &req.src_bucket,
+                    &req.src_key,
+                    req.src_version_id.as_deref(),
+                )?
+                .clone();
+            let dst_b = check_bucket_perm(&cat, &req.ctx, &req.dst_bucket, AclPermission::Write)?;
+            let _ = resolve_object_owner_and_acl(
+                dst_b.ownership,
+                &dst_b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?;
 
-            if found.is_delete_marker {
-                return Err(S3Error::new(
-                    S3ErrorCode::InvalidRequest,
-                    "The source of a copy request may not specifically refer to a delete marker by version id.",
-                ));
-            }
             if found.total_size > MAX_SINGLE_PUT_BYTES {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidRequest,
@@ -1658,6 +2371,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         let mut new_extents = Vec::with_capacity(src_ver.extents.len());
         let mut touched_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
         let mut md5_hasher = Md5::new();
+        let mut csum_hasher = ActiveHasher::new(src_ver.checksum.algorithm);
 
         for ext in src_ver.extents.iter() {
             let Some(pin) = src_pins.get(&ext.seg_id) else {
@@ -1676,6 +2390,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 ));
             }
             md5_hasher.update(payload);
+            csum_hasher.update(payload);
             let (new_ext, slot) = self.write_data_block(payload)?;
             touched_slots.insert(slot.seg_id, slot);
             new_extents.push(new_ext);
@@ -1690,10 +2405,15 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
         // 3. Commit under destination key lock
         let _kl = self.key_stripe(&req.dst_bucket, &req.dst_key).lock().await;
-        let (seq, dst_versioning, caller) = {
+        let (dst_versioning, dst_owner, dst_acl) = {
             let cat = self.catalog.read().unwrap();
-            let dst_b = check_bucket_access(&cat, &req.ctx, &req.dst_bucket)?;
-            let caller = require_authenticated(&req.ctx)?.clone();
+            let dst_b = check_bucket_perm(&cat, &req.ctx, &req.dst_bucket, AclPermission::Write)?;
+            let (owner, acl) = resolve_object_owner_and_acl(
+                dst_b.ownership,
+                &dst_b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?;
             let dst_head = head_state_of(dst_b.objects.get(&req.dst_key));
             evaluate_write_preconditions(
                 &req.dst_preconditions,
@@ -1701,8 +2421,9 @@ impl<D: Disk> ObjectStore for Engine<D> {
                 &req.dst_key,
                 dst_head,
             )?;
-            (cat.next_seq + 1, dst_b.versioning, caller)
+            (dst_b.versioning, owner, acl)
         };
+        let seq = self.alloc_seq();
 
         let dst_vid = match dst_versioning {
             VersioningStatus::Unversioned => None,
@@ -1716,6 +2437,12 @@ impl<D: Disk> ObjectStore for Engine<D> {
         };
         let md5_raw: [u8; 16] = md5_hasher.finalize().into();
         let etag = format!("\"{}\"", hex::encode(md5_raw));
+        let dst_csum = ChecksumState {
+            algorithm: src_ver.checksum.algorithm,
+            checksum_type: ChecksumType::FullObject,
+            value_b64: csum_hasher.finalize_b64(),
+            client_requested: src_ver.checksum.client_requested,
+        };
 
         let op = WalOp::PutVersion {
             bucket: req.dst_bucket.clone(),
@@ -1725,15 +2452,16 @@ impl<D: Disk> ObjectStore for Engine<D> {
             is_delete_marker: false,
             total_size: src_ver.total_size,
             etag: etag.clone(),
-            checksum: src_ver.checksum.clone(),
+            checksum: dst_csum.clone(),
             sys_meta: sys_meta.clone(),
             user_meta: user_meta.clone(),
-            owner: caller.clone(),
+            owner: dst_owner.clone(),
+            acl: dst_acl.clone(),
             last_modified_ms: req.ctx.request_time_ms,
             extents: new_extents.clone(),
-            part_sizes: None,
+            parts: None,
         };
-        self.append_and_sync_wal(&op)?;
+        self.commit_wal(op).await?;
 
         let mut reclaimed = Vec::new();
         {
@@ -1749,36 +2477,16 @@ impl<D: Disk> ObjectStore for Engine<D> {
                     is_delete_marker: false,
                     total_size: src_ver.total_size,
                     etag: etag.clone(),
-                    checksum: src_ver.checksum.clone(),
+                    checksum: dst_csum.clone(),
                     sys_meta,
                     user_meta,
-                    owner: caller,
+                    owner: dst_owner,
+                    acl: dst_acl,
                     last_modified_ms: req.ctx.request_time_ms,
                     extents: new_extents.clone().into(),
-                    part_sizes: None,
+                    parts: None,
                 };
-                match dst_versioning {
-                    VersioningStatus::Unversioned => {
-                        for old in chain.drain(..) {
-                            reclaimed.extend(old.extents.iter().copied());
-                        }
-                        chain.push(entry);
-                    }
-                    VersioningStatus::Suspended => {
-                        chain.retain(|old| {
-                            if old.version_id.as_deref() == Some("null") {
-                                reclaimed.extend(old.extents.iter().copied());
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                        chain.insert(0, entry);
-                    }
-                    VersioningStatus::Enabled => {
-                        chain.insert(0, entry);
-                    }
-                }
+                insert_version_chain(dst_versioning, chain, entry, &mut reclaimed);
             }
         }
         self.adjust_live_bytes(&new_extents, &reclaimed);
@@ -1788,13 +2496,1071 @@ impl<D: Disk> ObjectStore for Engine<D> {
             last_modified_ms: req.ctx.request_time_ms,
             src_version_id: src_ver.version_id,
             dst_version_id: dst_vid,
-            checksum: Some(src_ver.checksum),
+            checksum: dst_csum.client_requested.then_some(dst_csum),
+        })
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: CreateMultipartUploadReq,
+    ) -> StoreResult<CreateMultipartUploadResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        validate_user_metadata(&req.user_meta)?;
+
+        let resolved_type = match (req.checksum_algorithm, req.checksum_type) {
+            (Some(alg), explicit) => Some(alg.resolve_multipart_type(explicit)?),
+            (None, Some(_)) => {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    "x-amz-checksum-type requires x-amz-checksum-algorithm.",
+                ));
+            }
+            (None, None) => None,
+        };
+
+        self.check_writable(true)?;
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let (initiator, obj_owner, obj_acl) = {
+            let cat = self.catalog.read().unwrap();
+            let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Write)?;
+            let initiator = req.ctx.caller.clone().unwrap_or_else(|| b.owner.clone());
+            let (obj_owner, obj_acl) = resolve_object_owner_and_acl(
+                b.ownership,
+                &b.owner,
+                req.ctx.caller.as_ref(),
+                req.acl.as_ref(),
+            )?;
+            (initiator, obj_owner, obj_acl)
+        };
+
+        let seq = self.alloc_seq();
+        let mut entropy = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut entropy);
+        // [FR-24] >= 128-bit random entropy UploadId
+        let upload_id = format!("mp{seq:016x}{}", hex::encode(entropy));
+
+        self.commit_wal(WalOp::CreateMultipartUpload {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            upload_id: upload_id.clone(),
+            initiator: initiator.clone(),
+            owner: obj_owner.clone(),
+            acl: obj_acl.clone(),
+            initiated_ms: req.ctx.request_time_ms,
+            sys_meta: req.sys_meta.clone(),
+            user_meta: req.user_meta.clone(),
+            checksum_algorithm: req.checksum_algorithm,
+            checksum_type: resolved_type,
+        })
+        .await?;
+
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if seq > cat.next_seq {
+                cat.next_seq = seq;
+            }
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                b.uploads.insert(
+                    (req.key.clone(), upload_id.clone()),
+                    MultipartUploadEntry {
+                        upload_id: upload_id.clone(),
+                        key: req.key.clone(),
+                        initiator,
+                        owner: obj_owner,
+                        acl: obj_acl,
+                        initiated_ms: req.ctx.request_time_ms,
+                        sys_meta: req.sys_meta,
+                        user_meta: req.user_meta,
+                        checksum_algorithm: req.checksum_algorithm,
+                        checksum_type: resolved_type,
+                        parts: BTreeMap::new(),
+                    },
+                );
+            }
+        }
+
+        Ok(CreateMultipartUploadResp {
+            bucket: req.bucket,
+            key: req.key,
+            upload_id,
+            checksum_algorithm: req.checksum_algorithm,
+            checksum_type: resolved_type,
+        })
+    }
+
+    async fn upload_part<S: VerifiedBodyStream>(
+        &self,
+        req: UploadPartReq,
+        mut body: S,
+    ) -> StoreResult<UploadPartResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        if req.part_number == 0 || req.part_number > MAX_PARTS_COUNT {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Part number must be an integer between 1 and 10000, inclusive",
+            ));
+        }
+        self.check_writable(true)?;
+
+        let up_alg = {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
+                if has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NoSuchUpload,
+                        "The specified upload does not exist.",
+                    )
+                    .with_upload(&req.bucket, &req.key, &req.upload_id));
+                }
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            };
+            if !has_upload_perm(b, up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            }
+            up.checksum_algorithm
+        };
+
+        let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut extents: Vec<Extent> = Vec::new();
+        let mut touched_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
+        let mut seen_bytes = 0u64;
+        let mut crc64_hasher = crc64fast_nvme::Digest::new();
+        let mut up_csum_hasher = up_alg.map(ActiveHasher::new);
+
+        while let Some(chunk) = poll_fn(|cx| body.poll_next_chunk(cx))
+            .await
+            .map_err(map_body_err)?
+        {
+            seen_bytes += chunk.len() as u64;
+            if seen_bytes > req.max_bytes_limit {
+                return Err(S3Error::new(
+                    S3ErrorCode::EntityTooLarge,
+                    "Your proposed upload exceeds the maximum allowed size",
+                ));
+            }
+            crc64_hasher.write(&chunk);
+            if let Some(h) = &mut up_csum_hasher {
+                h.update(&chunk);
+            }
+            let mut slice: &[u8] = &chunk;
+            while !slice.is_empty() {
+                let space = self.cfg.max_block_payload - block_buf.len();
+                let take = space.min(slice.len());
+                block_buf.extend_from_slice(&slice[..take]);
+                slice = &slice[take..];
+                if block_buf.len() == self.cfg.max_block_payload {
+                    let (ext, slot) = self.write_data_block(&block_buf)?;
+                    touched_slots.insert(slot.seg_id, slot);
+                    extents.push(ext);
+                    block_buf.clear();
+                }
+            }
+        }
+        if !block_buf.is_empty() {
+            let (ext, slot) = self.write_data_block(&block_buf)?;
+            touched_slots.insert(slot.seg_id, slot);
+            extents.push(ext);
+            block_buf.clear();
+        }
+
+        let digests = body.finish().map_err(map_body_err)?;
+        if let Some(alg) = up_alg {
+            if digests.checksum.client_requested && digests.checksum.algorithm != alg {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidRequest,
+                    format!(
+                        "Checksum algorithm mismatch: upload expects {}",
+                        alg.as_aws_str()
+                    ),
+                ));
+            }
+        }
+
+        for slot in touched_slots.values() {
+            slot.file
+                .sync_data()
+                .map_err(|e| self.poison_read_only("upload_part_seg_fdatasync", e))?;
+        }
+
+        let part_crc64 = crc64_hasher.sum64();
+        let part_csum = up_alg
+            .zip(up_csum_hasher)
+            .map(|(alg, h)| (alg, h.finalize_b64()));
+        let resp_csum = if let Some((alg, val)) = &part_csum {
+            Some(ChecksumState {
+                algorithm: *alg,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: val.clone(),
+                client_requested: true,
+            })
+        } else if digests.checksum.client_requested {
+            Some(digests.checksum)
+        } else {
+            None
+        };
+        let etag = format!("\"{}\"", hex::encode(digests.md5));
+
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
+                return Err(S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.bucket, &req.key, &req.upload_id));
+            };
+            if !has_upload_perm(b, up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            }
+        }
+        let part_seq = self.alloc_seq();
+
+        self.commit_wal(WalOp::PutUploadPart {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            upload_id: req.upload_id.clone(),
+            part_seq,
+            part_number: req.part_number,
+            last_modified_ms: req.ctx.request_time_ms,
+            etag: etag.clone(),
+            size: digests.total_bytes,
+            md5: digests.md5,
+            crc64_nvme: part_crc64,
+            checksum: part_csum.clone(),
+            extents: extents.clone(),
+        })
+        .await?;
+
+        let mut reclaimed = Vec::new();
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if part_seq > cat.next_seq {
+                cat.next_seq = part_seq;
+            }
+            if let Some(up) = cat
+                .buckets
+                .get_mut(&req.bucket)
+                .and_then(|b| b.uploads.get_mut(&(req.key, req.upload_id)))
+            {
+                if let Some(old_part) = up.parts.insert(
+                    req.part_number,
+                    UploadPartEntry {
+                        part_seq,
+                        part_number: req.part_number,
+                        last_modified_ms: req.ctx.request_time_ms,
+                        etag: etag.clone(),
+                        size: digests.total_bytes,
+                        md5: digests.md5,
+                        crc64_nvme: part_crc64,
+                        checksum: part_csum,
+                        extents: extents.clone().into(),
+                    },
+                ) {
+                    reclaimed.extend(old_part.extents.iter().copied());
+                }
+            }
+        }
+        self.adjust_live_bytes(&extents, &reclaimed);
+
+        Ok(UploadPartResp {
+            etag,
+            checksum: resp_csum,
+        })
+    }
+
+    async fn upload_part_copy(&self, req: UploadPartCopyReq) -> StoreResult<UploadPartCopyResp> {
+        validate_object_key(&req.dst_bucket, &req.dst_key)?;
+        if req.part_number == 0 || req.part_number > MAX_PARTS_COUNT {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "Part number must be an integer between 1 and 10000, inclusive",
+            ));
+        }
+        self.check_writable(true)?;
+
+        let (src_ver, src_pins, up_alg, slice_start, slice_end_excl) = {
+            let cat = self.catalog.read().unwrap();
+            let src_b = lookup_bucket_checked(&cat, &req.ctx, &req.src_bucket)?;
+            let dst_b = lookup_bucket_checked(&cat, &req.ctx, &req.dst_bucket)?;
+            let Some(up) = dst_b
+                .uploads
+                .get(&(req.dst_key.clone(), req.upload_id.clone()))
+            else {
+                if has_bucket_perm(dst_b, &req.ctx, AclPermission::Write) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NoSuchUpload,
+                        "The specified upload does not exist.",
+                    )
+                    .with_upload(&req.dst_bucket, &req.dst_key, &req.upload_id));
+                }
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.dst_bucket),
+                );
+            };
+            if !has_upload_perm(dst_b, up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.dst_bucket),
+                );
+            }
+            let up_alg = up.checksum_algorithm;
+
+            let found = self
+                .lookup_version_for_copy_checked(
+                    src_b,
+                    &req.ctx,
+                    &req.src_bucket,
+                    &req.src_key,
+                    req.src_version_id.as_deref(),
+                )?
+                .clone();
+
+            evaluate_copy_source_preconditions(
+                &req.src_preconditions,
+                &found.etag,
+                found.last_modified_ms,
+            )?;
+
+            let src_len = found.total_size;
+            let (s, e_excl) = if let Some((start, end)) = req.src_range {
+                if start > end || end >= src_len {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InvalidRange,
+                        "Range specified is not valid for source object",
+                    ));
+                }
+                if end - start + 1 > MAX_PART_SIZE_BYTES {
+                    return Err(S3Error::new(
+                        S3ErrorCode::EntityTooLarge,
+                        "Your proposed upload exceeds the maximum allowed size",
+                    ));
+                }
+                (start, end + 1)
+            } else {
+                if src_len > MAX_PART_SIZE_BYTES {
+                    return Err(S3Error::new(
+                        S3ErrorCode::EntityTooLarge,
+                        "Your proposed upload exceeds the maximum allowed size",
+                    ));
+                }
+                (0, src_len)
+            };
+
+            let pins = if s < e_excl {
+                self.pin_extents(&found.extents)?
+            } else {
+                BTreeMap::new()
+            };
+            (found, pins, up_alg, s, e_excl)
+        };
+
+        let mut block_buf = BytesMut::with_capacity(self.cfg.max_block_payload.min(64 * 1024));
+        let mut extents: Vec<Extent> = Vec::new();
+        let mut touched_slots: BTreeMap<u32, Arc<SegmentSlot<D>>> = BTreeMap::new();
+        let mut md5_hasher = Md5::new();
+        let mut crc64_hasher = crc64fast_nvme::Digest::new();
+        let mut up_csum_hasher = up_alg.map(ActiveHasher::new);
+
+        if slice_start < slice_end_excl {
+            let mut logical_pos = 0u64;
+            for ext in src_ver.extents.iter() {
+                let ext_len = ext.len as u64;
+                if ext_len == 0 {
+                    continue;
+                }
+                let ext_start = logical_pos;
+                let ext_end_excl = logical_pos + ext_len;
+                logical_pos = ext_end_excl;
+
+                if ext_end_excl <= slice_start {
+                    continue;
+                }
+                if ext_start >= slice_end_excl {
+                    break;
+                }
+
+                let Some(pin) = src_pins.get(&ext.seg_id) else {
+                    return Err(S3Error::new(S3ErrorCode::InternalError, "Missing source segment"));
+                };
+                let mut raw = vec![0u8; ext.physical_bytes() as usize];
+                pin.slot()
+                    .file
+                    .read_exact_at(ext.offset, &mut raw)
+                    .map_err(|_| S3Error::new(S3ErrorCode::InternalError, "Source read failed"))?;
+                let payload = &raw[12..];
+                if crc32c::crc32c(payload) != ext.crc32c {
+                    return Err(S3Error::new(
+                        S3ErrorCode::InternalError,
+                        "Source block CRC32C mismatch",
+                    ));
+                }
+
+                let rel_s = slice_start.saturating_sub(ext_start) as usize;
+                let rel_e = (slice_end_excl.min(ext_end_excl) - ext_start) as usize;
+                let mut slice = &payload[rel_s..rel_e];
+                md5_hasher.update(slice);
+                crc64_hasher.write(slice);
+                if let Some(h) = &mut up_csum_hasher {
+                    h.update(slice);
+                }
+
+                while !slice.is_empty() {
+                    let space = self.cfg.max_block_payload - block_buf.len();
+                    let take = space.min(slice.len());
+                    block_buf.extend_from_slice(&slice[..take]);
+                    slice = &slice[take..];
+                    if block_buf.len() == self.cfg.max_block_payload {
+                        let (new_ext, slot) = self.write_data_block(&block_buf)?;
+                        touched_slots.insert(slot.seg_id, slot);
+                        extents.push(new_ext);
+                        block_buf.clear();
+                    }
+                }
+            }
+            if !block_buf.is_empty() {
+                let (new_ext, slot) = self.write_data_block(&block_buf)?;
+                touched_slots.insert(slot.seg_id, slot);
+                extents.push(new_ext);
+                block_buf.clear();
+            }
+        }
+        drop(src_pins);
+
+        for slot in touched_slots.values() {
+            slot.file
+                .sync_data()
+                .map_err(|e| self.poison_read_only("upload_part_copy_seg_sync", e))?;
+        }
+
+        let part_len = slice_end_excl - slice_start;
+        let md5: [u8; 16] = md5_hasher.finalize().into();
+        let etag = format!("\"{}\"", hex::encode(md5));
+        let part_crc64 = crc64_hasher.sum64();
+        let part_csum = up_alg
+            .zip(up_csum_hasher)
+            .map(|(alg, h)| (alg, h.finalize_b64()));
+        let resp_csum = part_csum.as_ref().map(|(alg, val)| ChecksumState {
+            algorithm: *alg,
+            checksum_type: ChecksumType::FullObject,
+            value_b64: val.clone(),
+            client_requested: true,
+        });
+
+        let _kl = self.key_stripe(&req.dst_bucket, &req.dst_key).lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let dst_b = lookup_bucket_checked(&cat, &req.ctx, &req.dst_bucket)?;
+            let Some(up) = dst_b
+                .uploads
+                .get(&(req.dst_key.clone(), req.upload_id.clone()))
+            else {
+                return Err(S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.dst_bucket, &req.dst_key, &req.upload_id));
+            };
+            if !has_upload_perm(dst_b, up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.dst_bucket),
+                );
+            }
+        }
+        let part_seq = self.alloc_seq();
+
+        self.commit_wal(WalOp::PutUploadPart {
+            bucket: req.dst_bucket.clone(),
+            key: req.dst_key.clone(),
+            upload_id: req.upload_id.clone(),
+            part_seq,
+            part_number: req.part_number,
+            last_modified_ms: req.ctx.request_time_ms,
+            etag: etag.clone(),
+            size: part_len,
+            md5,
+            crc64_nvme: part_crc64,
+            checksum: part_csum.clone(),
+            extents: extents.clone(),
+        })
+        .await?;
+
+        let mut reclaimed = Vec::new();
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if part_seq > cat.next_seq {
+                cat.next_seq = part_seq;
+            }
+            if let Some(up) = cat
+                .buckets
+                .get_mut(&req.dst_bucket)
+                .and_then(|b| b.uploads.get_mut(&(req.dst_key, req.upload_id)))
+            {
+                if let Some(old_part) = up.parts.insert(
+                    req.part_number,
+                    UploadPartEntry {
+                        part_seq,
+                        part_number: req.part_number,
+                        last_modified_ms: req.ctx.request_time_ms,
+                        etag: etag.clone(),
+                        size: part_len,
+                        md5,
+                        crc64_nvme: part_crc64,
+                        checksum: part_csum,
+                        extents: extents.clone().into(),
+                    },
+                ) {
+                    reclaimed.extend(old_part.extents.iter().copied());
+                }
+            }
+        }
+        self.adjust_live_bytes(&extents, &reclaimed);
+
+        Ok(UploadPartCopyResp {
+            etag,
+            last_modified_ms: req.ctx.request_time_ms,
+            src_version_id: src_ver.version_id,
+            checksum: resp_csum,
+        })
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: CompleteMultipartUploadReq,
+    ) -> StoreResult<CompleteMultipartUploadResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        if req.parts.is_empty() {
+            return Err(S3Error::new(
+                S3ErrorCode::MalformedXML,
+                "The XML you provided was not well-formed or did not validate against our published schema",
+            ));
+        }
+        self.check_writable(false)?;
+
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        let (up, versioning) = {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+
+            // [FR-27] 24h idempotent replay of completed UploadId
+            if let Some((completed_ms, cached_resp)) = b
+                .completed_uploads
+                .get(&(req.key.clone(), req.upload_id.clone()))
+            {
+                if !has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                    return Err(
+                        S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                            .with_bucket(&req.bucket),
+                    );
+                }
+                if req.ctx.request_time_ms.saturating_sub(*completed_ms)
+                    <= self.cfg.completed_upload_retention_ms
+                {
+                    return Ok(cached_resp.clone());
+                }
+            }
+
+            let Some(up) = b
+                .uploads
+                .get(&(req.key.clone(), req.upload_id.clone()))
+                .cloned()
+            else {
+                if has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NoSuchUpload,
+                        "The specified upload does not exist.",
+                    )
+                    .with_upload(&req.bucket, &req.key, &req.upload_id));
+                }
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            };
+            if !has_upload_perm(b, &up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            }
+            (up, b.versioning)
+        };
+
+        let deduped_parts = dedup_complete_parts(&req.parts)?;
+        let mut total_size = 0u64;
+        let mut combined_extents = Vec::new();
+        let mut md5_concat = Vec::with_capacity(deduped_parts.len() * 16);
+        let mut boundaries = Vec::with_capacity(deduped_parts.len());
+        let mut part_csum_b64s = Vec::with_capacity(deduped_parts.len());
+        let mut selected_pns = BTreeSet::new();
+
+        let mut crc32_acc = 0u32;
+        let mut crc32c_acc = 0u32;
+        let mut crc64_acc = 0u64;
+
+        for (idx, spec) in deduped_parts.iter().enumerate() {
+            selected_pns.insert(spec.part_number);
+
+            let Some(uploaded) = up.parts.get(&spec.part_number) else {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidPart,
+                    "One or more of the specified parts could not be found.",
+                ));
+            };
+            if strip_etag_quotes(&spec.etag) != strip_etag_quotes(&uploaded.etag) {
+                return Err(S3Error::new(
+                    S3ErrorCode::InvalidPart,
+                    "One or more of the specified parts could not be found.",
+                ));
+            };
+
+            let part_len = uploaded.size;
+            let is_last = idx + 1 == deduped_parts.len();
+            if !is_last && part_len < MIN_PART_SIZE_BYTES {
+                return Err(S3Error::new(
+                    S3ErrorCode::EntityTooSmall,
+                    "Your proposed upload is smaller than the minimum allowed size",
+                ));
+            }
+
+            if let Some((spec_alg, spec_b64)) = &spec.checksum {
+                match (&up.checksum_algorithm, &uploaded.checksum) {
+                    (Some(up_alg), Some((_, actual_b64))) if spec_alg == up_alg => {
+                        if spec_b64.trim() != actual_b64 {
+                            return Err(S3Error::new(
+                                S3ErrorCode::BadDigest,
+                                "The part checksum did not match.",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(S3Error::new(
+                            S3ErrorCode::BadDigest,
+                            "Unexpected or mismatched part checksum.",
+                        ));
+                    }
+                }
+            }
+
+            if let Some((alg, b64_val)) = &uploaded.checksum {
+                part_csum_b64s.push(b64_val.clone());
+                if up.checksum_type == Some(ChecksumType::FullObject) {
+                    match alg {
+                        ChecksumAlgorithm::Crc32 => {
+                            let c = decode_u32_be_b64(b64_val)?;
+                            crc32_acc = if idx == 0 {
+                                c
+                            } else {
+                                combine_crc32(crc32_acc, c, part_len)
+                            };
+                        }
+                        ChecksumAlgorithm::Crc32c => {
+                            let c = decode_u32_be_b64(b64_val)?;
+                            crc32c_acc = if idx == 0 {
+                                c
+                            } else {
+                                combine_crc32c(crc32c_acc, c, part_len)
+                            };
+                        }
+                        ChecksumAlgorithm::Crc64Nvme => {}
+                        ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256 => {}
+                    }
+                }
+            }
+
+            crc64_acc = if idx == 0 {
+                uploaded.crc64_nvme
+            } else {
+                combine_crc64_nvme(crc64_acc, uploaded.crc64_nvme, part_len)
+            };
+
+            total_size += part_len;
+            combined_extents.extend(uploaded.extents.iter().copied());
+            md5_concat.extend_from_slice(&uploaded.md5);
+            boundaries.push(PartBoundaryInfo {
+                part_number: uploaded.part_number,
+                size: part_len,
+                checksum: uploaded.checksum.clone(),
+            });
+        }
+
+        if total_size > self.cfg.max_object_size {
+            return Err(S3Error::new(
+                S3ErrorCode::EntityTooLarge,
+                "Your proposed upload exceeds the maximum allowed size",
+            ));
+        }
+        if let Some(exp_size) = req.expected_object_size {
+            if exp_size != total_size {
+                return Err(S3Error::new(
+                    S3ErrorCode::PreconditionFailed,
+                    "Object size does not match x-amz-mp-object-size.",
+                ));
+            }
+        }
+
+        // [PR-25] Combine checksums mathematically WITHOUT re-reading part data!
+        let final_checksum = match (up.checksum_algorithm, up.checksum_type) {
+            (Some(alg), Some(ChecksumType::Composite)) => ChecksumState {
+                algorithm: alg,
+                checksum_type: ChecksumType::Composite,
+                value_b64: compute_composite_checksum_b64(alg, &part_csum_b64s)?,
+                client_requested: true,
+            },
+            (Some(ChecksumAlgorithm::Crc32), Some(ChecksumType::FullObject)) => ChecksumState {
+                algorithm: ChecksumAlgorithm::Crc32,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: encode_u32_be_b64(crc32_acc),
+                client_requested: true,
+            },
+            (Some(ChecksumAlgorithm::Crc32c), Some(ChecksumType::FullObject)) => ChecksumState {
+                algorithm: ChecksumAlgorithm::Crc32c,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: encode_u32_be_b64(crc32c_acc),
+                client_requested: true,
+            },
+            (Some(ChecksumAlgorithm::Crc64Nvme), Some(ChecksumType::FullObject)) => ChecksumState {
+                algorithm: ChecksumAlgorithm::Crc64Nvme,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: encode_u64_be_b64(crc64_acc),
+                client_requested: true,
+            },
+            _ => ChecksumState {
+                algorithm: ChecksumAlgorithm::Crc64Nvme,
+                checksum_type: ChecksumType::FullObject,
+                value_b64: encode_u64_be_b64(crc64_acc),
+                client_requested: false,
+            },
+        };
+
+        if let Some((exp_alg, exp_val)) = &req.expected_checksum {
+            if !final_checksum.client_requested
+                || *exp_alg != final_checksum.algorithm
+                || exp_val.trim() != final_checksum.value_b64
+            {
+                return Err(S3Error::new(
+                    S3ErrorCode::BadDigest,
+                    "The digest you specified did not match the calculated digest.",
+                ));
+            }
+        }
+
+        // [FR-15, FR-17] Evaluate destination preconditions at commit point
+        {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let head = head_state_of(b.objects.get(&req.key));
+            evaluate_write_preconditions(&req.preconditions, &req.bucket, &req.key, head)?;
+        }
+
+        let seq = self.alloc_seq();
+        let outer_md5: [u8; 16] = Md5::digest(&md5_concat).into();
+        let etag = format!("\"{}-{}\"", hex::encode(outer_md5), deduped_parts.len());
+        let version_id = match versioning {
+            VersioningStatus::Unversioned => None,
+            VersioningStatus::Suspended => Some("null".to_string()),
+            VersioningStatus::Enabled => Some(format!("v{seq:016x}")),
+        };
+
+        let resp = CompleteMultipartUploadResp {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            etag: etag.clone(),
+            version_id: version_id.clone(),
+            checksum: final_checksum
+                .client_requested
+                .then(|| final_checksum.clone()),
+        };
+
+        self.commit_wal(WalOp::CompleteMultipartUpload {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            upload_id: req.upload_id.clone(),
+            seq,
+            version_id: version_id.clone(),
+            total_size,
+            etag: etag.clone(),
+            checksum: final_checksum.clone(),
+            sys_meta: up.sys_meta.clone(),
+            user_meta: up.user_meta.clone(),
+            owner: up.owner.clone(),
+            acl: up.acl.clone(),
+            completed_ms: req.ctx.request_time_ms,
+            extents: combined_extents.clone(),
+            parts: boundaries.clone(),
+            resp: resp.clone(),
+        })
+        .await?;
+
+        let mut reclaimed = Vec::new();
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if seq > cat.next_seq {
+                cat.next_seq = seq;
+            }
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                let entry = ObjectVersionEntry {
+                    seq,
+                    version_id,
+                    is_delete_marker: false,
+                    total_size,
+                    etag,
+                    checksum: final_checksum,
+                    sys_meta: up.sys_meta,
+                    user_meta: up.user_meta,
+                    owner: up.owner,
+                    acl: up.acl,
+                    last_modified_ms: req.ctx.request_time_ms,
+                    extents: combined_extents.into(),
+                    parts: Some(boundaries.into()),
+                };
+                let chain = b.objects.entry(req.key.clone()).or_default();
+                insert_version_chain(b.versioning, chain, entry, &mut reclaimed);
+                if let Some(removed_up) = b.uploads.remove(&(req.key.clone(), req.upload_id.clone()))
+                {
+                    for (pn, p) in removed_up.parts {
+                        if !selected_pns.contains(&pn) {
+                            reclaimed.extend(p.extents.iter().copied());
+                        }
+                    }
+                }
+                b.completed_uploads
+                    .insert((req.key, req.upload_id), (req.ctx.request_time_ms, resp.clone()));
+            }
+        }
+        if !reclaimed.is_empty() {
+            self.adjust_live_bytes(&[], &reclaimed);
+        }
+
+        Ok(resp)
+    }
+
+    async fn abort_multipart_upload(&self, req: AbortMultipartUploadReq) -> StoreResult<()> {
+        validate_object_key(&req.bucket, &req.key)?;
+        self.check_writable(false)?;
+
+        let _kl = self.key_stripe(&req.bucket, &req.key).lock().await;
+        {
+            let cat = self.catalog.read().unwrap();
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
+                if has_bucket_perm(b, &req.ctx, AclPermission::Write) {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NoSuchUpload,
+                        "The specified upload does not exist.",
+                    )
+                    .with_upload(&req.bucket, &req.key, &req.upload_id));
+                }
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            };
+            if !has_upload_perm(b, up, &req.ctx, AclPermission::Write) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_bucket(&req.bucket),
+                );
+            }
+        }
+
+        self.commit_wal(WalOp::AbortMultipartUpload {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            upload_id: req.upload_id.clone(),
+        })
+        .await?;
+
+        let mut reclaimed = Vec::new();
+        {
+            let mut cat = self.catalog.write().unwrap();
+            if let Some(b) = cat.buckets.get_mut(&req.bucket) {
+                if let Some(removed_up) = b.uploads.remove(&(req.key, req.upload_id)) {
+                    for p in removed_up.parts.into_values() {
+                        reclaimed.extend(p.extents.iter().copied());
+                    }
+                }
+            }
+        }
+        if !reclaimed.is_empty() {
+            self.adjust_live_bytes(&[], &reclaimed);
+        }
+        Ok(())
+    }
+
+    async fn list_parts(&self, req: ListPartsReq) -> StoreResult<ListPartsResp> {
+        validate_object_key(&req.bucket, &req.key)?;
+        let cat = self.catalog.read().unwrap();
+        let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+        let Some(up) = b.uploads.get(&(req.key.clone(), req.upload_id.clone())) else {
+            if has_bucket_perm(b, &req.ctx, AclPermission::Read) {
+                return Err(S3Error::new(
+                    S3ErrorCode::NoSuchUpload,
+                    "The specified upload does not exist.",
+                )
+                .with_upload(&req.bucket, &req.key, &req.upload_id));
+            }
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                    .with_bucket(&req.bucket),
+            );
+        };
+        if !has_upload_perm(b, up, &req.ctx, AclPermission::Read) {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                    .with_bucket(&req.bucket),
+            );
+        }
+
+        let max_p = req.max_parts.min(1000);
+        let mut parts = Vec::new();
+        let mut is_truncated = false;
+        if max_p > 0 {
+            for p in up.parts.values() {
+                if p.part_number <= req.part_number_marker {
+                    continue;
+                }
+                if parts.len() == max_p {
+                    is_truncated = true;
+                    break;
+                }
+                parts.push(PartSummary {
+                    part_number: p.part_number,
+                    last_modified_ms: p.last_modified_ms,
+                    etag: p.etag.clone(),
+                    size: p.size,
+                    checksum: p.checksum.clone(),
+                });
+            }
+        }
+        let next_marker = parts
+            .last()
+            .map(|p| p.part_number)
+            .unwrap_or(req.part_number_marker);
+
+        Ok(ListPartsResp {
+            bucket: req.bucket,
+            key: req.key,
+            upload_id: req.upload_id,
+            initiator: up.initiator.clone(),
+            owner: up.owner.clone(),
+            storage_class: "STANDARD".to_string(),
+            checksum_algorithm: up.checksum_algorithm,
+            checksum_type: up.checksum_type,
+            part_number_marker: req.part_number_marker,
+            next_part_number_marker: next_marker,
+            max_parts: max_p,
+            is_truncated,
+            parts,
+        })
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: ListMultipartUploadsReq,
+    ) -> StoreResult<ListMultipartUploadsResp> {
+        let cat = self.catalog.read().unwrap();
+        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
+        let max_u = req.max_uploads.min(1000);
+        let km = req.key_marker.clone().unwrap_or_default();
+        let um = req.upload_id_marker.clone().unwrap_or_default();
+
+        let mut uploads = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut last_cp: Option<String> = None;
+        let mut is_truncated = false;
+        let mut next_km = None;
+        let mut next_um = None;
+
+        if max_u > 0 {
+            for ((key, uid), up) in &b.uploads {
+                if !key.starts_with(&req.prefix) {
+                    continue;
+                }
+                if !km.is_empty() {
+                    if key.as_str() < km.as_str() {
+                        continue;
+                    }
+                    if key == &km && (um.is_empty() || uid.as_str() <= um.as_str()) {
+                        continue;
+                    }
+                }
+                let rest = &key[req.prefix.len()..];
+                if let Some(delim) = req.delimiter.as_deref().filter(|d| !d.is_empty()) {
+                    if let Some(pos) = rest.find(delim) {
+                        let cp = format!("{}{}", req.prefix, &rest[..pos + delim.len()]);
+                        if !km.is_empty() && cp.as_str() <= km.as_str() {
+                            continue;
+                        }
+                        if last_cp.as_deref() == Some(cp.as_str()) {
+                            continue;
+                        }
+                        if uploads.len() + common_prefixes.len() == max_u {
+                            is_truncated = true;
+                            break;
+                        }
+                        next_km = Some(cp.clone());
+                        next_um = None;
+                        last_cp = Some(cp.clone());
+                        common_prefixes.push(cp);
+                        continue;
+                    }
+                }
+                if uploads.len() + common_prefixes.len() == max_u {
+                    is_truncated = true;
+                    break;
+                }
+                next_km = Some(key.clone());
+                next_um = Some(uid.clone());
+                uploads.push(MultipartUploadSummary {
+                    key: key.clone(),
+                    upload_id: uid.clone(),
+                    initiator: up.initiator.clone(),
+                    owner: up.owner.clone(),
+                    storage_class: "STANDARD".to_string(),
+                    initiated_ms: up.initiated_ms,
+                    checksum_algorithm: up.checksum_algorithm,
+                    checksum_type: up.checksum_type,
+                });
+            }
+        }
+
+        if !is_truncated {
+            next_km = None;
+            next_um = None;
+        }
+
+        Ok(ListMultipartUploadsResp {
+            bucket: req.bucket,
+            key_marker: km,
+            upload_id_marker: um,
+            next_key_marker: next_km,
+            next_upload_id_marker: next_um,
+            prefix: req.prefix,
+            delimiter: req.delimiter,
+            max_uploads: max_u,
+            is_truncated,
+            uploads,
+            common_prefixes,
         })
     }
 
     async fn list_objects_v1(&self, req: ListObjectsV1Req) -> StoreResult<ListObjectsV1Resp> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
         let max_keys = req.max_keys.min(1000);
         let marker_str = req.marker.clone().unwrap_or_default();
         let (items, is_truncated) = collect_visible_items(
@@ -1851,11 +3617,11 @@ impl<D: Disk> ObjectStore for Engine<D> {
 
     async fn list_objects_v2(&self, req: ListObjectsV2Req) -> StoreResult<ListObjectsV2Resp> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
         let max_keys = req.max_keys.min(1000);
         let token_after = match &req.continuation_token {
-            Some(tok) => Some(decode_token(&req.bucket, tok)?),
-            None => None,
+            Some(tok) if !tok.is_empty() => Some(decode_token(&req.bucket, tok)?),
+            _ => None,
         };
         let effective_after = match (&token_after, &req.start_after) {
             (Some(a), Some(s)) => Some(if a > s { a.as_str() } else { s.as_str() }),
@@ -1924,7 +3690,7 @@ impl<D: Disk> ObjectStore for Engine<D> {
         req: ListObjectVersionsReq,
     ) -> StoreResult<ListObjectVersionsResp> {
         let cat = self.catalog.read().unwrap();
-        let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
+        let b = check_bucket_perm(&cat, &req.ctx, &req.bucket, AclPermission::Read)?;
         let max_keys = req.max_keys.min(1000);
         let km = req.key_marker.clone().unwrap_or_default();
         let vm = req.version_id_marker.clone().unwrap_or_default();
@@ -2067,6 +3833,139 @@ impl<D: Disk> Engine<D> {
         Ok(pins)
     }
 
+    fn lookup_version_for_read<'a>(
+        &self,
+        b: &'a BucketEntry,
+        bucket_name: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> StoreResult<&'a ObjectVersionEntry> {
+        match version_id {
+            None => {
+                let Some(head) = b.objects.get(key).and_then(|c| c.first()) else {
+                    return Err(
+                        S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
+                            .with_key(bucket_name, key),
+                    );
+                };
+                if head.is_delete_marker {
+                    let mut err =
+                        S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
+                            .with_key(bucket_name, key)
+                            .with_header("x-amz-delete-marker", "true");
+                    if let Some(vid) = &head.version_id {
+                        err = err.with_header("x-amz-version-id", vid.clone());
+                    }
+                    return Err(err);
+                }
+                Ok(head)
+            }
+            Some(vid) => {
+                let Some(v) = b.objects.get(key).and_then(|c| {
+                    c.iter()
+                        .find(|v| v.version_id.as_deref().unwrap_or("null") == vid)
+                }) else {
+                    return Err(S3Error::new(
+                        S3ErrorCode::NoSuchVersion,
+                        "The specified version does not exist.",
+                    )
+                    .with_key(bucket_name, key));
+                };
+                if v.is_delete_marker {
+                    return Err(S3Error::new(
+                        S3ErrorCode::MethodNotAllowed,
+                        "The specified method is not allowed against this resource.",
+                    )
+                    .with_header("x-amz-delete-marker", "true")
+                    .with_header("Allow", "DELETE"));
+                }
+                Ok(v)
+            }
+        }
+    }
+
+    fn lookup_version_for_read_checked<'a>(
+        &self,
+        b: &'a BucketEntry,
+        ctx: &CallerContext,
+        bucket_name: &str,
+        key: &str,
+        version_id: Option<&str>,
+        needed: AclPermission,
+    ) -> StoreResult<&'a ObjectVersionEntry> {
+        match self.lookup_version_for_read(b, bucket_name, key, version_id) {
+            Ok(ver) => {
+                if !has_object_perm(b, ver, ctx, needed) {
+                    return Err(
+                        S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                            .with_key(bucket_name, key),
+                    );
+                }
+                Ok(ver)
+            }
+            Err(err) => {
+                if has_bucket_perm(b, ctx, AclPermission::Read) {
+                    Err(err)
+                } else {
+                    Err(
+                        S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                            .with_key(bucket_name, key),
+                    )
+                }
+            }
+        }
+    }
+
+    fn lookup_version_for_copy_checked<'a>(
+        &self,
+        b: &'a BucketEntry,
+        ctx: &CallerContext,
+        bucket_name: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> StoreResult<&'a ObjectVersionEntry> {
+        let ver = match version_id {
+            None => b
+                .objects
+                .get(key)
+                .and_then(|c| c.first())
+                .filter(|v| !v.is_delete_marker),
+            Some(vid) => b.objects.get(key).and_then(|c| {
+                c.iter()
+                    .find(|v| v.version_id.as_deref().unwrap_or("null") == vid)
+            }),
+        };
+        let Some(ver) = ver else {
+            if has_bucket_perm(b, ctx, AclPermission::Read) {
+                return Err(
+                    S3Error::new(S3ErrorCode::NoSuchKey, "The specified key does not exist.")
+                        .with_key(bucket_name, key),
+                );
+            }
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_key(bucket_name, key)
+            );
+        };
+        if ver.is_delete_marker {
+            if !has_bucket_perm(b, ctx, AclPermission::Read) {
+                return Err(
+                    S3Error::new(S3ErrorCode::AccessDenied, "Access Denied")
+                        .with_key(bucket_name, key),
+                );
+            }
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "The source of a copy request may not specifically refer to a delete marker by version id.",
+            ));
+        }
+        if !has_object_perm(b, ver, ctx, AclPermission::Read) {
+            return Err(
+                S3Error::new(S3ErrorCode::AccessDenied, "Access Denied").with_key(bucket_name, key)
+            );
+        }
+        Ok(ver)
+    }
+
     fn read_internal(
         &self,
         req: &GetObjectReq,
@@ -2083,52 +3982,17 @@ impl<D: Disk> Engine<D> {
         // Snapshot version metadata and pin segments while holding brief catalog read lock (8.6)
         let (ver, pins) = {
             let cat = self.catalog.read().unwrap();
-            let b = check_bucket_access(&cat, &req.ctx, &req.bucket)?;
-            let found = match &req.version_id {
-                None => {
-                    let Some(head) = b.objects.get(&req.key).and_then(|c| c.first()) else {
-                        return Err(S3Error::new(
-                            S3ErrorCode::NoSuchKey,
-                            "The specified key does not exist.",
-                        )
-                        .with_key(&req.bucket, &req.key));
-                    };
-                    if head.is_delete_marker {
-                        let mut err = S3Error::new(
-                            S3ErrorCode::NoSuchKey,
-                            "The specified key does not exist.",
-                        )
-                        .with_key(&req.bucket, &req.key)
-                        .with_header("x-amz-delete-marker", "true");
-                        if let Some(vid) = &head.version_id {
-                            err = err.with_header("x-amz-version-id", vid.clone());
-                        }
-                        return Err(err);
-                    }
-                    head.clone()
-                }
-                Some(vid) => {
-                    let Some(v) = b.objects.get(&req.key).and_then(|c| {
-                        c.iter()
-                            .find(|v| v.version_id.as_deref().unwrap_or("null") == vid.as_str())
-                    }) else {
-                        return Err(S3Error::new(
-                            S3ErrorCode::NoSuchVersion,
-                            "The specified version does not exist.",
-                        )
-                        .with_key(&req.bucket, &req.key));
-                    };
-                    if v.is_delete_marker {
-                        return Err(S3Error::new(
-                            S3ErrorCode::MethodNotAllowed,
-                            "The specified method is not allowed against this resource.",
-                        )
-                        .with_header("x-amz-delete-marker", "true")
-                        .with_header("Allow", "DELETE"));
-                    }
-                    v.clone()
-                }
-            };
+            let b = lookup_bucket_checked(&cat, &req.ctx, &req.bucket)?;
+            let found = self
+                .lookup_version_for_read_checked(
+                    b,
+                    &req.ctx,
+                    &req.bucket,
+                    &req.key,
+                    req.version_id.as_deref(),
+                    AclPermission::Read,
+                )?
+                .clone();
 
             let pins = if need_reader {
                 self.pin_extents(&found.extents)?
@@ -2149,14 +4013,16 @@ impl<D: Disk> Engine<D> {
         )?;
 
         let total_size = ver.total_size;
+        let mut part_specific_csum: Option<ChecksumState> = None;
+
         let (start, end, is_partial, parts_count) = if let Some(pn) = req.part_number {
-            if pn == 0 || pn > 10_000 {
+            if pn == 0 || pn > MAX_PARTS_COUNT {
                 return Err(S3Error::new(
                     S3ErrorCode::InvalidArgument,
                     "Part number must be an integer between 1 and 10000, inclusive",
                 ));
             }
-            match &ver.part_sizes {
+            match &ver.parts {
                 None => {
                     if pn != 1 {
                         return Err(S3Error::new(
@@ -2165,24 +4031,32 @@ impl<D: Disk> Engine<D> {
                         ));
                     }
                     if total_size == 0 {
-                        (0, 0, false, Some(1))
+                        (0, 0, false, None)
                     } else {
-                        (0, total_size - 1, true, Some(1))
+                        (0, total_size - 1, true, None)
                     }
                 }
-                Some(sizes) => {
-                    if (pn as usize) > sizes.len() {
+                Some(parts) => {
+                    if (pn as usize) > parts.len() {
                         return Err(S3Error::new(
                             S3ErrorCode::InvalidPart,
                             "The requested partnumber is not satisfiable",
                         ));
                     }
-                    let offset: u64 = sizes[..(pn as usize - 1)].iter().sum();
-                    let len = sizes[pn as usize - 1];
-                    if len == 0 {
-                        (offset, offset, false, Some(sizes.len() as u32))
+                    let offset: u64 = parts[..(pn as usize - 1)].iter().map(|p| p.size).sum();
+                    let pinfo = &parts[pn as usize - 1];
+                    if let Some((alg, b64_val)) = &pinfo.checksum {
+                        part_specific_csum = Some(ChecksumState {
+                            algorithm: *alg,
+                            checksum_type: ver.checksum.checksum_type,
+                            value_b64: b64_val.clone(),
+                            client_requested: true,
+                        });
+                    }
+                    if pinfo.size == 0 {
+                        (offset, offset, false, Some(parts.len() as u32))
                     } else {
-                        (offset, offset + len - 1, true, Some(sizes.len() as u32))
+                        (offset, offset + pinfo.size - 1, true, Some(parts.len() as u32))
                     }
                 }
             }
@@ -2195,7 +4069,13 @@ impl<D: Disk> Engine<D> {
             (0, total_size - 1, false, None)
         };
 
-        let content_len = if total_size == 0 && !is_partial {
+        let content_len = if let Some(pn) = req.part_number {
+            if let Some(parts) = &ver.parts {
+                parts[pn as usize - 1].size
+            } else {
+                total_size
+            }
+        } else if total_size == 0 && !is_partial {
             0
         } else if is_partial && total_size > 0 {
             end - start + 1
@@ -2203,14 +4083,15 @@ impl<D: Disk> Engine<D> {
             total_size
         };
 
-        let content_range = if is_partial && total_size > 0 {
+        let content_range = if is_partial && content_len > 0 {
             Some((start, end, total_size))
         } else {
             None
         };
 
-        let is_full = content_len == total_size;
-        let checksum = if req.checksum_mode_enabled && is_full {
+        let checksum = if part_specific_csum.is_some() {
+            part_specific_csum
+        } else if req.checksum_mode_enabled && req.range.is_none() && req.part_number.is_none() {
             Some(ver.checksum.clone())
         } else {
             None
@@ -2328,7 +4209,15 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                         v.total_size, actual_size
                     ));
                 }
-                if v.part_sizes.is_none() {
+                if let Some(parts) = &v.parts {
+                    let parts_sum: u64 = parts.iter().map(|p| p.size).sum();
+                    if parts_sum != v.total_size {
+                        errors.push(format!(
+                            "{bname}/{key}: multipart part sizes sum {parts_sum} != {}",
+                            v.total_size
+                        ));
+                    }
+                } else {
                     let expected_etag = format!("\"{}\"", hex::encode(md5_h.finalize()));
                     if expected_etag != v.etag {
                         errors.push(format!(
@@ -2336,6 +4225,56 @@ pub fn run_fsck<D: Disk>(disk: D) -> FsckReport {
                             v.etag, expected_etag
                         ));
                     }
+                }
+            }
+        }
+
+        for ((key, uid), up) in &b.uploads {
+            for p in up.parts.values() {
+                let mut part_bytes = 0u64;
+                for ext in p.extents.iter() {
+                    let Some(slot) = mgr.segments.get(&ext.seg_id) else {
+                        errors.push(format!(
+                            "{bname}/{key} upload {uid} part {}: missing segment {}",
+                            p.part_number, ext.seg_id
+                        ));
+                        continue;
+                    };
+                    let mut raw = vec![0u8; ext.physical_bytes() as usize];
+                    if let Err(e) = slot.file.read_exact_at(ext.offset, &mut raw) {
+                        errors.push(format!(
+                            "{bname}/{key} upload {uid} part {}: read error: {e}",
+                            p.part_number
+                        ));
+                        continue;
+                    }
+                    let hdr: [u8; 12] = raw[0..12].try_into().unwrap();
+                    match decode_block_header(&hdr) {
+                        Ok((len, crc)) => {
+                            let payload = &raw[12..];
+                            if len != ext.len
+                                || crc != ext.crc32c
+                                || crc32c::crc32c(payload) != ext.crc32c
+                            {
+                                errors.push(format!(
+                                    "{bname}/{key} upload {uid} part {}: block CRC mismatch",
+                                    p.part_number
+                                ));
+                            }
+                            part_bytes += payload.len() as u64;
+                            bytes_verified += payload.len() as u64;
+                        }
+                        Err(msg) => errors.push(format!(
+                            "{bname}/{key} upload {uid} part {}: {msg}",
+                            p.part_number
+                        )),
+                    }
+                }
+                if part_bytes != p.size {
+                    errors.push(format!(
+                        "{bname}/{key} upload {uid} part {}: size mismatch expected {}, got {part_bytes}",
+                        p.part_number, p.size
+                    ));
                 }
             }
         }
