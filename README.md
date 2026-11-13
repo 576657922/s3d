@@ -7,6 +7,28 @@
 
 ---
 
+## 实测性能与验证基线（`Linux x86-64, 2 vCPU, 7 GB RAM`）
+
+完整 300 秒压测数据存档于 [`reports/linux-x86_64-bench.json`](reports/linux-x86_64-bench.json)（双端对比含 Apple Silicon 原生 [`reports/m3-bench.json`](reports/m3-bench.json)）：
+
+| 指标编号 | 场景 | 规格书门槛 | `Linux x86-64 (2 vCPU, 7 GB)` 实测 | 状态 |
+| --- | --- | --- | --- | --- |
+| **`NFR-1`** | 4 KiB `PutObject`（32 并发，持续 300s，Group Commit 落盘） | `≥ 1,000 ops/s` 且 `p99 ≤ 50 ms` | **`3,049.2 ops/s`**，`p50 = 4.05 ms`，**`p99 = 41.11 ms`** | PASS |
+| **`NFR-2`** | 4 KiB `GetObject`（32 并发，持续 300s） | `≥ 5,000 ops/s` 且 `p99 ≤ 10 ms` | **`31,669.1 ops/s`**，`p50 = 0.91 ms`，**`p99 = 3.58 ms`** | PASS |
+| **`NFR-3`** | 1 GiB 单流 `PutObject` / `GetObject`（对比 `fio --direct=1` 裸盘 `308.8 / 350.2 MiB/s`） | PUT `≥ 70%` 裸盘，GET `≥ 80%` 裸盘 | PUT **`334.5 MiB/s`（`108.3%`）**，GET **`1,374.9 MiB/s`（`392.6%`）** | PASS |
+| **`NFR-4`** | 100 万对象桶随机 `start-after` `ListObjectsV2`（每页 1,000 键，1,000 次） | `p99 ≤ 20 ms` | `p50 = 1.18 ms`，**`p99 = 1.50 ms`** | PASS |
+| **`NFR-5`** | 驻留内存上限（空载 / 流式分片上传 `10 GiB` 峰值 `VmRSS`） | 空载 `≤ 64 MiB`，峰值 `≤ 66 MiB` | 空载 **`11.18 MiB`**，`10 GiB` 上传峰值 **`25.52 MiB`** | PASS |
+| **`NFR-6`** | 100 万对象版本（95 万检查点 + 5 万 WAL）`SIGKILL` 冷恢复至 `/health 200` | `≤ 20 s` | **`1.204 s`**（离线 `s3d fsck` `0` 错误） | PASS |
+
+十层验证门禁（`VR-1`～`VR-10`）实测归档：
+- **`VR-1` / `VR-2`**：`s3d-model` 覆盖全部 63 个操作与 `51/51` `FR` 标注（全工作区 `119/119` 规格书需求 ID 机械可追溯），`proptest` **100,000** 条 P0+P1+P2 随机操作序列对拍 `0` 差异。
+- **`VR-3`**：`FaultDisk` 4 KiB 扇区粒度系统调用中途断电注入 **100,000** 次（含检查点、WAL 裁剪、GC 与多段分片上传）`0` 违例。
+- **`VR-4`**：`Loom` 穷举交错 + `Shuttle` **10,000** 次随机调度 + `s3d-check` HTTP 层 16 客户端 WGL 线性一致性 **10,000** 条单键历史（240,000 次签名请求）`0` 违例。
+- **`VR-5` / `VR-6` / `VR-8`**：双平台（`Linux x86-64` 与 `macOS ARM64`）全量 `ceph/s3-tests` **526 / 545** 通过（[`linux-x86_64-junit.xml`](reports/linux-x86_64-junit.xml)、[`m4-junit.xml`](reports/m4-junit.xml)）、`boto3 1.44` + `awscli v1` 1 GiB 分片 SHA-256 端到端通过、SigV4 双端 **10,000** 组（30,000 次判定）差分与篡改 `0` 误判。
+- **`VR-7` / `VR-10`**：8 个 `cargo-fuzz`（`LLVM libFuzzer` + `SanitizerCoverage` + `AddressSanitizer`）目标各跑 **1 小时（`3,606～3,609s`）** 累计 **323,360,642** 次覆盖率引导执行 `0` 崩溃（[`vr7-cargo-fuzz-report.json`](reports/vr7-cargo-fuzz-report.json)）；`cargo +nightly miri test --workspace --lib` `0` UB / `0` 泄漏。
+
+---
+
 ## 功能概览
 
 | 级别 | 支持能力 |

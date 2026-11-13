@@ -468,7 +468,7 @@ pub fn initial_seed_corpus(target_name: &str) -> Vec<Vec<u8>> {
             b"__buckets__:djE6X19idWNrZXRzX186bXktYmt0".to_vec(),
         ],
         "fuzz_post_policy" => vec![
-            b"multipart/form-data; boundary=BOUND\n--BOUND\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nhello.txt\r\n--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nworld\r\n--BOUND--\r\n".to_vec(),
+            b"multipart/form-data; boundary=BOUND\n--BOUND\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nhello.txt\r\n--BOUND\r\nContent-Disposition: form-data; name=\"0123456789\xd3\x94tail\"\r\n\r\nv\r\n--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nworld\r\n--BOUND--\r\n".to_vec(),
             b"{\"expiration\":\"2030-01-01T00:00:00Z\",\"conditions\":[{\"bucket\":\"fuzz-bkt\"},[\"starts-with\",\"$key\",\"user/\"],[\"content-length-range\",0,1048576]]}".to_vec(),
         ],
         "fuzz_wal_ckpt_decode" => {

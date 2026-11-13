@@ -4573,3 +4573,14 @@ async fn vr3_mid_syscall_multi_mib_power_cuts() {
         drop(recovered);
     }
 }
+
+/// Non-ignored regression test for seed `0xD3AD_001F` (caught by `VR-3` 100k mid-syscall power-cut gate):
+/// When power cuts during `write_checkpoint()`'s post-checkpoint WAL pruning before `sync_dir("wal")`,
+/// POSIX/ext4 directory entry reordering may persist `unlink("wal/00000002.log")` while dropping
+/// `unlink("wal/00000001.log")`. Because both `00000001.log` and `00000002.log` are strictly covered
+/// by the already-durable checkpoint (`first_lsn_of_00000003 <= ckpt_lsn + 1`), recovery and `fsck`
+/// must tolerate the pre-checkpoint gap and finish pruning the obsolete pre-checkpoint WAL file.
+#[tokio::test]
+async fn vr3_regression_seed_0xd3ad001f_interrupted_wal_prune_dir_reorder() {
+    run_power_cut_chain(0xD3AD_001F, 50).await;
+}

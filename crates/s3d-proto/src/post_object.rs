@@ -700,7 +700,11 @@ pub fn parse_and_verify_post_object(
     let mut user_meta = Vec::new();
     let mut meta_bytes = 0usize;
     for (fname, fval) in &fields {
-        if fname.len() > 11 && fname[..11].eq_ignore_ascii_case("x-amz-meta-") {
+        if fname.len() > 11
+            && fname
+                .get(..11)
+                .is_some_and(|p| p.eq_ignore_ascii_case("x-amz-meta-"))
+        {
             let mk = fname[11..].to_ascii_lowercase();
             meta_bytes += mk.len() + fval.len();
             if meta_bytes > MAX_USER_METADATA_BYTES {
@@ -820,4 +824,54 @@ pub fn parse_and_verify_post_object(
         raw_sse,
         raw_lock,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sigv4::SigV4Verifier;
+    use s3d_types::{AccountRecord, OwnerInfo};
+
+    #[test]
+    fn post_object_multibyte_utf8_field_name_across_byte_11_does_not_panic() {
+        let verifier = SigV4Verifier::new(
+            "us-east-1",
+            vec![AccountRecord {
+                owner: OwnerInfo {
+                    user_id: "u1".into(),
+                    display_name: "u1".into(),
+                    email: "u1@example.com".into(),
+                },
+                access_key: "AKIA0000000000000001".into(),
+                secret_key: s3d_types::SecretKey::new("secret0000000000000000000000000000000001"),
+            }],
+        );
+        // '\u{0494}' ('Ӕ') is 2 bytes in UTF-8, placed at bytes 10..12 so index 11 is mid-codepoint!
+        let body = concat!(
+            "--BOUND\r\n",
+            "Content-Disposition: form-data; name=\"key\"\r\n\r\n",
+            "hello.txt\r\n",
+            "--BOUND\r\n",
+            "Content-Disposition: form-data; name=\"0123456789\u{0494}tail\"\r\n\r\n",
+            "val\r\n",
+            "--BOUND\r\n",
+            "Content-Disposition: form-data; name=\"X-Amz-Meta-\u{0494}k\"\r\n\r\n",
+            "meta-val\r\n",
+            "--BOUND\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "payload\r\n",
+            "--BOUND--\r\n",
+        );
+        let parsed = parse_and_verify_post_object(
+            &verifier,
+            "bkt",
+            "multipart/form-data; boundary=BOUND",
+            Bytes::from_static(body.as_bytes()),
+            1_794_441_600_000,
+        )
+        .unwrap();
+        assert_eq!(parsed.key, "hello.txt");
+        assert_eq!(parsed.user_meta, vec![("\u{0494}k".to_string(), "meta-val".to_string())]);
+    }
 }

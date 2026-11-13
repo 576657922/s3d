@@ -295,8 +295,9 @@ pub struct SegmentSlot {
 2. 读取并校验 `FORMAT` 魔数、版本号与 CRC32C。
 3. 清空 `tmp/` 目录下所有未完成临时文件。
 4. 扫描 `ckpt/`，找到 LSN 最大的检查点文件，按 2.4 节规则校验全文件完整性并流式加载至 `MemoryCatalog`，得到 `base_lsn`。若无检查点则 `base_lsn = 0`。
-5. 扫描 `wal/`，按 `wal_seq` 升序打开所有包含 `lsn > base_lsn` 的日志文件，校验文件头，逐条重放记录：
-   - 校验连续 `lsn` 与 `crc32c`；利用 `synced_lsn` 区分尾部撕裂与中间损坏（`ST-6`）：尾部撕裂调用 `set_len` 截断并 `sync_data()`，中间损坏立即中止启动并返回非零退出码。
+5. 扫描 `wal/`，按 `wal_seq` 升序打开现存日志文件，校验文件头与每条记录 `crc32c`，并对 `lsn > base_lsn` 的记录重放：
+   - 校验检查点边界后连续 `lsn` 与 `crc32c`；利用 `synced_lsn` / `has_later_committed_record` 区分尾部撕裂与中间损坏（`ST-6`）：尾部撕裂调用 `set_len` 截断并 `sync_data()`，中间损坏立即中止启动并返回非零退出码。
+   - 对检查点落盘后清理旧 WAL 期间掉电造成的目录项部分刷盘（例如更老的 `lsn <= base_lsn` 日志文件尚未落盘 `unlink`、而中间另一份 `lsn <= base_lsn` 日志文件已完成 `unlink`），只要后续 WAL `first_lsn <= base_lsn + 1`（即缺口完全处于已持久化的 `ckpt-<base_lsn>` 覆盖范围内），恢复流程允许跳过该纯前置缺口并在校验完成后补齐清理旧 WAL + `sync_dir("wal")`（`ST-8`）。
 6. 扫描 `seg/` 目录核对段文件：
    - 对 `DeleteSegment` 已提交但仍残留的段文件执行 `remove_file` + `sync_dir("seg")`。
    - 对所有已提交 `Extent` 引用的 `(seg_id, offset + 12 + len)`，核对实际文件长度 `file.len() >= offset + 12 + len`（若短于此长度，说明违反 `ST-1`，立即拒绝启动报错）。

@@ -58,7 +58,7 @@ pub fn days_in_month(year: i32, month: u32) -> Option<u32> {
 /// Parse an ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac](Z|+HH:MM|-HH:MM)`) into Unix microseconds.
 pub fn parse_iso8601_utc_us(raw: &str) -> Option<i64> {
     let s = raw.trim();
-    if s.len() < 20 {
+    if s.len() < 20 || !s.is_ascii() {
         return None;
     }
     let bytes = s.as_bytes();
@@ -1019,5 +1019,9 @@ mod tests {
 
         let non_midnight = parse_iso8601_utc_us("1970-08-22T19:08:21Z").unwrap();
         assert!(!is_exact_utc_midnight_us(non_midnight));
+
+        // Multibyte UTF-8 characters spanning byte slice offsets must return None without panicking
+        assert_eq!(parse_iso8601_utc_us("2030-01-01T00:00:0\u{0494}Z"), None);
+        assert_eq!(parse_iso8601_utc_us("2030-01-01T00:00:00+a€"), None);
     }
 }

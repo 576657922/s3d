@@ -122,7 +122,7 @@ pub struct FaultDiskState {
 
 ### 4.3 八个 `cargo-fuzz` 目标清单（`VR-7`）
 
-位于 `fuzz/fuzz_targets/`，全部处理不可信字节流，要求无 `panic!`、无整数溢出、无 OOM（限制单次输入上限）：
+位于 `fuzz/fuzz_targets/`，由 `scripts/run_libfuzzer_gate.py` 导出结构化种子语料与字典后，通过 `cargo +nightly fuzz build` 编译为带 **LLVM `SanitizerCoverage` + `AddressSanitizer`** 插桩的 `libFuzzer` 二进制并行执行（单目标 `≥ 3,605s`，实测 8 目标累计 **323,360,642** 次覆盖率引导执行 `0` 崩溃，报告存档 `reports/vr7-cargo-fuzz-report.json`），全部处理不可信字节流，要求无 `panic!`、无整数溢出、无内存泄漏、无 OOM（限制单次输入上限）：
 1. `fuzz_auth_header`：`Authorization` 头词法与字段解析。
 2. `fuzz_canonical_request`：任意 HTTP 请求行/头构造 SigV4 规范请求与 URI 编码。
 3. `fuzz_aws_chunked`：`aws-chunked` 流式状态机与尾部头解析（随机切分字节块喂入）。

@@ -228,12 +228,14 @@ impl<D: Disk> Engine<D> {
         }
         wal_files.sort_by_key(|(seq, _)| *seq);
 
-        let mut expected_lsn = base_lsn + 1;
+        let ckpt_next_lsn = base_lsn + 1;
+        let mut expected_lsn = ckpt_next_lsn;
         let mut cur_lsn: Option<u64> = None;
         let mut deleted_segments: BTreeSet<u32> = BTreeSet::new();
         let mut created_segments: BTreeSet<u32> = BTreeSet::new();
         let mut last_wal_state: Option<(u32, u64)> = None;
         let mut post_ckpt_wal_bytes = 0u64;
+        let mut scanned_wals: Vec<(u32, String, u64)> = Vec::new();
 
         let total_wals = wal_files.len();
         for (idx, (wal_seq, rel_path)) in wal_files.into_iter().enumerate() {
@@ -241,7 +243,7 @@ impl<D: Disk> Engine<D> {
             let f = disk.open(&rel_path, OpenOpts::open_rw())?;
             let file_len = f.len()?;
             if file_len < WAL_HEADER_LEN {
-                let prev_reached_ckpt = cur_lsn.unwrap_or(1) >= expected_lsn;
+                let prev_reached_ckpt = cur_lsn.unwrap_or(1) >= ckpt_next_lsn;
                 if is_last_wal && prev_reached_ckpt {
                     // Unfinished rollover at tail: discard empty/torn new WAL file
                     drop(f);
@@ -261,7 +263,7 @@ impl<D: Disk> Engine<D> {
             let first_lsn = match decode_wal_header(&hdr, wal_seq, format.uuid_lo()) {
                 Ok(lsn) => lsn,
                 Err(msg) => {
-                    let prev_reached_ckpt = cur_lsn.unwrap_or(1) >= expected_lsn;
+                    let prev_reached_ckpt = cur_lsn.unwrap_or(1) >= ckpt_next_lsn;
                     if is_last_wal && idx > 0 && prev_reached_ckpt {
                         drop(f);
                         disk.remove_file(&rel_path)?;
@@ -274,7 +276,7 @@ impl<D: Disk> Engine<D> {
 
             let mut scan_lsn = match cur_lsn {
                 None => {
-                    if first_lsn > expected_lsn {
+                    if first_lsn > ckpt_next_lsn {
                         return Err(EngineOpenError::Corrupt(format!(
                             "{rel_path}: missing WAL gap after ckpt_lsn {base_lsn}, earliest first_lsn is {first_lsn}"
                         )));
@@ -283,11 +285,20 @@ impl<D: Disk> Engine<D> {
                 }
                 Some(c) => {
                     if first_lsn != c {
-                        return Err(EngineOpenError::Corrupt(format!(
-                            "{rel_path}: expected first_lsn {c}, got {first_lsn}"
-                        )));
+                        if c < first_lsn && first_lsn <= ckpt_next_lsn {
+                            // [ST-8] Gap `[c, first_lsn)` is strictly `<= base_lsn` (already durably
+                            // captured in verified `ckpt-<base_lsn>`): an earlier pre-checkpoint WAL
+                            // survived an interrupted post-checkpoint WAL prune while an intermediate
+                            // pre-checkpoint WAL's `unlink` persisted before `sync_dir("wal")`.
+                            first_lsn
+                        } else {
+                            return Err(EngineOpenError::Corrupt(format!(
+                                "{rel_path}: expected first_lsn {c}, got {first_lsn}"
+                            )));
+                        }
+                    } else {
+                        c
                     }
-                    c
                 }
             };
 
@@ -355,10 +366,11 @@ impl<D: Disk> Engine<D> {
             }
             cur_lsn = Some(scan_lsn);
             last_wal_state = Some((wal_seq, pos as u64));
+            scanned_wals.push((wal_seq, rel_path, first_lsn));
         }
 
         if let Some(c) = cur_lsn {
-            if c < expected_lsn {
+            if c < ckpt_next_lsn {
                 return Err(EngineOpenError::Corrupt(format!(
                     "WAL ended at LSN {} before checkpoint LSN {base_lsn}",
                     c.saturating_sub(1)
@@ -369,6 +381,20 @@ impl<D: Disk> Engine<D> {
             return Err(EngineOpenError::Corrupt(format!(
                 "no WAL files found for checkpoint LSN {base_lsn}"
             )));
+        }
+
+        // [ST-8] Finish pruning any obsolete pre-checkpoint WAL files left behind by an interrupted prune
+        if base_lsn > 0
+            && scanned_wals.len() > 1
+            && let Some(keep_from) = scanned_wals
+                .iter()
+                .rposition(|(_, _, flsn)| *flsn <= ckpt_next_lsn)
+            && keep_from > 0
+        {
+            for (_, rel_i, _) in &scanned_wals[..keep_from] {
+                let _ = disk.remove_file(rel_i);
+            }
+            disk.sync_dir("wal")?;
         }
 
         // Open or create active WAL file

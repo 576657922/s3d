@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(not(miri))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -55,6 +56,7 @@ impl OsDisk {
 
 pub struct OsFile {
     file: File,
+    #[cfg(not(miri))]
     bg_flushing: Arc<AtomicBool>,
 }
 
@@ -118,6 +120,7 @@ impl Disk for OsDisk {
         let file = std_opts.open(full).map_err(map_io_err)?;
         Ok(OsFile {
             file,
+            #[cfg(not(miri))]
             bg_flushing: Arc::new(AtomicBool::new(false)),
         })
     }
