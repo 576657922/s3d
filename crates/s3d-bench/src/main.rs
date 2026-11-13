@@ -565,7 +565,7 @@ fn sample_process_rss_mib(pid: u32) -> Option<f64> {
         if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
             for line in status.lines() {
                 if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    let kib_str = rest.trim().split_whitespace().next()?;
+                    let kib_str = rest.split_whitespace().next()?;
                     let kib: u64 = kib_str.parse().ok()?;
                     return Some((kib as f64) / 1024.0);
                 }

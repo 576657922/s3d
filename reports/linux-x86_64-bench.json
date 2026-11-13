@@ -1,0 +1,141 @@
+{
+  "generated_at_epoch_s": 1794568944,
+  "os": "linux",
+  "arch": "x86_64",
+  "cpu_cores_available": 2,
+  "disk_baseline": {
+    "baseline_source": "fio (direct=1, bs=1M, size=1G, end_fsync=1)",
+    "iterations": 5,
+    "seq_write_runs_mib_s": [
+      341.90317153930664,
+      305.76291370391846,
+      348.4178285598755,
+      305.85424041748047,
+      308.80578994750977
+    ],
+    "seq_write_median_mib_s": 308.80578994750977,
+    "seq_read_runs_mib_s": [
+      349.84625816345215,
+      350.20519828796387,
+      349.96582317352295,
+      350.92529106140137,
+      350.56487464904785
+    ],
+    "seq_read_median_mib_s": 350.20519828796387,
+    "md5_single_core_runs_mib_s": [
+      387.801963281599,
+      380.83018617505104,
+      326.5008426768338,
+      377.45517882031436,
+      374.38985276206466
+    ],
+    "md5_single_core_median_mib_s": 377.45517882031436,
+    "http_crc32c_loopback_runs_mib_s": [
+      1149.1340374461374,
+      3280.364018407224,
+      3265.288411174785,
+      3402.518032805623,
+      3598.609848581251
+    ],
+    "http_crc32c_loopback_median_mib_s": 3280.364018407224,
+    "effective_single_stream_put_baseline_mib_s": 308.80578994750977,
+    "effective_single_stream_get_baseline_mib_s": 350.20519828796387
+  },
+  "nfr1_small_put": {
+    "duration_secs": 300.076541613,
+    "concurrency": 32,
+    "object_bytes": 4096,
+    "total_ops": 914985,
+    "ops_per_sec": 3049.172038179611,
+    "latency": {
+      "samples": 914985,
+      "p50_ms": 4.047,
+      "p95_ms": 12.719,
+      "p99_ms": 41.113,
+      "max_ms": 33248.247
+    },
+    "target_min_ops_per_sec": 1000.0,
+    "target_max_p99_ms": 50.0,
+    "passed": true
+  },
+  "nfr2_small_get": {
+    "duration_secs": 300.083728869,
+    "concurrency": 32,
+    "object_bytes": 4096,
+    "total_ops": 9503375,
+    "ops_per_sec": 31669.077946404246,
+    "latency": {
+      "samples": 9503375,
+      "p50_ms": 0.911,
+      "p95_ms": 1.69,
+      "p99_ms": 3.583,
+      "max_ms": 256.556
+    },
+    "target_min_ops_per_sec": 5000.0,
+    "target_max_p99_ms": 10.0,
+    "passed": true
+  },
+  "nfr3_large_stream": {
+    "object_bytes": 1073741824,
+    "iterations": 5,
+    "put_runs_mib_s": [
+      352.5873044747332,
+      334.4725129603673,
+      272.46243225256546,
+      304.2218466086586,
+      344.2669715109459
+    ],
+    "put_median_mib_s": 334.4725129603673,
+    "put_ratio_vs_raw_disk": 1.0831160679248284,
+    "put_ratio_vs_effective_baseline": 1.0831160679248284,
+    "target_min_put_ratio": 0.7,
+    "get_runs_mib_s": [
+      1392.6452608567374,
+      1549.5949896666755,
+      999.2101243966644,
+      1296.3220508977483,
+      1374.8564359200805
+    ],
+    "get_median_mib_s": 1374.8564359200805,
+    "get_ratio_vs_disk": 3.9258595892959156,
+    "get_ratio_vs_effective_baseline": 3.9258595892959156,
+    "target_min_get_ratio": 0.8,
+    "fsck_verified_bytes": 5368709120,
+    "raw_disk_formula_passed": true,
+    "passed": true
+  },
+  "nfr4_list_1m": {
+    "total_objects": 1000000,
+    "page_size": 1000,
+    "queries": 1000,
+    "latency": {
+      "samples": 1000,
+      "p50_ms": 1.183,
+      "p95_ms": 1.387,
+      "p99_ms": 1.495,
+      "max_ms": 13.936
+    },
+    "target_max_p99_ms": 20.0,
+    "passed": true
+  },
+  "nfr5_memory": {
+    "idle_rss_mib": 11.17578125,
+    "target_max_idle_rss_mib": 64.0,
+    "streamed_object_bytes": 10737418240,
+    "rss_samples_during_upload": 299,
+    "peak_upload_rss_mib": 25.5234375,
+    "max_allowed_peak_rss_mib": 66.0,
+    "fsck_verified_bytes": 10737418240,
+    "passed": true
+  },
+  "nfr6_cold_recovery": {
+    "total_versions": 1000000,
+    "checkpoint_versions": 950000,
+    "wal_replay_versions": 50000,
+    "kill9_to_health200_secs": 1.203586813,
+    "target_max_secs": 20.0,
+    "fsck_verified_versions": 1000000,
+    "passed": true
+  },
+  "all_passed": true
+}
