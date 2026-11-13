@@ -1,11 +1,9 @@
 use std::collections::HashSet;
 
-use quick_xml::events::Event;
-use quick_xml::Reader;
 use s3d_types::*;
 
 use crate::xml::{
-    check_no_dtd_or_entity, is_valid_acl_group_uri, malformed_xml, xml_escape, S3_XML_NS,
+    is_valid_acl_group_uri, malformed_xml, read_xml_tokens, xml_escape, XmlTok, S3_XML_NS,
 };
 
 // ============================================================================
@@ -16,10 +14,7 @@ pub fn parse_object_lock_configuration_xml(body: &[u8]) -> StoreResult<ObjectLoc
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut saw_enabled = false;
@@ -34,72 +29,59 @@ pub fn parse_object_lock_configuration_xml(body: &[u8]) -> StoreResult<ObjectLoc
     let mut days_str: Option<String> = None;
     let mut years_str: Option<String> = None;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "ObjectLockConfiguration" if !saw_root => saw_root = true,
-                    "ObjectLockEnabled" if saw_root && !in_rule && !saw_enabled && cur_tag.is_none() => {
-                        saw_enabled = true;
-                        cur_tag = Some("ObjectLockEnabled".to_string());
-                    }
-                    "Rule" if saw_root && !saw_rule && !in_rule && cur_tag.is_none() => {
-                        saw_rule = true;
-                        in_rule = true;
-                    }
-                    "DefaultRetention" if in_rule && !saw_default_ret && !in_default_ret && cur_tag.is_none() => {
-                        saw_default_ret = true;
-                        in_default_ret = true;
-                    }
-                    "Mode" if in_default_ret && cur_tag.is_none() && mode_str.is_none() => {
-                        cur_tag = Some("Mode".to_string());
-                    }
-                    "Days" if in_default_ret && cur_tag.is_none() && days_str.is_none() => {
-                        cur_tag = Some("Days".to_string());
-                    }
-                    "Years" if in_default_ret && cur_tag.is_none() && years_str.is_none() => {
-                        cur_tag = Some("Years".to_string());
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "ObjectLockConfiguration" if !saw_root => saw_root = true,
+                "ObjectLockEnabled"
+                    if saw_root && !in_rule && !saw_enabled && cur_tag.is_none() =>
+                {
+                    saw_enabled = true;
+                    cur_tag = Some("ObjectLockEnabled".to_string());
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
+                "Rule" if saw_root && !saw_rule && !in_rule && cur_tag.is_none() => {
+                    saw_rule = true;
+                    in_rule = true;
+                }
+                "DefaultRetention"
+                    if in_rule && !saw_default_ret && !in_default_ret && cur_tag.is_none() =>
+                {
+                    saw_default_ret = true;
+                    in_default_ret = true;
+                }
+                "Mode" if in_default_ret && cur_tag.is_none() && mode_str.is_none() => {
+                    cur_tag = Some("Mode".to_string());
+                }
+                "Days" if in_default_ret && cur_tag.is_none() && days_str.is_none() => {
+                    cur_tag = Some("Days".to_string());
+                }
+                "Years" if in_default_ret && cur_tag.is_none() && years_str.is_none() => {
+                    cur_tag = Some("Years".to_string());
+                }
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { local } => {
                 if local == "Rule" && saw_root && !saw_rule && !in_rule {
                     saw_rule = true;
                 } else {
                     return Err(malformed_xml());
                 }
             }
-            Ok(Event::Text(t)) => {
-                let val = t.unescape().map_err(|_| malformed_xml())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("ObjectLockEnabled") => enabled_val = Some(val),
-                    Some("Mode") => mode_str = Some(val),
-                    Some("Days") => days_str = Some(val),
-                    Some("Years") => years_str = Some(val),
-                    _ => return Err(malformed_xml()),
-                }
-            }
-            Ok(Event::End(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "ObjectLockEnabled" | "Mode" | "Days" | "Years" => cur_tag = None,
-                    "DefaultRetention" if in_default_ret => in_default_ret = false,
-                    "Rule" if in_rule => in_rule = false,
-                    "ObjectLockConfiguration" => {}
-                    _ => return Err(malformed_xml()),
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+            XmlTok::Text(val) => match cur_tag.as_deref() {
+                Some("ObjectLockEnabled") => enabled_val = Some(val),
+                Some("Mode") => mode_str = Some(val),
+                Some("Days") => days_str = Some(val),
+                Some("Years") => years_str = Some(val),
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::End { local } => match local.as_str() {
+                "ObjectLockEnabled" | "Mode" | "Days" | "Years" => cur_tag = None,
+                "DefaultRetention" if in_default_ret => in_default_ret = false,
+                "Rule" if in_rule => in_rule = false,
+                "ObjectLockConfiguration" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root || enabled_val.as_deref() != Some("Enabled") {
@@ -165,55 +147,37 @@ pub fn parse_object_retention_xml(body: &[u8]) -> StoreResult<ObjectRetention> {
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut cur_tag: Option<String> = None;
     let mut mode_str: Option<String> = None;
     let mut date_str: Option<String> = None;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "Retention" if !saw_root => saw_root = true,
-                    "Mode" if saw_root && cur_tag.is_none() && mode_str.is_none() => {
-                        cur_tag = Some("Mode".to_string());
-                    }
-                    "RetainUntilDate" if saw_root && cur_tag.is_none() && date_str.is_none() => {
-                        cur_tag = Some("RetainUntilDate".to_string());
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "Retention" if !saw_root => saw_root = true,
+                "Mode" if saw_root && cur_tag.is_none() && mode_str.is_none() => {
+                    cur_tag = Some("Mode".to_string());
                 }
-            }
-            Ok(Event::Empty(_)) => return Err(malformed_xml()),
-            Ok(Event::Text(t)) => {
-                let val = t.unescape().map_err(|_| malformed_xml())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("Mode") => mode_str = Some(val),
-                    Some("RetainUntilDate") => date_str = Some(val),
-                    _ => return Err(malformed_xml()),
+                "RetainUntilDate" if saw_root && cur_tag.is_none() && date_str.is_none() => {
+                    cur_tag = Some("RetainUntilDate".to_string());
                 }
-            }
-            Ok(Event::End(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "Mode" | "RetainUntilDate" => cur_tag = None,
-                    "Retention" => {}
-                    _ => return Err(malformed_xml()),
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { .. } => return Err(malformed_xml()),
+            XmlTok::Text(val) => match cur_tag.as_deref() {
+                Some("Mode") => mode_str = Some(val),
+                Some("RetainUntilDate") => date_str = Some(val),
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::End { local } => match local.as_str() {
+                "Mode" | "RetainUntilDate" => cur_tag = None,
+                "Retention" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root {
@@ -242,51 +206,35 @@ pub fn parse_object_legal_hold_xml(body: &[u8]) -> StoreResult<LegalHoldStatus> 
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut cur_tag: Option<String> = None;
     let mut status_str: Option<String> = None;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "LegalHold" if !saw_root => saw_root = true,
-                    "Status" if saw_root && cur_tag.is_none() && status_str.is_none() => {
-                        cur_tag = Some("Status".to_string());
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "LegalHold" if !saw_root => saw_root = true,
+                "Status" if saw_root && cur_tag.is_none() && status_str.is_none() => {
+                    cur_tag = Some("Status".to_string());
                 }
-            }
-            Ok(Event::Empty(_)) => return Err(malformed_xml()),
-            Ok(Event::Text(t)) => {
-                let val = t.unescape().map_err(|_| malformed_xml())?.into_owned();
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { .. } => return Err(malformed_xml()),
+            XmlTok::Text(val) => {
                 if cur_tag.as_deref() == Some("Status") {
                     status_str = Some(val);
                 } else {
                     return Err(malformed_xml());
                 }
             }
-            Ok(Event::End(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "Status" => cur_tag = None,
-                    "LegalHold" => {}
-                    _ => return Err(malformed_xml()),
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+            XmlTok::End { local } => match local.as_str() {
+                "Status" => cur_tag = None,
+                "LegalHold" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root {
@@ -343,10 +291,7 @@ pub fn parse_lifecycle_configuration_xml(body: &[u8]) -> StoreResult<LifecycleCo
     if body.is_empty() || body.len() > 2 * 1024 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, false, malformed_xml)?;
 
     let mut stack: Vec<String> = Vec::new();
     let mut saw_root = false;
@@ -364,17 +309,20 @@ pub fn parse_lifecycle_configuration_xml(body: &[u8]) -> StoreResult<LifecycleCo
         }
     };
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("").to_string();
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => {
                 text_acc.clear();
                 match (stack.as_slice(), local.as_str()) {
-                    ([], "LifecycleConfiguration") | ([], "LifecycleConfigurationV2") if !saw_root => {
+                    ([], "LifecycleConfiguration") | ([], "LifecycleConfigurationV2")
+                        if !saw_root =>
+                    {
                         saw_root = true;
                     }
-                    ([root], "Rule") if root == "LifecycleConfiguration" || root == "LifecycleConfigurationV2" => {
+                    ([root], "Rule")
+                        if root == "LifecycleConfiguration"
+                            || root == "LifecycleConfigurationV2" =>
+                    {
                         cur_rule = RawRuleAcc::default();
                     }
                     ([_, r], "ID" | "Status" | "Prefix") if r == "Rule" => {}
@@ -391,11 +339,14 @@ pub fn parse_lifecycle_configuration_xml(body: &[u8]) -> StoreResult<LifecycleCo
                         cur_tag_k = None;
                         cur_tag_v = None;
                     }
-                    ([_, r, f], "And") if r == "Rule" && f == "Filter" && !cur_rule.filter.saw_and => {
+                    ([_, r, f], "And")
+                        if r == "Rule" && f == "Filter" && !cur_rule.filter.saw_and =>
+                    {
                         cur_rule.filter.direct_children += 1;
                         cur_rule.filter.saw_and = true;
                     }
-                    ([_, r, f, t], "Key" | "Value") if r == "Rule" && f == "Filter" && t == "Tag" => {}
+                    ([_, r, f, t], "Key" | "Value")
+                        if r == "Rule" && f == "Filter" && t == "Tag" => {}
                     ([_, r, f, a], "Prefix" | "ObjectSizeGreaterThan" | "ObjectSizeLessThan")
                         if r == "Rule" && f == "Filter" && a == "And" => {}
                     ([_, r, f, a], "Tag") if r == "Rule" && f == "Filter" && a == "And" => {
@@ -409,12 +360,16 @@ pub fn parse_lifecycle_configuration_xml(body: &[u8]) -> StoreResult<LifecycleCo
                     }
                     ([_, r, ex], "Days" | "Date" | "ExpiredObjectDeleteMarker")
                         if r == "Rule" && ex == "Expiration" => {}
-                    ([_, r], "NoncurrentVersionExpiration") if r == "Rule" && !cur_rule.has_noncurrent => {
+                    ([_, r], "NoncurrentVersionExpiration")
+                        if r == "Rule" && !cur_rule.has_noncurrent =>
+                    {
                         cur_rule.has_noncurrent = true;
                     }
                     ([_, r, nc], "NoncurrentDays" | "NewerNoncurrentVersions")
                         if r == "Rule" && nc == "NoncurrentVersionExpiration" => {}
-                    ([_, r], "AbortIncompleteMultipartUpload") if r == "Rule" && !cur_rule.has_abort_mpu => {
+                    ([_, r], "AbortIncompleteMultipartUpload")
+                        if r == "Rule" && !cur_rule.has_abort_mpu =>
+                    {
                         cur_rule.has_abort_mpu = true;
                     }
                     ([_, r, ab], "DaysAfterInitiation")
@@ -423,48 +378,41 @@ pub fn parse_lifecycle_configuration_xml(body: &[u8]) -> StoreResult<LifecycleCo
                 }
                 stack.push(local);
             }
-            Ok(Event::Empty(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match (stack.as_slice(), local) {
-                    ([_, r], "ID") if r == "Rule" => cur_rule.id = Some(String::new()),
-                    ([_, r], "Prefix") if r == "Rule" => cur_rule.legacy_prefix = Some(String::new()),
-                    ([_, r], "Filter") if r == "Rule" && !cur_rule.has_filter => {
-                        cur_rule.has_filter = true;
-                    }
-                    ([_, r, f], "Prefix") if r == "Rule" && f == "Filter" => {
-                        cur_rule.filter.direct_children += 1;
-                        cur_rule.filter.saw_prefix = Some(String::new());
-                    }
-                    ([_, r, f, a], "Prefix") if r == "Rule" && f == "Filter" && a == "And" => {
-                        cur_rule.filter.and_prefix = Some(String::new());
-                    }
-                    ([_, r, f, t], "Key") if r == "Rule" && f == "Filter" && t == "Tag" => {
-                        cur_tag_k = Some(String::new());
-                    }
-                    ([_, r, f, t], "Value") if r == "Rule" && f == "Filter" && t == "Tag" => {
-                        cur_tag_v = Some(String::new());
-                    }
-                    ([_, r, f, a, t], "Key")
-                        if r == "Rule" && f == "Filter" && a == "And" && t == "Tag" =>
-                    {
-                        cur_tag_k = Some(String::new());
-                    }
-                    ([_, r, f, a, t], "Value")
-                        if r == "Rule" && f == "Filter" && a == "And" && t == "Tag" =>
-                    {
-                        cur_tag_v = Some(String::new());
-                    }
-                    _ => return Err(malformed_xml()),
+            XmlTok::Empty { local } => match (stack.as_slice(), local.as_str()) {
+                ([_, r], "ID") if r == "Rule" => cur_rule.id = Some(String::new()),
+                ([_, r], "Prefix") if r == "Rule" => cur_rule.legacy_prefix = Some(String::new()),
+                ([_, r], "Filter") if r == "Rule" && !cur_rule.has_filter => {
+                    cur_rule.has_filter = true;
                 }
-            }
-            Ok(Event::Text(t)) => {
-                let txt = t.unescape().map_err(|_| malformed_xml())?;
+                ([_, r, f], "Prefix") if r == "Rule" && f == "Filter" => {
+                    cur_rule.filter.direct_children += 1;
+                    cur_rule.filter.saw_prefix = Some(String::new());
+                }
+                ([_, r, f, a], "Prefix") if r == "Rule" && f == "Filter" && a == "And" => {
+                    cur_rule.filter.and_prefix = Some(String::new());
+                }
+                ([_, r, f, t], "Key") if r == "Rule" && f == "Filter" && t == "Tag" => {
+                    cur_tag_k = Some(String::new());
+                }
+                ([_, r, f, t], "Value") if r == "Rule" && f == "Filter" && t == "Tag" => {
+                    cur_tag_v = Some(String::new());
+                }
+                ([_, r, f, a, t], "Key")
+                    if r == "Rule" && f == "Filter" && a == "And" && t == "Tag" =>
+                {
+                    cur_tag_k = Some(String::new());
+                }
+                ([_, r, f, a, t], "Value")
+                    if r == "Rule" && f == "Filter" && a == "And" && t == "Tag" =>
+                {
+                    cur_tag_v = Some(String::new());
+                }
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Text(txt) => {
                 text_acc.push_str(&txt);
             }
-            Ok(Event::End(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
+            XmlTok::End { local } => {
                 let popped = stack.pop().ok_or_else(malformed_xml)?;
                 if popped != local {
                     return Err(malformed_xml());
@@ -472,7 +420,7 @@ pub fn parse_lifecycle_configuration_xml(body: &[u8]) -> StoreResult<LifecycleCo
                 let val_raw = std::mem::take(&mut text_acc);
                 let val_trim = val_raw.trim();
 
-                match (stack.as_slice(), local) {
+                match (stack.as_slice(), local.as_str()) {
                     ([_], "Rule") => {
                         raw_rules.push(std::mem::take(&mut cur_rule));
                     }
@@ -573,11 +521,7 @@ pub fn parse_lifecycle_configuration_xml(body: &[u8]) -> StoreResult<LifecycleCo
                     _ => {}
                 }
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
         }
-        buf.clear();
     }
 
     if !saw_root || !stack.is_empty() || raw_rules.is_empty() || raw_rules.len() > 1000 {
@@ -906,10 +850,7 @@ pub fn parse_bucket_encryption_xml(body: &[u8]) -> StoreResult<BucketEncryptionC
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut in_rule = false;
@@ -922,76 +863,59 @@ pub fn parse_bucket_encryption_xml(body: &[u8]) -> StoreResult<BucketEncryptionC
     let mut kms_key_id: Option<String> = None;
     let mut bucket_key_enabled: Option<bool> = None;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "ServerSideEncryptionConfiguration" if !saw_root => saw_root = true,
-                    "Rule" if saw_root && !in_rule => {
-                        in_rule = true;
-                        rule_count += 1;
-                    }
-                    "ApplyServerSideEncryptionByDefault" if in_rule && !in_default => {
-                        in_default = true;
-                        saw_default = true;
-                    }
-                    "SSEAlgorithm" if in_default && cur_tag.is_none() => {
-                        cur_tag = Some("SSEAlgorithm".to_string());
-                    }
-                    "KMSMasterKeyID" if in_default && cur_tag.is_none() => {
-                        cur_tag = Some("KMSMasterKeyID".to_string());
-                    }
-                    "BucketKeyEnabled" if in_rule && !in_default && cur_tag.is_none() => {
-                        cur_tag = Some("BucketKeyEnabled".to_string());
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "ServerSideEncryptionConfiguration" if !saw_root => saw_root = true,
+                "Rule" if saw_root && !in_rule => {
+                    in_rule = true;
+                    rule_count += 1;
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
+                "ApplyServerSideEncryptionByDefault" if in_rule && !in_default => {
+                    in_default = true;
+                    saw_default = true;
+                }
+                "SSEAlgorithm" if in_default && cur_tag.is_none() => {
+                    cur_tag = Some("SSEAlgorithm".to_string());
+                }
+                "KMSMasterKeyID" if in_default && cur_tag.is_none() => {
+                    cur_tag = Some("KMSMasterKeyID".to_string());
+                }
+                "BucketKeyEnabled" if in_rule && !in_default && cur_tag.is_none() => {
+                    cur_tag = Some("BucketKeyEnabled".to_string());
+                }
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { local } => {
                 if local == "KMSMasterKeyID" && in_default {
                     kms_key_id = Some(String::new());
                 } else {
                     return Err(malformed_xml());
                 }
             }
-            Ok(Event::Text(t)) => {
-                let val = t.unescape().map_err(|_| malformed_xml())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("SSEAlgorithm") => sse_algo = Some(val),
-                    Some("KMSMasterKeyID") => kms_key_id = Some(val),
-                    Some("BucketKeyEnabled") => {
-                        let b = if val.eq_ignore_ascii_case("true") {
-                            true
-                        } else if val.eq_ignore_ascii_case("false") {
-                            false
-                        } else {
-                            return Err(malformed_xml());
-                        };
-                        bucket_key_enabled = Some(b);
-                    }
-                    _ => return Err(malformed_xml()),
+            XmlTok::Text(val) => match cur_tag.as_deref() {
+                Some("SSEAlgorithm") => sse_algo = Some(val),
+                Some("KMSMasterKeyID") => kms_key_id = Some(val),
+                Some("BucketKeyEnabled") => {
+                    let b = if val.eq_ignore_ascii_case("true") {
+                        true
+                    } else if val.eq_ignore_ascii_case("false") {
+                        false
+                    } else {
+                        return Err(malformed_xml());
+                    };
+                    bucket_key_enabled = Some(b);
                 }
-            }
-            Ok(Event::End(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match local {
-                    "SSEAlgorithm" | "KMSMasterKeyID" | "BucketKeyEnabled" => cur_tag = None,
-                    "ApplyServerSideEncryptionByDefault" if in_default => in_default = false,
-                    "Rule" if in_rule => in_rule = false,
-                    "ServerSideEncryptionConfiguration" => {}
-                    _ => return Err(malformed_xml()),
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::End { local } => match local.as_str() {
+                "SSEAlgorithm" | "KMSMasterKeyID" | "BucketKeyEnabled" => cur_tag = None,
+                "ApplyServerSideEncryptionByDefault" if in_default => in_default = false,
+                "Rule" if in_rule => in_rule = false,
+                "ServerSideEncryptionConfiguration" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root || rule_count != 1 || !saw_default {
@@ -1047,10 +971,7 @@ where
     if body.is_empty() || body.len() > 256 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, false, malformed_xml)?;
 
     let mut stack: Vec<String> = Vec::new();
     let mut saw_root = false;
@@ -1076,19 +997,21 @@ where
     let mut raw_grants: Vec<RawGrant> = Vec::new();
     let mut text_acc = String::new();
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("").to_string();
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, type_attr } => {
                 text_acc.clear();
                 match (stack.as_slice(), local.as_str()) {
                     ([], "BucketLoggingStatus") if !saw_root => saw_root = true,
-                    ([r], "LoggingEnabled") if r == "BucketLoggingStatus" && !saw_logging_enabled => {
+                    ([r], "LoggingEnabled")
+                        if r == "BucketLoggingStatus" && !saw_logging_enabled =>
+                    {
                         saw_logging_enabled = true;
                     }
-                    ([_, le], "TargetBucket" | "TargetPrefix" | "TargetGrants" | "TargetObjectKeyFormat")
-                        if le == "LoggingEnabled" => {}
+                    (
+                        [_, le],
+                        "TargetBucket" | "TargetPrefix" | "TargetGrants" | "TargetObjectKeyFormat",
+                    ) if le == "LoggingEnabled" => {}
                     ([_, le, tg], "Grant") if le == "LoggingEnabled" && tg == "TargetGrants" => {
                         cur_grantee_type = None;
                         cur_grantee_id = None;
@@ -1099,14 +1022,7 @@ where
                     ([_, le, tg, g], "Grantee")
                         if le == "LoggingEnabled" && tg == "TargetGrants" && g == "Grant" =>
                     {
-                        for attr in e.attributes().flatten() {
-                            let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                            if (key == "type" || key.ends_with(":type"))
-                                && let Ok(v) = attr.unescape_value()
-                            {
-                                cur_grantee_type = Some(v.into_owned());
-                            }
-                        }
+                        cur_grantee_type = type_attr;
                     }
                     ([_, le, tg, g], "Permission")
                         if le == "LoggingEnabled" && tg == "TargetGrants" && g == "Grant" => {}
@@ -1139,46 +1055,39 @@ where
                 }
                 stack.push(local);
             }
-            Ok(Event::Empty(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
-                match (stack.as_slice(), local) {
-                    ([], "BucketLoggingStatus") if !saw_root => saw_root = true,
-                    ([_, le], "TargetPrefix") if le == "LoggingEnabled" => {
-                        target_prefix = Some(String::new());
-                    }
-                    ([_, le], "TargetGrants") if le == "LoggingEnabled" => {}
-                    ([_, le, kf], "SimplePrefix")
-                        if le == "LoggingEnabled"
-                            && kf == "TargetObjectKeyFormat"
-                            && key_format.is_none()
-                            && !saw_partitioned =>
-                    {
-                        key_format = Some(TargetObjectKeyFormat::SimplePrefix);
-                    }
-                    ([_, le, kf], "PartitionedPrefix")
-                        if le == "LoggingEnabled"
-                            && kf == "TargetObjectKeyFormat"
-                            && key_format.is_none()
-                            && !saw_partitioned =>
-                    {
-                        saw_partitioned = true;
-                    }
-                    ([_, le, tg, g, gr], "DisplayName")
-                        if le == "LoggingEnabled"
-                            && tg == "TargetGrants"
-                            && g == "Grant"
-                            && gr == "Grantee" => {}
-                    _ => return Err(malformed_xml()),
+            XmlTok::Empty { local } => match (stack.as_slice(), local.as_str()) {
+                ([], "BucketLoggingStatus") if !saw_root => saw_root = true,
+                ([_, le], "TargetPrefix") if le == "LoggingEnabled" => {
+                    target_prefix = Some(String::new());
                 }
-            }
-            Ok(Event::Text(t)) => {
-                let txt = t.unescape().map_err(|_| malformed_xml())?;
+                ([_, le], "TargetGrants") if le == "LoggingEnabled" => {}
+                ([_, le, kf], "SimplePrefix")
+                    if le == "LoggingEnabled"
+                        && kf == "TargetObjectKeyFormat"
+                        && key_format.is_none()
+                        && !saw_partitioned =>
+                {
+                    key_format = Some(TargetObjectKeyFormat::SimplePrefix);
+                }
+                ([_, le, kf], "PartitionedPrefix")
+                    if le == "LoggingEnabled"
+                        && kf == "TargetObjectKeyFormat"
+                        && key_format.is_none()
+                        && !saw_partitioned =>
+                {
+                    saw_partitioned = true;
+                }
+                ([_, le, tg, g, gr], "DisplayName")
+                    if le == "LoggingEnabled"
+                        && tg == "TargetGrants"
+                        && g == "Grant"
+                        && gr == "Grantee" => {}
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Text(txt) => {
                 text_acc.push_str(&txt);
             }
-            Ok(Event::End(e)) => {
-                let lb = e.local_name();
-                let local = std::str::from_utf8(lb.as_ref()).unwrap_or("");
+            XmlTok::End { local } => {
                 let popped = stack.pop().ok_or_else(malformed_xml)?;
                 if popped != local {
                     return Err(malformed_xml());
@@ -1186,7 +1095,7 @@ where
                 let val_raw = std::mem::take(&mut text_acc);
                 let val_trim = val_raw.trim();
 
-                match (stack.as_slice(), local) {
+                match (stack.as_slice(), local.as_str()) {
                     ([_, le], "TargetBucket") if le == "LoggingEnabled" => {
                         target_bucket = Some(val_trim.to_string());
                     }
@@ -1241,11 +1150,7 @@ where
                     _ => {}
                 }
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
         }
-        buf.clear();
     }
 
     if !saw_root || !stack.is_empty() {

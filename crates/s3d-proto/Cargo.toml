@@ -24,6 +24,7 @@ serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }

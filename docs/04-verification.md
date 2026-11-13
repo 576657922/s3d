@@ -8,8 +8,8 @@
 
 ### 1.1 `s3d-model` 设计约束（`VR-1`）
 
-- **极简可读性**：全库控制在 **500～800 行纯安全 Rust**，仅使用一把粗粒度 `Mutex<ModelState>` 串行保护内存中的 `BTreeMap`，不做分块、不写磁盘、不做异步并发优化。
-- **可追溯性**：模型代码中每个分支以注释显式标注需求编号（例如 `// [FR-16] DeleteObject with If-Match:* on delete marker -> 412`），构建脚本自动扫描校验 `FR-1`～`FR-51` 全部在 `s3d-model` 中有对应标注。
+- **纯内存可执行规格（零持久化 / 零并发优化）**：`s3d-model` 仅使用一把粗粒度 `Mutex<ModelState>` 串行保护内存中的 `BTreeMap`，不做分块、不写磁盘、不做锁细化或异步流水线优化（M0 基础桶与对象 CRUD 约 500 行；随 M1～M4 扩展至覆盖 `ObjectStore` 全部 **63 个操作**——含 P0 全量、P1 多租户 IAM Bucket Policy / ACL / CORS / 版本控制 / 分片上传、P2 对象锁 WORM / 生命周期清扫 / SSE-S3 & SSE-C / 桶日志及全部 10 种校验和——总计约 4,280 行纯安全平铺状态机代码，支持 `O(1)` `Clone` 快照）。
+- **100% 机械可追溯性**：模型生产代码中每个需求分支均以 `// [FR-N]` 显式标注需求编号；内置单元测试 `tests::vr1_all_51_fr_annotated_in_model` 与独立门禁脚本 `scripts/verify_fr_traceability.py` 自动扫描源码，强制校验 `FR-1`～`FR-51`（51/51）及全规格书 `PR`/`ST`/`NFR`/`VR`（共 **119/119** 个需求 ID）100% 落位，缺失任一编号即阻断 CI。
 
 ### 1.2 符号句柄双射与确定性上下文（`VR-2` 核心机制）
 
@@ -27,9 +27,10 @@
 
 | 维度 | 偏置取值分布 | 覆盖意图 |
 | --- | --- | --- |
-| Bucket | 3 个固定桶名（含开启/暂停/未开启版本切换）+ 10% 非法桶名 | 桶生命周期、版本状态机转换（`FR-32`） |
+| Bucket | 3 个固定桶名（含开启/暂停/未开启版本切换及 `object_lock_enabled` 桶级 WORM 开关）+ 10% 非法桶名 | 桶生命周期、版本状态机转换（`FR-32`）、对象锁联动 |
 | Key | 70% 取自 4 个热点 key（`k1`, `k2`, `dir/a`, `dir/b`）；30% 取边界 key（含连续 `//`、首尾 `/`、`.`、`..`、`+`、空格、CJK/Emoji、1024B 极限与 1025B 超限） | 写覆盖、版本链堆叠、列举 `delimiter`/`prefix` 折叠（`PR-3`, `FR-40`） |
-| 数据大小 | `{0, 1, 4095, 4096, 8192, 1 MiB - 1, 1 MiB, 1 MiB + 1, 5 MiB - 1, 5 MiB}`（测试模式下段块上限可缩放为 64 KiB 加速 100 万条回归，夜间同时跑真实 1 MiB/5 MiB） | 空对象、扇区边界、段块切分边界、分片最小尺寸 `EntityTooSmall` |
+| 数据大小 | `{0, 1, 4095, 4096, 8192, 65535, 65536, 5 MiB - 1, 5 MiB}` | 空对象、扇区边界、段块切分边界、分片最小尺寸 `EntityTooSmall`（`FR-25`） |
+| 校验和、加密与对象锁（P0+P1+P2） | 均匀/偏置采样全部 **10 种 `ChecksumAlgorithm`**（含 P2 `MD5`/`SHA512`/`XXHASH64`/`XXHASH3`/`XXHASH128`）、SSE-S3 / SSE-C 密钥槽、Governance / Compliance 保留期、Legal Hold 及 `x-amz-bypass-governance-retention` 删除 | 覆盖 P0+P1+P2 全特性组合状态转移 |
 | 异常流注入 | 15% 写操作在流末尾返回 `BodyStreamError::BadDigest` 或 `ClientDisconnected` | 验证失败写入 0 可见残留（`FR-1`, `PR-21`） |
 
 ---
@@ -60,6 +61,7 @@ pub struct FaultDiskState {
 - **正常读写**：进程读操作看到 `durable + pending` 合并后的页缓存视图（与 OS Page Cache 一致）。
 - **`sync_data(inode)`**：若命中 `EIO` 注入点则返回 `Err(DiskError::IoError)`（此时 `pending` 脏扇区保持不确定状态）；否则将该 `inode` 的全部 `pending_file_writes` 刷入 `durable_files`。
 - **`sync_dir(dir)`**：将该目录下的 `pending_dir_ops` 刷入 `durable_dirs`（若未调用 `sync_dir` 即掉电，新建的段/WAL 文件或 `rename` 的检查点有 50% 概率在恢复后的目录中消失，直接检验 `ST-7` 与 `ST-8`）。
+- **系统调用中途 / 4 KiB 扇区粒度断电触发器（`arm_mid_io_power_cut(countdown)`）**：在每次目录变更、`set_len`、`sync_data`/`sync_dir` 以及 `write_all_at` **内部的 4 KiB 扇区循环中**逐次递减计数器；归零瞬间立即中断当前写入（仅前半部分扇区进入 `pending_sectors`，后半部分扇区从未写出）并使后续所有磁盘 I/O 返回 `IoError`，配合 `128 KiB`、`1 MiB + 37 B`、`5 MiB + 19 B`（跨 11 个段文件与 1,280+ 个扇区）大对象、多段分片上传、`compact()` 与 `write_checkpoint()` 真实检验写途中断电的原子回滚与持久化边界。
 - **模拟掉电（`power_cut(seed)`）**：
   1. 丢弃所有句柄与排他锁。
   2. 对每个未 `sync_dir` 的目录项变更，按伪随机布尔值决定保留或丢弃。

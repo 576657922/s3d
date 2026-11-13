@@ -742,15 +742,10 @@ pub fn parse_and_verify_post_object(
         }
     }
 
-    // Verify x-amz-checksum-* if provided
+    // Verify x-amz-checksum-* if provided (all P0 + P2 algorithms per PR-20)
     let mut expected_checksum: Option<(ChecksumAlgorithm, String)> = None;
-    for (hdr, alg) in [
-        ("x-amz-checksum-crc32", ChecksumAlgorithm::Crc32),
-        ("x-amz-checksum-crc32c", ChecksumAlgorithm::Crc32c),
-        ("x-amz-checksum-crc64nvme", ChecksumAlgorithm::Crc64Nvme),
-        ("x-amz-checksum-sha1", ChecksumAlgorithm::Sha1),
-        ("x-amz-checksum-sha256", ChecksumAlgorithm::Sha256),
-    ] {
+    for alg in ChecksumAlgorithm::ALL {
+        let hdr = alg.header_name();
         if let Some(val_str) = get_field(&fields, hdr) {
             if expected_checksum.is_some() {
                 return Err(S3Error::new(

@@ -97,5 +97,5 @@ flowchart LR
 | `Q2` | 新桶默认 `ObjectOwnership` | 配置项 `default_object_ownership` 默认 `BucketOwnerEnforced`，`s3-tests` 配置设为 `ObjectWriter`（`FR-51`） | **M2** 跑 `acl`（42/44）与 `policy`（52/53）用例集全部符合预期 | **已核实闭环** |
 | `Q3` / `FR-9` | `GetObject` 收到多区间 `Range`（如 `bytes=0-1,3-4`）的行为 | 忽略 `Range` 头，返回 `200 OK` 与完整对象 | **M0-8** 对照 `s3-tests` Range 用例全部通过 | **已核实闭环** |
 | `Q4` | `versionId` 编码格式与长度 | `v{seq:016x}`（17 字符 ASCII 十六进制，不透明、同 key 内单调可排序、≤ 64 字符） | **M2** 跑 `versioning` 用例集（29/31 通过，仅余 2 个 `FR-49` 二次建桶辅助函数冲突） | **已核实闭环** |
-| `Q5` | TLS 支持 | M0～M3 走明文 HTTP；TLS 放 P2 选做 | **M4** 视需求决定是否启用 `tokio-rustls` | 放入 P2 |
-| `Q6` | MD5、XXHASH 系列、SHA512 校验和优先级 | 保持 P2（`PR-20`） | 持续观察 `boto3` 默认行为，v1 无需升至 P1 | 放入 P2 |
+| `Q5` | TLS 支持 | 通过 `tokio-rustls` + `ring` 原生支持 `--tls-cert-file` / `--tls-key-file`（TLS 1.2 / 1.3），默认不配走明文 HTTP | **M4+** `crates/s3d-server/tests/p2_tls_and_checksums.rs` 端到端 TLS 1.3 SigV4 读写与过载保护全部通过 | **已实现闭环** |
+| `Q6` | MD5、XXHASH 系列、SHA512 校验和优先级 | 已全量实现 `MD5`、`SHA512`、`XXHASH64`、`XXHASH3`、`XXHASH128`（共 10 种算法，`PR-20`） | **M4+** 单流 PUT、`aws-chunked` 尾部、分片 `COMPOSITE`、`GetObjectAttributes` 与 `VR-2` 随机对拍全部通过 | **已实现闭环** |

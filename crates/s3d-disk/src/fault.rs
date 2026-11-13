@@ -48,6 +48,8 @@ struct InnerState {
     fail_sync_at: Option<usize>,
     sync_calls: usize,
     always_fail_sync: bool,
+    mid_io_countdown: Option<usize>,
+    power_cut_tripped: bool,
 }
 
 impl Default for InnerState {
@@ -65,6 +67,8 @@ impl Default for InnerState {
             fail_sync_at: None,
             sync_calls: 0,
             always_fail_sync: false,
+            mid_io_countdown: None,
+            power_cut_tripped: false,
         }
     }
 }
@@ -108,6 +112,30 @@ impl FaultDisk {
         guard.fail_sync_at = Some(nth);
         guard.always_fail_sync = false;
         self.poison_sync.store(false, Ordering::SeqCst);
+    }
+
+    /// Arm an atomic mid-syscall power-cut countdown (`VR-3`).
+    ///
+    /// Decrements once on every mutating or syncing filesystem step — including every individual
+    /// 4 KiB sector inside `write_all_at`. When the countdown reaches `0`, the in-flight operation
+    /// stops immediately (leaving earlier sectors of a multi-sector `write_all_at` in `pending_sectors`
+    /// while later sectors are never issued) and all subsequent I/O calls fail with `DiskError::IoError`.
+    pub fn arm_mid_io_power_cut(&self, countdown: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.mid_io_countdown = Some(countdown);
+        guard.power_cut_tripped = false;
+    }
+
+    /// Disarm any active mid-syscall power-cut countdown.
+    pub fn disarm_mid_io_power_cut(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.mid_io_countdown = None;
+        guard.power_cut_tripped = false;
+    }
+
+    /// Return `true` if a mid-syscall power cut was tripped since `arm_mid_io_power_cut`.
+    pub fn did_trip_power_cut(&self) -> bool {
+        self.inner.lock().unwrap().power_cut_tripped
     }
 
     /// Simulate sudden power loss:
@@ -226,13 +254,31 @@ impl FaultDisk {
                 fail_sync_at: None,
                 sync_calls: 0,
                 always_fail_sync: false,
+                mid_io_countdown: None,
+                power_cut_tripped: false,
             })),
             available: Arc::new(AtomicU64::new(self.available.load(Ordering::SeqCst))),
             poison_sync: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    fn tick_mid_io_fault(guard: &mut InnerState) -> DiskResult<()> {
+        if guard.power_cut_tripped {
+            return Err(DiskError::IoError);
+        }
+        if let Some(rem) = &mut guard.mid_io_countdown {
+            if *rem == 0 {
+                guard.power_cut_tripped = true;
+                guard.mid_io_countdown = None;
+                return Err(DiskError::IoError);
+            }
+            *rem -= 1;
+        }
+        Ok(())
+    }
+
     fn check_sync_fault(&self, guard: &mut InnerState) -> DiskResult<()> {
+        Self::tick_mid_io_fault(guard)?;
         if self.poison_sync.load(Ordering::SeqCst) || guard.always_fail_sync {
             return Err(DiskError::IoError);
         }
@@ -286,6 +332,9 @@ impl DiskFile for FaultFile {
             return Err(DiskError::InvalidInput);
         }
         let guard = self.disk.inner.lock().unwrap();
+        if guard.power_cut_tripped {
+            return Err(DiskError::IoError);
+        }
         let file = guard.files.get(&self.inode_id).ok_or(DiskError::IoError)?;
         let start = offset as usize;
         let end = start.checked_add(buf.len()).ok_or(DiskError::InvalidInput)?;
@@ -301,27 +350,40 @@ impl DiskFile for FaultFile {
             return Err(DiskError::InvalidInput);
         }
         if buf.is_empty() {
+            let guard = self.disk.inner.lock().unwrap();
+            if guard.power_cut_tripped {
+                return Err(DiskError::IoError);
+            }
             return Ok(());
         }
         let mut guard = self.disk.inner.lock().unwrap();
-        let file = guard
-            .files
-            .get_mut(&self.inode_id)
-            .ok_or(DiskError::IoError)?;
-        let start = offset as usize;
-        let end = start.checked_add(buf.len()).ok_or(DiskError::InvalidInput)?;
-        if file.live.len() < end {
-            file.live.resize(end, 0);
+        if guard.power_cut_tripped {
+            return Err(DiskError::IoError);
         }
-        file.live[start..end].copy_from_slice(buf);
+        if !guard.files.contains_key(&self.inode_id) {
+            return Err(DiskError::IoError);
+        }
+        let start = offset as usize;
+        let _end = start.checked_add(buf.len()).ok_or(DiskError::InvalidInput)?;
 
-        // Split write into 4 KiB sector chunks for adversarial crash modeling
+        // Split write into 4 KiB sector chunks for adversarial crash modeling;
+        // `tick_mid_io_fault` can cut power mid-`write_all_at` between any two 4 KiB sectors!
         let mut cursor = 0usize;
         while cursor < buf.len() {
+            FaultDisk::tick_mid_io_fault(&mut guard)?;
             let abs = start + cursor;
             let sector_idx = abs / SECTOR_SIZE;
             let offset_in_sector = abs % SECTOR_SIZE;
             let chunk_len = (SECTOR_SIZE - offset_in_sector).min(buf.len() - cursor);
+            let chunk_end = abs + chunk_len;
+            let file = guard
+                .files
+                .get_mut(&self.inode_id)
+                .ok_or(DiskError::IoError)?;
+            if file.live.len() < chunk_end {
+                file.live.resize(chunk_end, 0);
+            }
+            file.live[abs..chunk_end].copy_from_slice(&buf[cursor..cursor + chunk_len]);
             file.pending_sectors.push(DirtySectorWrite {
                 inode_id: self.inode_id,
                 sector_idx,
@@ -338,6 +400,7 @@ impl DiskFile for FaultFile {
             return Err(DiskError::InvalidInput);
         }
         let mut guard = self.disk.inner.lock().unwrap();
+        FaultDisk::tick_mid_io_fault(&mut guard)?;
         let file = guard
             .files
             .get_mut(&self.inode_id)
@@ -349,6 +412,9 @@ impl DiskFile for FaultFile {
 
     fn len(&self) -> DiskResult<u64> {
         let guard = self.disk.inner.lock().unwrap();
+        if guard.power_cut_tripped {
+            return Err(DiskError::IoError);
+        }
         let file = guard.files.get(&self.inode_id).ok_or(DiskError::IoError)?;
         Ok(file.live.len() as u64)
     }
@@ -385,6 +451,9 @@ impl Disk for FaultDisk {
     fn open(&self, rel_path: &str, opts: OpenOpts) -> DiskResult<Self::File> {
         let (dir, name) = split_dir_file(rel_path)?;
         let mut guard = self.inner.lock().unwrap();
+        if guard.power_cut_tripped {
+            return Err(DiskError::IoError);
+        }
         if !guard.live_dirs.contains_key(&dir) {
             return Err(DiskError::NotFound);
         }
@@ -396,6 +465,7 @@ impl Disk for FaultDisk {
                     if !opts.write {
                         return Err(DiskError::InvalidInput);
                     }
+                    Self::tick_mid_io_fault(&mut guard)?;
                     if let Some(f) = guard.files.get_mut(&id) {
                         f.live.clear();
                         f.pending_set_len = Some(0);
@@ -407,6 +477,7 @@ impl Disk for FaultDisk {
                 if !(opts.create || opts.create_new) {
                     return Err(DiskError::NotFound);
                 }
+                Self::tick_mid_io_fault(&mut guard)?;
                 let id = guard.next_inode;
                 guard.next_inode += 1;
                 guard.files.insert(id, FileState::default());
@@ -439,6 +510,7 @@ impl Disk for FaultDisk {
         let (from_dir, from_name) = split_dir_file(from)?;
         let (to_dir, to_name) = split_dir_file(to)?;
         let mut guard = self.inner.lock().unwrap();
+        Self::tick_mid_io_fault(&mut guard)?;
         if !guard.live_dirs.contains_key(&to_dir) {
             return Err(DiskError::NotFound);
         }
@@ -468,6 +540,7 @@ impl Disk for FaultDisk {
     fn remove_file(&self, rel_path: &str) -> DiskResult<()> {
         let (dir, name) = split_dir_file(rel_path)?;
         let mut guard = self.inner.lock().unwrap();
+        Self::tick_mid_io_fault(&mut guard)?;
         let removed = guard
             .live_dirs
             .get_mut(&dir)
@@ -486,6 +559,9 @@ impl Disk for FaultDisk {
     fn exists(&self, rel_path: &str) -> DiskResult<bool> {
         let (dir, name) = split_dir_file(rel_path)?;
         let guard = self.inner.lock().unwrap();
+        if guard.power_cut_tripped {
+            return Err(DiskError::IoError);
+        }
         Ok(guard
             .live_dirs
             .get(&dir)
@@ -495,6 +571,9 @@ impl Disk for FaultDisk {
     fn read_dir(&self, rel_dir: &str) -> DiskResult<Vec<String>> {
         let dir = normalize_dir(rel_dir)?;
         let guard = self.inner.lock().unwrap();
+        if guard.power_cut_tripped {
+            return Err(DiskError::IoError);
+        }
         let entries = guard.live_dirs.get(&dir).ok_or(DiskError::NotFound)?;
         Ok(entries.keys().cloned().collect())
     }
@@ -502,6 +581,7 @@ impl Disk for FaultDisk {
     fn create_dir_all(&self, rel_dir: &str) -> DiskResult<()> {
         let dir = normalize_dir(rel_dir)?;
         let mut guard = self.inner.lock().unwrap();
+        Self::tick_mid_io_fault(&mut guard)?;
         if dir.is_empty() {
             return Ok(());
         }

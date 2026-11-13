@@ -317,7 +317,23 @@ fn vr8_10000_groups_botocore_and_aws_sigv4_zero_misjudgments() {
 
     // Spawn single batched `botocore` signer process for all 10,000 cases
     let root = workspace_root();
-    let python_bin = root.join(".venv/bin/python");
+    let python_bin: std::path::PathBuf = if let Some(env_py) = std::env::var_os("S3TESTS_PYTHON") {
+        env_py.into()
+    } else {
+        let venv_py = root.join(".venv/bin/python");
+        let venv_ok = Command::new(&venv_py)
+            .args(["-c", "import botocore"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if venv_ok {
+            venv_py
+        } else {
+            "python3".into()
+        }
+    };
     let script = root.join("scripts/vr8_botocore_signer.py");
     let mut child = Command::new(&python_bin)
         .arg(&script)

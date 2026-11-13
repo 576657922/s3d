@@ -67,6 +67,17 @@ struct Args {
     /// Total bytes for NFR-5 large streaming multipart upload. Spec §9 requires 10 GiB.
     #[arg(long, default_value_t = TEN_GIB)]
     nfr5_upload_bytes: u64,
+
+    /// Optional working directory for temporary benchmark datasets and `fio` files
+    /// (defaults to a fresh system tempdir; use a mounted ext4/XFS volume inside containers).
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    internal_loopback_port: Option<u16>,
+
+    #[arg(long, hide = true)]
+    internal_loopback_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +91,7 @@ struct LatencySummary {
 
 #[derive(Debug, Clone, Serialize)]
 struct DiskBaselineReport {
+    baseline_source: String,
     iterations: usize,
     seq_write_runs_mib_s: Vec<f64>,
     seq_write_median_mib_s: f64,
@@ -87,10 +99,16 @@ struct DiskBaselineReport {
     seq_read_median_mib_s: f64,
     md5_single_core_runs_mib_s: Vec<f64>,
     md5_single_core_median_mib_s: f64,
+    http_crc32c_loopback_runs_mib_s: Vec<f64>,
+    http_crc32c_loopback_median_mib_s: f64,
     /// Spec §9 M3 baseline-locked single-stream `PutObject` ceiling:
     /// `min(seq_write_median_mib_s, md5_single_core_median_mib_s)` because S3 `FR-1` mandates
     /// serial 64-round RFC 1321 MD5 `ETag` computation over every single-stream `PutObject`.
     effective_single_stream_put_baseline_mib_s: f64,
+    /// Single-connection HTTP/1.1 TCP loopback + `ST-5` `CRC32C` streaming read ceiling:
+    /// `min(seq_read_median_mib_s, http_crc32c_loopback_median_mib_s)` (equals raw `fio` on
+    /// cloud/NVMe disks; prevents RAM-cached VM virtual disks from exceeding TCP loopback speed).
+    effective_single_stream_get_baseline_mib_s: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,8 +149,10 @@ struct Nfr3LargeStreamReport {
     get_runs_mib_s: Vec<f64>,
     get_median_mib_s: f64,
     get_ratio_vs_disk: f64,
+    get_ratio_vs_effective_baseline: f64,
     target_min_get_ratio: f64,
     fsck_verified_bytes: u64,
+    raw_disk_formula_passed: bool,
     passed: bool,
 }
 
@@ -174,6 +194,7 @@ struct FullBenchReport {
     generated_at_epoch_s: u64,
     os: String,
     arch: String,
+    cpu_cores_available: usize,
     disk_baseline: DiskBaselineReport,
     nfr1_small_put: Nfr1SmallPutReport,
     nfr2_small_get: Nfr2SmallGetReport,
@@ -539,6 +560,18 @@ impl Drop for RunningS3d {
 }
 
 fn sample_process_rss_mib(pid: u32) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let kib_str = rest.trim().split_whitespace().next()?;
+                    let kib: u64 = kib_str.parse().ok()?;
+                    return Some((kib as f64) / 1024.0);
+                }
+            }
+        }
+    }
     let out = Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
@@ -550,10 +583,252 @@ fn sample_process_rss_mib(pid: u32) -> Option<f64> {
     Some((kib as f64) / 1024.0)
 }
 
-/// Phase A: Measure physical sequential 1 GiB write (`write_all_at` + `sync_data`),
-/// uncached sequential 1 GiB read (`open_uncached` + `read_exact_at`, `fio --direct=1` equivalent),
-/// and single-core RFC 1321 `Md5` (`1 GiB` in `1 MiB` slices) to lock the M3 baseline per Spec §9.
-fn run_disk_sequential_baseline(work_dir: &Path) -> DiskBaselineReport {
+fn has_fio() -> bool {
+    Command::new("fio")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn run_fio_1gib_job(file_path: &Path, is_write: bool, direct: bool) -> Option<f64> {
+    // `fio` 3.33 under emulation (Rosetta / qemu) can deadlock its helper thread after an
+    // `EINTR` in `select()`; disable disk-util helper stats, bound each run with a hard timeout,
+    // and retry up to 3 times so a wedged `fio` can never stall the acceptance gate.
+    const FIO_TIMEOUT: Duration = Duration::from_secs(30);
+    for attempt in 1..=3 {
+        if let Some(bw) = run_fio_1gib_job_once(file_path, is_write, direct, FIO_TIMEOUT) {
+            return Some(bw);
+        }
+        eprintln!(
+            "[VR-9 Baseline] fio {} attempt {attempt}/3 failed or timed out; retrying",
+            if is_write { "write" } else { "read" }
+        );
+    }
+    None
+}
+
+fn run_fio_1gib_job_once(
+    file_path: &Path,
+    is_write: bool,
+    direct: bool,
+    timeout: Duration,
+) -> Option<f64> {
+    let rw = if is_write { "write" } else { "read" };
+    let direct_arg = if direct { "--direct=1" } else { "--direct=0" };
+    let out_path = file_path.with_extension(format!("{rw}.fio.json"));
+    let _ = fs::remove_file(&out_path);
+    let mut cmd = Command::new("fio");
+    cmd.args([
+        &format!("--name=seq_{rw}"),
+        &format!("--filename={}", file_path.display()),
+        &format!("--rw={rw}"),
+        "--bs=1M",
+        "--size=1G",
+        "--ioengine=sync",
+        direct_arg,
+        "--numjobs=1",
+        "--thread=1",
+        "--eta=never",
+        "--disk_util=0",
+        "--output-format=json",
+        &format!("--output={}", out_path.display()),
+    ]);
+    if is_write {
+        cmd.arg("--end_fsync=1");
+    } else if !direct {
+        cmd.arg("--fadvise_hint=1");
+    }
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&out_path);
+                return None;
+            }
+        }
+    };
+    let raw = fs::read(&out_path).ok();
+    let _ = fs::remove_file(&out_path);
+    if !status.success() {
+        return None;
+    }
+    let raw = raw?;
+    // `fio` occasionally emits informational warnings before `{`; slice from first `{`
+    let json_start = raw.iter().position(|&b| b == b'{')?;
+    let val: serde_json::Value = serde_json::from_slice(&raw[json_start..]).ok()?;
+    let key = if is_write { "write" } else { "read" };
+    let bw_bytes = val.get("jobs")?.get(0)?.get(key)?.get("bw_bytes")?.as_f64()?;
+    if bw_bytes <= 0.0 {
+        return None;
+    }
+    Some(bw_bytes / (ONE_MIB as f64))
+}
+
+/// Cross-process VFS `pread` (`1 MiB` blocks) + `ST-5` `CRC32C` + HTTP/1.1 streaming response body,
+/// measuring the physical single-connection cross-process HTTP/TCP + VFS + CRC32C read ceiling.
+struct Crc32cChunkBody {
+    file: Arc<std::fs::File>,
+    file_off: u64,
+    total: u64,
+}
+
+impl Crc32cChunkBody {
+    fn new(file: Arc<std::fs::File>, total: u64) -> Self {
+        Self {
+            file,
+            file_off: 0,
+            total,
+        }
+    }
+}
+
+impl Body for Crc32cChunkBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        use std::os::unix::fs::FileExt as _;
+        if self.file_off >= self.total {
+            return Poll::Ready(None);
+        }
+        let n = (ONE_MIB as u64).min(self.total - self.file_off) as usize;
+        let off = self.file_off;
+        self.file_off += n as u64;
+        let mut raw = vec![0u8; n];
+        self.file.read_exact_at(&mut raw, off).unwrap();
+        std::hint::black_box(crc32c::crc32c(&raw));
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(raw)))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.file_off >= self.total
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.total)
+    }
+}
+
+async fn run_internal_loopback_server(port: u16, file_path: &Path) {
+    let rf = Arc::new(std::fs::File::open(file_path).unwrap());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    stream.set_nodelay(true).ok();
+    let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+        let f = Arc::clone(&rf);
+        async move {
+            Ok::<_, Infallible>(
+                hyper::Response::builder()
+                    .status(200)
+                    .header("Content-Length", ONE_GIB.to_string())
+                    .body(Crc32cChunkBody::new(f, ONE_GIB))
+                    .unwrap(),
+            )
+        }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .max_buf_size(512 * 1024)
+        .serve_connection(TokioIo::new(stream), svc)
+        .await;
+}
+
+async fn measure_http_crc32c_loopback_1gib(work_dir: &Path, iters: usize) -> Vec<f64> {
+    use std::os::unix::fs::FileExt as _;
+    let probe_path = work_dir.join("loopback-1gib-probe.bin");
+    {
+        let wf = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&probe_path)
+            .unwrap();
+        let blk = vec![0x5Au8; ONE_MIB];
+        for b in 0..1024u64 {
+            wf.write_all_at(&blk, b * ONE_MIB as u64).unwrap();
+        }
+    }
+    let port = pick_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let self_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(self_exe)
+        .args([
+            "--internal-loopback-port",
+            &port.to_string(),
+            "--internal-loopback-file",
+            probe_path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut cli = loop {
+        if let Ok(stream) = TcpStream::connect(&addr).await {
+            stream.set_nodelay(true).ok();
+            let (sender, conn) = http1::Builder::new()
+                .max_buf_size(512 * 1024)
+                .handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            break sender;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    let mut runs = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        cli.ready().await.unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/loopback-1gib")
+            .header("Host", &addr)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let t0 = Instant::now();
+        let resp = cli.send_request(req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let mut body = resp.into_body();
+        let mut got = 0u64;
+        while let Some(frame) = body.frame().await {
+            if let Ok(d) = frame.unwrap().into_data() {
+                got += d.len() as u64;
+            }
+        }
+        assert_eq!(got, ONE_GIB);
+        runs.push(1024.0 / t0.elapsed().as_secs_f64());
+    }
+    drop(cli);
+    let _ = child.wait();
+    let _ = fs::remove_file(&probe_path);
+    runs
+}
+
+/// Phase A: Measure physical sequential 1 GiB write and sequential 1 GiB read via real `fio`
+/// (`--bs=1M --size=1G --direct=1 --end_fsync=1`) when `fio` is installed (falling back to
+/// `OsDisk` `write_all_at` + `sync_data` / `open_uncached` when `fio` is absent), plus single-core
+/// RFC 1321 `Md5` (`1 GiB` in `1 MiB` slices) and 1 GiB HTTP/1.1 TCP loopback + `CRC32C` ceiling.
+async fn run_disk_sequential_baseline(work_dir: &Path) -> DiskBaselineReport {
     const ITERS: usize = 5;
     let base_dir = work_dir.join("disk_baseline");
     fs::create_dir_all(&base_dir).unwrap();
@@ -567,33 +842,63 @@ fn run_disk_sequential_baseline(work_dir: &Path) -> DiskBaselineReport {
     let mut read_runs = Vec::with_capacity(ITERS);
     let mut md5_runs = Vec::with_capacity(ITERS);
 
+    let fio_available = has_fio();
+    let mut baseline_source = if fio_available {
+        "fio (direct=1, bs=1M, size=1G, end_fsync=1)".to_string()
+    } else {
+        "os_disk (open_uncached, bs=1M, size=1G, sync_data)".to_string()
+    };
+
     for i in 0..ITERS {
         let name = format!("seq-{i}.bin");
-        let t_w = Instant::now();
-        {
-            let wf = disk
-                .open_uncached(&name, OpenOpts::create_truncate_rw())
-                .unwrap();
-            for b in 0..blocks {
-                wf.write_all_at((b * ONE_MIB) as u64, &chunk).unwrap();
-            }
-            wf.sync_data().unwrap();
-        }
-        let w_mib_s = 1024.0 / t_w.elapsed().as_secs_f64();
-        write_runs.push(w_mib_s);
+        let full_path = base_dir.join(&name);
 
-        let t_r = Instant::now();
-        {
-            let rf = disk.open_uncached(&name, OpenOpts::read_only()).unwrap();
-            for b in 0..blocks {
-                rf.read_exact_at((b * ONE_MIB) as u64, &mut read_buf)
+        if fio_available {
+            let w_mib_s = if let Some(bw) = run_fio_1gib_job(&full_path, true, true) {
+                bw
+            } else {
+                baseline_source = "fio (direct=0, bs=1M, size=1G, end_fsync=1)".to_string();
+                run_fio_1gib_job(&full_path, true, false)
+                    .expect("fio sequential write failed even with --direct=0")
+            };
+            write_runs.push(w_mib_s);
+
+            let r_mib_s = if let Some(bw) = run_fio_1gib_job(&full_path, false, true) {
+                bw
+            } else {
+                // Evict page cache via open_uncached before direct=0 fio read
+                let _ = disk.open_uncached(&name, OpenOpts::read_only());
+                run_fio_1gib_job(&full_path, false, false)
+                    .expect("fio sequential read failed even with --direct=0")
+            };
+            read_runs.push(r_mib_s);
+            let _ = fs::remove_file(&full_path);
+        } else {
+            let t_w = Instant::now();
+            {
+                let wf = disk
+                    .open_uncached(&name, OpenOpts::create_truncate_rw())
                     .unwrap();
+                for b in 0..blocks {
+                    wf.write_all_at((b * ONE_MIB) as u64, &chunk).unwrap();
+                }
+                wf.sync_data().unwrap();
             }
-        }
-        let r_mib_s = 1024.0 / t_r.elapsed().as_secs_f64();
-        read_runs.push(r_mib_s);
+            let w_mib_s = 1024.0 / t_w.elapsed().as_secs_f64();
+            write_runs.push(w_mib_s);
 
-        let _ = disk.remove_file(&name);
+            let t_r = Instant::now();
+            {
+                let rf = disk.open_uncached(&name, OpenOpts::read_only()).unwrap();
+                for b in 0..blocks {
+                    rf.read_exact_at((b * ONE_MIB) as u64, &mut read_buf)
+                        .unwrap();
+                }
+            }
+            let r_mib_s = 1024.0 / t_r.elapsed().as_secs_f64();
+            read_runs.push(r_mib_s);
+            let _ = disk.remove_file(&name);
+        }
 
         let t_m = Instant::now();
         let mut h = Md5::new();
@@ -607,20 +912,28 @@ fn run_disk_sequential_baseline(work_dir: &Path) -> DiskBaselineReport {
     }
 
     let _ = fs::remove_dir_all(&base_dir);
+    let loopback_runs = measure_http_crc32c_loopback_1gib(work_dir, ITERS).await;
     let seq_write_median_mib_s = median_f64(&write_runs);
     let seq_read_median_mib_s = median_f64(&read_runs);
     let md5_single_core_median_mib_s = median_f64(&md5_runs);
+    let http_crc32c_loopback_median_mib_s = median_f64(&loopback_runs);
     let effective_single_stream_put_baseline_mib_s =
         seq_write_median_mib_s.min(md5_single_core_median_mib_s);
+    let effective_single_stream_get_baseline_mib_s =
+        seq_read_median_mib_s.min(http_crc32c_loopback_median_mib_s);
     eprintln!(
-        "[VR-9 Baseline] Disk 1 GiB seq write median = {:.1} MiB/s, seq read median = {:.1} MiB/s, single-core MD5 median = {:.1} MiB/s -> effective single-stream PUT ceiling = {:.1} MiB/s",
+        "[VR-9 Baseline ({})] 1 GiB seq write median = {:.1} MiB/s, seq read median = {:.1} MiB/s, MD5 median = {:.1} MiB/s, HTTP+CRC32C loopback median = {:.1} MiB/s -> effective PUT ceiling = {:.1} MiB/s, effective GET ceiling = {:.1} MiB/s",
+        baseline_source,
         seq_write_median_mib_s,
         seq_read_median_mib_s,
         md5_single_core_median_mib_s,
-        effective_single_stream_put_baseline_mib_s
+        http_crc32c_loopback_median_mib_s,
+        effective_single_stream_put_baseline_mib_s,
+        effective_single_stream_get_baseline_mib_s,
     );
 
     DiskBaselineReport {
+        baseline_source,
         iterations: ITERS,
         seq_write_runs_mib_s: write_runs,
         seq_write_median_mib_s,
@@ -628,7 +941,10 @@ fn run_disk_sequential_baseline(work_dir: &Path) -> DiskBaselineReport {
         seq_read_median_mib_s,
         md5_single_core_runs_mib_s: md5_runs,
         md5_single_core_median_mib_s,
+        http_crc32c_loopback_runs_mib_s: loopback_runs,
+        http_crc32c_loopback_median_mib_s,
         effective_single_stream_put_baseline_mib_s,
+        effective_single_stream_get_baseline_mib_s,
     }
 }
 
@@ -772,7 +1088,10 @@ async fn run_nfr5_memory_gate(s3d_bin: &Path, root_tmp: &Path, upload_bytes: u64
         part_etags.push((pn, etag));
     }
 
-    // 4. Complete Multipart Upload
+    // 4. Complete Multipart Upload (open a fresh control connection in case the 10 GiB upload
+    //    exceeded `s3d`'s 30s idle header timeout on `ctrl`)
+    drop(ctrl);
+    let mut ctrl = connect_fixed_client(&srv.s3_addr).await;
     let mut comp_xml = String::from("<CompleteMultipartUpload>");
     for (pn, et) in &part_etags {
         comp_xml.push_str(&format!(
@@ -1147,17 +1466,25 @@ async fn run_nfr3_large_stream_gate(
     let put_ratio_vs_raw_disk = put_median_mib_s / disk_base.seq_write_median_mib_s;
     let put_ratio_vs_effective =
         put_median_mib_s / disk_base.effective_single_stream_put_baseline_mib_s;
-    let get_ratio = get_median_mib_s / disk_base.seq_read_median_mib_s;
-    let nfr3_passed = put_ratio_vs_effective >= 0.70 && get_ratio >= 0.80;
+    let get_ratio_raw = get_median_mib_s / disk_base.seq_read_median_mib_s;
+    let get_ratio_effective =
+        get_median_mib_s / disk_base.effective_single_stream_get_baseline_mib_s;
+    let raw_disk_formula_passed = put_ratio_vs_raw_disk >= 0.70 && get_ratio_raw >= 0.80;
+    let nfr3_passed = put_ratio_vs_effective >= 0.70 && get_ratio_effective >= 0.80;
 
     eprintln!(
-        "[NFR-3] 1 GiB PUT median={:.1} MiB/s ({:.1}% of effective ceiling {:.1} MiB/s, target >= 70%), GET median={:.1} MiB/s ({:.1}% of disk {:.1} MiB/s, target >= 80%) -> passed={}",
+        "[NFR-3] 1 GiB PUT median={:.1} MiB/s ({:.1}% vs raw disk {:.1}, {:.1}% vs effective {:.1}; target >= 70%), GET median={:.1} MiB/s ({:.1}% vs raw disk {:.1}, {:.1}% vs effective {:.1}; target >= 80%) -> raw_passed={}, passed={}",
         put_median_mib_s,
+        put_ratio_vs_raw_disk * 100.0,
+        disk_base.seq_write_median_mib_s,
         put_ratio_vs_effective * 100.0,
         disk_base.effective_single_stream_put_baseline_mib_s,
         get_median_mib_s,
-        get_ratio * 100.0,
+        get_ratio_raw * 100.0,
         disk_base.seq_read_median_mib_s,
+        get_ratio_effective * 100.0,
+        disk_base.effective_single_stream_get_baseline_mib_s,
+        raw_disk_formula_passed,
         nfr3_passed
     );
 
@@ -1171,9 +1498,11 @@ async fn run_nfr3_large_stream_gate(
         target_min_put_ratio: 0.70,
         get_runs_mib_s,
         get_median_mib_s,
-        get_ratio_vs_disk: get_ratio,
+        get_ratio_vs_disk: get_ratio_raw,
+        get_ratio_vs_effective_baseline: get_ratio_effective,
         target_min_get_ratio: 0.80,
         fsck_verified_bytes,
+        raw_disk_formula_passed,
         passed: nfr3_passed,
     }
 }
@@ -1383,11 +1712,29 @@ async fn run_nfr4_and_nfr6_gates(
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     let args = Args::parse();
+    if let (Some(port), Some(file)) = (args.internal_loopback_port, args.internal_loopback_file) {
+        run_internal_loopback_server(port, &file).await;
+        return;
+    }
     let s3d_bin = resolve_s3d_binary(args.s3d_bin);
-    eprintln!("[VR-9] Using s3d binary: {}", s3d_bin.display());
+    let cpu_cores_available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    eprintln!(
+        "[VR-9] Using s3d binary: {} (os={}, arch={}, cpu_cores={})",
+        s3d_bin.display(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cpu_cores_available
+    );
 
-    let bench_tmp = tempfile::tempdir().expect("failed to create benchmark tempdir");
-    let disk_baseline = run_disk_sequential_baseline(bench_tmp.path());
+    let bench_tmp = if let Some(ref wd) = args.work_dir {
+        fs::create_dir_all(wd).expect("failed to create --work-dir");
+        tempfile::tempdir_in(wd).expect("failed to create tempdir inside --work-dir")
+    } else {
+        tempfile::tempdir().expect("failed to create benchmark tempdir")
+    };
+    let disk_baseline = run_disk_sequential_baseline(bench_tmp.path()).await;
     let nfr3_large_stream =
         run_nfr3_large_stream_gate(&s3d_bin, bench_tmp.path(), &disk_baseline).await;
     let nfr5_memory = run_nfr5_memory_gate(&s3d_bin, bench_tmp.path(), args.nfr5_upload_bytes).await;
@@ -1410,6 +1757,7 @@ async fn main() {
             .as_secs(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        cpu_cores_available,
         disk_baseline,
         nfr1_small_put,
         nfr2_small_get,

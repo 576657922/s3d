@@ -1,0 +1,9 @@
+target/
+.git/
+.venv/
+.cache/
+.pytest_cache/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+reports/

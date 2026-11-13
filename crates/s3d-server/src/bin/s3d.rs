@@ -58,6 +58,12 @@ struct ServeArgs {
     /// Override 1 lifecycle "day" with N seconds (for deterministic s3-tests lifecycle suites)
     #[arg(long)]
     lc_debug_interval: Option<u64>,
+    /// Optional PEM certificate chain path for HTTPS listener (`Q5`)
+    #[arg(long)]
+    tls_cert_file: Option<PathBuf>,
+    /// Optional PEM private key path for HTTPS listener (`Q5`)
+    #[arg(long)]
+    tls_key_file: Option<PathBuf>,
 }
 
 fn init_tracing(log_format: &str) {
@@ -137,6 +143,12 @@ async fn main() -> ExitCode {
             }
             if let Some(v) = args.lc_debug_interval {
                 cfg.lc_debug_interval_secs = Some(v);
+            }
+            if let Some(v) = args.tls_cert_file {
+                cfg.tls_cert_file = Some(v);
+            }
+            if let Some(v) = args.tls_key_file {
+                cfg.tls_key_file = Some(v);
             }
 
             if let Err(e) = cfg.validate() {

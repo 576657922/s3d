@@ -261,10 +261,11 @@ mod tests {
         assert_eq!(buf, expected_ct);
 
         // Verify arbitrary unaligned Range decryption
+        let cipher = Aes256Cipher::new(&key);
         for start in 0..pt.len() {
             for end in start..=pt.len() {
                 let mut slice = expected_ct[start..end].to_vec();
-                aes256_ctr_xor(&key, &iv, start as u64, &mut slice);
+                aes256_ctr_xor_with_cipher(&cipher, &iv, start as u64, &mut slice);
                 assert_eq!(slice, &pt[start..end]);
             }
         }

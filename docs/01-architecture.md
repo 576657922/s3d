@@ -137,7 +137,7 @@ pub trait DiskFile: Send + Sync + 'static {
 `ObjectStore` 必须同时满足三件事：
 1. **流式零缓冲（`NFR-5`）**：10 GiB 上传/下载不能驻留内存，单在途请求缓冲 ≤ 2 MiB。
 2. **先流式校验，后提交点验条件（`PR-21`, `FR-17`, `8.3`）**：请求体边读边算 SHA-256 / MD5 / Checksum（包括 `aws-chunked` 尾部块），摘要全部校验通过后才允许提交；条件头（`If-Match` / `If-None-Match`）必须在流读完后的 **key 锁提交点**求值。
-3. **与参考模型同构（`VR-1`, `VR-2`）**：`s3d-model` 只需把流拼成 `Bytes` 即可在数百行内实现完全一致的外部可观测语义。
+3. **与参考模型同构（`VR-1`, `VR-2`）**：`s3d-model` 只需把流拼成 `Bytes`，无需任何分块、预写日志或磁盘 IO 状态机即可实现完全一致的外部可观测语义。
 
 解法是将写入拆为输入流契约 `VerifiedBodyStream`：流在产生字节块的过程中由协议层流式计算并校验 Payload SHA-256、`Content-MD5` 及 `x-amz-checksum-*`；引擎把字节块追加到活跃段文件，直到调用 `finish()` 拿到经协议层确认的 `(md5, checksum)`（若校验失败则流返回 `BodyError`，引擎直接丢弃未引用的段块，不写 WAL）。
 

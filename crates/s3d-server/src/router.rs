@@ -2337,6 +2337,7 @@ async fn handle_object_target<S: ObjectStore>(
                 )
                 .await?;
 
+            // [PR-23] Echo x-amz-checksum-<alg> on PutObject / UploadPart responses
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header("ETag", &resp.etag)
@@ -2675,6 +2676,7 @@ fn build_error_response<R>(
     resp
 }
 
+// [PR-15] Inject x-amz-request-id (16-hex uppercase), x-amz-id-2, Date, and Server: s3d on every response
 fn inject_common_headers(hdrs: &mut HeaderMap, request_id: &str, host_id: &str) {
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         hdrs.insert("x-amz-request-id", hv);
@@ -2908,15 +2910,9 @@ fn parse_optional_part_marker_header(headers: &HeaderMap) -> StoreResult<u32> {
 fn parse_complete_mp_checksum_header(
     headers: &HeaderMap,
 ) -> StoreResult<Option<(ChecksumAlgorithm, String)>> {
-    let candidates = [
-        (ChecksumAlgorithm::Crc32, "x-amz-checksum-crc32"),
-        (ChecksumAlgorithm::Crc32c, "x-amz-checksum-crc32c"),
-        (ChecksumAlgorithm::Crc64Nvme, "x-amz-checksum-crc64nvme"),
-        (ChecksumAlgorithm::Sha1, "x-amz-checksum-sha1"),
-        (ChecksumAlgorithm::Sha256, "x-amz-checksum-sha256"),
-    ];
     let mut found: Option<(ChecksumAlgorithm, String)> = None;
-    for (alg, hname) in candidates {
+    for alg in ChecksumAlgorithm::ALL {
+        let hname = alg.header_name();
         if let Some(hv) = headers.get(hname) {
             if found.is_some() {
                 return Err(S3Error::new(
@@ -2975,16 +2971,9 @@ fn parse_optional_md5(headers: &HeaderMap) -> StoreResult<Option<[u8; 16]>> {
 fn parse_header_checksum(
     headers: &HeaderMap,
 ) -> StoreResult<Option<(ChecksumAlgorithm, Option<String>)>> {
-    let candidates = [
-        (ChecksumAlgorithm::Crc32, "x-amz-checksum-crc32"),
-        (ChecksumAlgorithm::Crc32c, "x-amz-checksum-crc32c"),
-        (ChecksumAlgorithm::Crc64Nvme, "x-amz-checksum-crc64nvme"),
-        (ChecksumAlgorithm::Sha1, "x-amz-checksum-sha1"),
-        (ChecksumAlgorithm::Sha256, "x-amz-checksum-sha256"),
-    ];
-
     let mut found: Option<(ChecksumAlgorithm, String)> = None;
-    for (alg, hname) in candidates {
+    for alg in ChecksumAlgorithm::ALL {
+        let hname = alg.header_name();
         if let Some(hv) = headers.get(hname) {
             if found.is_some() {
                 return Err(S3Error::new(
@@ -3012,19 +3001,12 @@ fn parse_header_checksum(
                 .to_str()
                 .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument, "Invalid algorithm"))?
                 .trim();
-            let alg = match s {
-                "CRC32" => ChecksumAlgorithm::Crc32,
-                "CRC32C" => ChecksumAlgorithm::Crc32c,
-                "CRC64NVME" => ChecksumAlgorithm::Crc64Nvme,
-                "SHA1" => ChecksumAlgorithm::Sha1,
-                "SHA256" => ChecksumAlgorithm::Sha256,
-                _ => {
-                    return Err(S3Error::new(
-                        S3ErrorCode::InvalidArgument,
-                        "Unsupported checksum algorithm",
-                    ))
-                }
-            };
+            let alg = ChecksumAlgorithm::from_aws_str(s).ok_or_else(|| {
+                S3Error::new(
+                    S3ErrorCode::InvalidArgument,
+                    "Unsupported checksum algorithm",
+                )
+            })?;
             return Ok(Some((alg, None)));
         }
 

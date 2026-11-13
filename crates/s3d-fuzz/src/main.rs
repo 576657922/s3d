@@ -30,6 +30,10 @@ struct Args {
     /// Output JSON report path.
     #[arg(long, default_value = "reports/m3-fuzz-report.json")]
     report: PathBuf,
+
+    /// Export initial seed corpus and libFuzzer dictionary into `<DIR>/<target>/` and exit.
+    #[arg(long)]
+    export_corpus: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,6 +267,36 @@ fn main() {
         None => all_targets,
     };
     assert!(!selected.is_empty(), "unknown --target {:?}", args.target);
+
+    if let Some(corpus_root) = &args.export_corpus {
+        fs::create_dir_all(corpus_root).unwrap();
+        let mut dict_txt = String::new();
+        for (i, tok) in DICT_TOKENS.iter().enumerate() {
+            dict_txt.push_str(&format!("tok_{i}=\""));
+            for &b in *tok {
+                if (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+                    dict_txt.push(b as char);
+                } else {
+                    dict_txt.push_str(&format!("\\x{b:02x}"));
+                }
+            }
+            dict_txt.push_str("\"\n");
+        }
+        fs::write(corpus_root.join("s3d.dict"), dict_txt).unwrap();
+        for (name, _) in &selected {
+            let dir = corpus_root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            for (idx, seed) in initial_seed_corpus(name).into_iter().enumerate() {
+                fs::write(dir.join(format!("seed-{idx:03}.bin")), seed).unwrap();
+            }
+        }
+        eprintln!(
+            "[VR-7] Exported initial seed corpus & dictionary for {} targets to {}",
+            selected.len(),
+            corpus_root.display()
+        );
+        return;
+    }
 
     let budget = Duration::from_secs(args.duration_secs);
     eprintln!(

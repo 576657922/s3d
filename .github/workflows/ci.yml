@@ -1,0 +1,155 @@
+name: s3d Verification Gates (G1-G5 / VR-1..VR-10)
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  schedule:
+    # Nightly full gate at 02:00 UTC (VR-2 1M, VR-3 100k, VR-4 10k, VR-5 ALL 545, VR-7 cargo-fuzz 1h x 8)
+    - cron: "0 2 * * *"
+    # Weekly performance benchmark gate at 04:00 UTC Sunday (VR-9 NFR-1..NFR-6 + <=10% regression check)
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Gate tier to run (pr | nightly | perf)"
+        required: false
+        default: "pr"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  pr-gate:
+    name: PR Blocking Gate (Clippy, VR-1..3, VR-5 P0, VR-6, VR-8, VR-10 Miri)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable & nightly Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install nightly --profile minimal --component miri rust-src
+
+      - name: Set up Python 3.12 + ceph/s3-tests (5b39871) + boto3 1.44.1 + awscli v1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-venv python3-dev libxml2-dev libxslt1-dev
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip setuptools
+          .venv/bin/pip install \
+            "boto3==1.44.1" "botocore[crt]==1.44.1" "awscli" "PyYAML" \
+            "munch>=2.0.0" "gevent>=1.0" "isodate>=0.4.4" "requests>=2.23.0" \
+            "pytz" "httplib2" "lxml" "pytest"
+          if [ ! -d .cache/s3-tests ]; then
+            git clone https://github.com/ceph/s3-tests.git .cache/s3-tests
+            git -C .cache/s3-tests checkout 5b39871
+          fi
+          .venv/bin/pip install --no-deps -e .cache/s3-tests
+
+      - name: Run local/CI PR blocking gate (scripts/ci_gate.sh)
+        run: bash scripts/ci_gate.sh
+
+      - name: Archive PR JUnit & P0 ceiling reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-verification-reports
+          path: |
+            reports/ci-p0-junit.xml
+            reports/p0-ceiling-proof.json
+
+  nightly-deep-gate:
+    name: Nightly Deep Gate (VR-2 1M, VR-3 100k, VR-4 10k, VR-5 545 ALL, VR-7 1h x 8 Fuzz)
+    if: github.event.schedule == '0 2 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'nightly')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains & cargo-fuzz
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal --component llvm-tools-preview
+          cargo install cargo-fuzz
+
+      - name: Set up Python + ceph/s3-tests (5b39871)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-venv python3-dev
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip setuptools
+          .venv/bin/pip install \
+            "boto3==1.44.1" "botocore[crt]==1.44.1" "awscli" "PyYAML" \
+            "munch>=2.0.0" "gevent>=1.0" "isodate>=0.4.4" "requests>=2.23.0" \
+            "pytz" "httplib2" "lxml" "pytest"
+          if [ ! -d .cache/s3-tests ]; then
+            git clone https://github.com/ceph/s3-tests.git .cache/s3-tests
+            git -C .cache/s3-tests checkout 5b39871
+          fi
+          .venv/bin/pip install --no-deps -e .cache/s3-tests
+
+      - name: VR-2 Nightly 1,000,000 Differential Sequences
+        run: cargo test --release -p s3d-engine --test vr2_vr3 vr2_1m_sequences_nightly_gate -- --ignored --nocapture
+
+      - name: VR-3 Nightly 100,000 Mid-Syscall Power Cuts
+        run: cargo test --release -p s3d-engine --test vr2_vr3 vr3_100k_random_power_cuts_m3_gate -- --ignored --nocapture
+
+      - name: VR-4 Shuttle 10k + Loom + 10k WGL Linearizability
+        run: |
+          cargo test --release -p s3d-engine --test vr4_loom --nocapture
+          cargo test --release -p s3d-engine --test vr4_shuttle -- --ignored --nocapture
+          cargo test --release -p s3d-check --test vr4_wgl_http -- --ignored --nocapture
+
+      - name: VR-5 Full 545-Test ceph/s3-tests Regression Gate (G4)
+        run: |
+          cargo build --release -p s3d-server --bin s3d
+          .venv/bin/python scripts/run_s3tests_gate.py --select ALL --junitxml reports/nightly-all-junit.xml
+          .venv/bin/python scripts/check_junit.py \
+            reports/nightly-all-junit.xml \
+            --baseline tests/s3tests-passed.txt \
+            --deviations docs/deviations.md \
+            --min-passed 526
+
+      - name: VR-7 cargo-fuzz (libFuzzer) 1 Hour x 8 Targets
+        run: python3 scripts/run_libfuzzer_gate.py --seconds 3605 --report reports/vr7-cargo-fuzz-report.json
+
+      - name: Archive Nightly Verification Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-verification-reports
+          path: |
+            reports/nightly-all-junit.xml
+            reports/vr7-cargo-fuzz-report.json
+
+  weekly-perf-gate:
+    name: Weekly Performance Gate (VR-9 / NFR-1..NFR-6 + fio Baseline)
+    if: github.event.schedule == '0 4 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'perf')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust & fio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fio procps
+          rustup toolchain install stable --profile minimal
+
+      - name: Build release s3d & s3d-bench and run full NFR-1..NFR-6 gate
+        run: |
+          cargo build --release -p s3d-server -p s3d-bench
+          ./target/release/s3d-bench \
+            --s3d-bin ./target/release/s3d \
+            --put-get-secs 300 \
+            --report reports/weekly-bench.json
+
+      - name: Archive Weekly Benchmark Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-bench-report
+          path: reports/weekly-bench.json

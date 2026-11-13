@@ -5,6 +5,7 @@ use std::time::Duration;
 use s3d_types::{AccountRecord, ObjectOwnership, OwnerInfo, SecretKey, DEFAULT_MAX_OBJECT_SIZE};
 use serde::Deserialize;
 
+/// `NFR-15`: TOML configuration with CLI overrides; `deny_unknown_fields` rejects unknown keys.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -29,6 +30,8 @@ pub struct ServerConfig {
     pub log_format: String,
     pub reserved_disk_bytes: u64,
     pub lc_debug_interval_secs: Option<u64>,
+    pub tls_cert_file: Option<PathBuf>,
+    pub tls_key_file: Option<PathBuf>,
     #[serde(skip)]
     pub header_read_timeout: Duration,
     #[serde(skip)]
@@ -59,6 +62,8 @@ impl Default for ServerConfig {
             log_format: "json".to_string(),
             reserved_disk_bytes: 2 * 1024 * 1024 * 1024,
             lc_debug_interval_secs: None,
+            tls_cert_file: None,
+            tls_key_file: None,
             header_read_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
         }
@@ -104,6 +109,11 @@ impl ServerConfig {
         }
         if !matches!(self.log_format.as_str(), "json" | "pretty" | "compact") {
             return Err(format!("unsupported log_format '{}'", self.log_format));
+        }
+        if self.tls_cert_file.is_some() != self.tls_key_file.is_some() {
+            return Err(
+                "tls_cert_file and tls_key_file must both be set or both be omitted".into(),
+            );
         }
         Ok(())
     }

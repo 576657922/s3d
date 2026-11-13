@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-contained s3-tests runner for s3d milestone gates.
+"""Self-contained s3-tests runner for s3d milestone gates (`VR-5`).
 
 Starts release `s3d` on 127.0.0.1:28080 with all 6 accounts from `tests/s3test.conf`
 and `default_object_ownership = "ObjectWriter"` (per FR-51 / Q2), runs the selected
@@ -84,7 +84,7 @@ def main() -> int:
     ap.add_argument("--junitxml", type=Path, default=None)
     args = ap.parse_args()
 
-    s3d_bin = ROOT / "target" / "release" / "s3d"
+    s3d_bin = Path(os.environ.get("S3D_BIN", str(ROOT / "target" / "release" / "s3d")))
     if not s3d_bin.exists():
         print(f"Missing release binary: {s3d_bin}", file=sys.stderr)
         return 2
@@ -156,8 +156,24 @@ def main() -> int:
                 "}); "
                 "raise SystemExit(pytest.main(sys.argv[1:]))"
             )
+            py_bin = os.environ.get("S3TESTS_PYTHON")
+            if not py_bin:
+                default_py = ROOT / ".venv" / "bin" / "python"
+                if default_py.exists():
+                    try:
+                        if subprocess.run(
+                            [str(default_py), "-c", "import pytest, botocore"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        ).returncode == 0:
+                            py_bin = str(default_py)
+                    except OSError:
+                        py_bin = None
+            if not py_bin:
+                py_bin = sys.executable
+            s3tests_dir = Path(os.environ.get("S3TESTS_DIR", str(ROOT / ".cache" / "s3-tests")))
             pytest_cmd = [
-                str(ROOT / ".venv" / "bin" / "python"),
+                py_bin,
                 "-c",
                 runner_code,
                 *pytest_args,
@@ -166,9 +182,11 @@ def main() -> int:
             env = os.environ.copy()
             env["TZ"] = "UTC"
             env["S3TEST_CONF"] = str(ROOT / "tests" / "s3test.conf")
+            existing_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{s3tests_dir}:{existing_pp}" if existing_pp else str(s3tests_dir)
             pytest_res = subprocess.run(
                 pytest_cmd,
-                cwd=str(ROOT / ".cache" / "s3-tests"),
+                cwd=str(s3tests_dir),
                 env=env,
             )
         finally:

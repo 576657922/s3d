@@ -690,6 +690,10 @@ impl<D: Disk> Engine<D> {
             error!(seg_id = guard.seg_id(), offset, ?e, "segment write failed");
             S3Error::new(S3ErrorCode::InternalError, "Disk write error")
         })?;
+        const ASYNC_WRITEBACK_WINDOW: u64 = 16 * 1024 * 1024;
+        if (offset + frame_len) / ASYNC_WRITEBACK_WINDOW > offset / ASYNC_WRITEBACK_WINDOW {
+            guard.slot().file.hint_async_writeback();
+        }
 
         Ok((
             Extent {
@@ -5716,7 +5720,13 @@ impl<D: Disk> ObjectStore for Engine<D> {
                             };
                         }
                         ChecksumAlgorithm::Crc64Nvme => {}
-                        ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256 => {}
+                        ChecksumAlgorithm::Sha1
+                        | ChecksumAlgorithm::Sha256
+                        | ChecksumAlgorithm::Md5
+                        | ChecksumAlgorithm::Sha512
+                        | ChecksumAlgorithm::XxHash64
+                        | ChecksumAlgorithm::XxHash3
+                        | ChecksumAlgorithm::XxHash128 => {}
                     }
                 }
             }

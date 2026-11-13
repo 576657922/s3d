@@ -1,7 +1,14 @@
 /target/
 /.venv/
 /.cache/
+/.pytest_cache/
 /data/
 /*.conf
 /credentials.toml
 /.DS_Store
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/logs/
+__pycache__/
+*.pyc

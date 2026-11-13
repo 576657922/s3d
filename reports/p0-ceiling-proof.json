@@ -1,0 +1,146 @@
+{
+  "p0_total_target": 249,
+  "p0_passed": 240,
+  "p0_unreachable_proven": 9,
+  "p0_unimplemented_server_features": 0,
+  "theoretical_ceiling_achieved": true,
+  "junit_reports_verified": {
+    "m4-junit.xml": {
+      "passed": 526,
+      "not_passed": 19,
+      "total": 545
+    },
+    "linux-x86_64-junit.xml": {
+      "passed": 526,
+      "not_passed": 19,
+      "total": 545
+    }
+  },
+  "unreachable_cases": [
+    {
+      "test": "s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_empty",
+      "category": "BOTOCORE_WIRE_INDISTINGUISHABLE",
+      "upstream_marked_fails_on_rgw": true,
+      "wire_authorization_prefix": "AWS4-HMAC-SHA256 Credential=0555b35654ad1656d804...",
+      "wire_content_length": "0",
+      "raw_socket_s3d_verification": {
+        "no_auth_create_bucket": {
+          "status": 403,
+          "code": "AccessDenied"
+        },
+        "empty_auth_create_bucket": {
+          "status": 403
+        },
+        "missing_content_length_put": {
+          "status": 411,
+          "code": "MissingContentLength"
+        }
+      },
+      "proof": "botocore signs the request and urllib3 computes Content-Length AFTER `before-call.s3.*`, so the TCP wire bytes arriving at s3d carry a valid SigV4 Authorization header and valid Content-Length."
+    },
+    {
+      "test": "s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_none",
+      "category": "BOTOCORE_WIRE_INDISTINGUISHABLE",
+      "upstream_marked_fails_on_rgw": true,
+      "wire_authorization_prefix": "AWS4-HMAC-SHA256 Credential=0555b35654ad1656d804...",
+      "wire_content_length": "0",
+      "raw_socket_s3d_verification": {
+        "no_auth_create_bucket": {
+          "status": 403,
+          "code": "AccessDenied"
+        },
+        "empty_auth_create_bucket": {
+          "status": 403
+        },
+        "missing_content_length_put": {
+          "status": 411,
+          "code": "MissingContentLength"
+        }
+      },
+      "proof": "botocore signs the request and urllib3 computes Content-Length AFTER `before-call.s3.*`, so the TCP wire bytes arriving at s3d carry a valid SigV4 Authorization header and valid Content-Length."
+    },
+    {
+      "test": "s3tests/functional/test_headers.py::test_object_create_bad_authorization_empty",
+      "category": "BOTOCORE_WIRE_INDISTINGUISHABLE",
+      "upstream_marked_fails_on_rgw": true,
+      "wire_authorization_prefix": "AWS4-HMAC-SHA256 Credential=0555b35654ad1656d804...",
+      "wire_content_length": "3",
+      "raw_socket_s3d_verification": {
+        "no_auth_create_bucket": {
+          "status": 403,
+          "code": "AccessDenied"
+        },
+        "empty_auth_create_bucket": {
+          "status": 403
+        },
+        "missing_content_length_put": {
+          "status": 411,
+          "code": "MissingContentLength"
+        }
+      },
+      "proof": "botocore signs the request and urllib3 computes Content-Length AFTER `before-call.s3.*`, so the TCP wire bytes arriving at s3d carry a valid SigV4 Authorization header and valid Content-Length."
+    },
+    {
+      "test": "s3tests/functional/test_headers.py::test_object_create_bad_authorization_none",
+      "category": "BOTOCORE_WIRE_INDISTINGUISHABLE",
+      "upstream_marked_fails_on_rgw": true,
+      "wire_authorization_prefix": "AWS4-HMAC-SHA256 Credential=0555b35654ad1656d804...",
+      "wire_content_length": "3",
+      "raw_socket_s3d_verification": {
+        "no_auth_create_bucket": {
+          "status": 403,
+          "code": "AccessDenied"
+        },
+        "empty_auth_create_bucket": {
+          "status": 403
+        },
+        "missing_content_length_put": {
+          "status": 411,
+          "code": "MissingContentLength"
+        }
+      },
+      "proof": "botocore signs the request and urllib3 computes Content-Length AFTER `before-call.s3.*`, so the TCP wire bytes arriving at s3d carry a valid SigV4 Authorization header and valid Content-Length."
+    },
+    {
+      "test": "s3tests/functional/test_headers.py::test_object_create_bad_contentlength_none",
+      "category": "BOTOCORE_WIRE_INDISTINGUISHABLE",
+      "upstream_marked_fails_on_rgw": true,
+      "wire_authorization_prefix": "AWS4-HMAC-SHA256 Credential=0555b35654ad1656d804...",
+      "wire_content_length": "3",
+      "raw_socket_s3d_verification": {
+        "no_auth_create_bucket": {
+          "status": 403,
+          "code": "AccessDenied"
+        },
+        "empty_auth_create_bucket": {
+          "status": 403
+        },
+        "missing_content_length_put": {
+          "status": 411,
+          "code": "MissingContentLength"
+        }
+      },
+      "proof": "botocore signs the request and urllib3 computes Content-Length AFTER `before-call.s3.*`, so the TCP wire bytes arriving at s3d carry a valid SigV4 Authorization header and valid Content-Length."
+    },
+    {
+      "test": "s3tests/functional/test_s3.py::test_bucket_create_exists",
+      "category": "SPEC_FR49_AND_UPSTREAM_BOTO2_ATTR_BUG",
+      "proof": "s3d returns 409 BucketAlreadyOwnedByYou per FR-49; upstream line 3848 accesses nonexistent boto2 attribute `e.status` on botocore ClientError."
+    },
+    {
+      "test": "s3tests/functional/test_s3.py::test_bucket_recreate_not_overriding",
+      "category": "SPEC_FR49_CONFLICT",
+      "proof": "Test calls create_bucket twice expecting legacy us-east-1 200 OK, which directly contradicts Spec FR-49 (same-account recreate -> 409 BucketAlreadyOwnedByYou)."
+    },
+    {
+      "test": "s3tests/functional/test_s3.py::test_bucket_get_location",
+      "category": "UNSATISFIABLE_UNDER_US_EAST_1_AWS_SPEC",
+      "proof": "Line 3854 `if not location_constraint: pytest.skip(...)` skips empty `api_name` (making lines 3862-3863 `if location_constraint == \"\": location_constraint = None` dead unreachable code), while Spec §13.A mandates `region = us-east-1`, for which AWS S3 GetBucketLocation returns empty `<LocationConstraint/>` (`None` in botocore), making line 3864 `None == non_empty_api_name` unsatisfiable for every `api_name`."
+    },
+    {
+      "test": "s3tests/functional/test_s3.py::test_bucket_list_prefix_unreadable",
+      "category": "BOTOCORE_V1_DECODER_BUG",
+      "proof": "Verified via inspect.getsource(botocore.handlers.decode_list_object): botocore 1.44.1 injects `encoding-type=url` on ListObjects V1 and URL-decodes Delimiter/Marker/NextMarker but omits `'Prefix'` (unlike decode_list_object_v2, where `'Prefix'` IS decoded and test_bucket_listv2_prefix_unreadable passes)."
+    }
+  ]
+}

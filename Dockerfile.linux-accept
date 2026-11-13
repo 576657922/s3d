@@ -1,0 +1,35 @@
+# Linux x86-64 Acceptance Environment (Spec §1 / §9: Linux x86-64, 2 vCPU, 7 GB RAM)
+FROM --platform=linux/amd64 rust:1-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    fio \
+    git \
+    pkg-config \
+    procps \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools && \
+    /opt/venv/bin/pip install --no-cache-dir \
+        "boto3==1.44.1" \
+        "botocore[crt]==1.44.1" \
+        "awscli" \
+        "PyYAML" \
+        "munch>=2.0.0" \
+        "gevent>=1.0" \
+        "isodate>=0.4.4" \
+        "requests>=2.23.0" \
+        "pytz" \
+        "httplib2" \
+        "lxml" \
+        "pytest"
+
+ENV PATH="/opt/venv/bin:/usr/local/cargo/bin:${PATH}"
+WORKDIR /work

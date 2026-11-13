@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::{Disk, DiskError, DiskFile, DiskResult, OpenOpts};
@@ -54,6 +55,7 @@ impl OsDisk {
 
 pub struct OsFile {
     file: File,
+    bg_flushing: Arc<AtomicBool>,
 }
 
 impl DiskFile for OsFile {
@@ -76,6 +78,25 @@ impl DiskFile for OsFile {
     fn sync_data(&self) -> DiskResult<()> {
         self.file.sync_data().map_err(map_io_err)
     }
+
+    fn hint_async_writeback(&self) {
+        #[cfg(not(miri))]
+        if self
+            .bg_flushing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            if let Ok(dup) = self.file.try_clone() {
+                let flag = Arc::clone(&self.bg_flushing);
+                std::thread::spawn(move || {
+                    let _ = dup.sync_data();
+                    flag.store(false, Ordering::Release);
+                });
+            } else {
+                self.bg_flushing.store(false, Ordering::Release);
+            }
+        }
+    }
 }
 
 struct LockGuard {
@@ -95,7 +116,10 @@ impl Disk for OsDisk {
             .create_new(opts.create_new)
             .truncate(opts.truncate);
         let file = std_opts.open(full).map_err(map_io_err)?;
-        Ok(OsFile { file })
+        Ok(OsFile {
+            file,
+            bg_flushing: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     fn rename(&self, from: &str, to: &str) -> DiskResult<()> {
@@ -193,7 +217,8 @@ fn statvfs_available_bytes(path: &Path) -> DiskResult<u64> {
     Ok((stat.f_bavail as u64).saturating_mul(frsize))
 }
 
-/// Isolated FFI wrapper enabling `F_NOCACHE` on macOS (`VR-10` audited).
+/// Isolated FFI wrapper enabling OS page-cache bypass (`F_NOCACHE` on macOS,
+/// `POSIX_FADV_DONTNEED` on Linux; `VR-10` audited).
 #[allow(unsafe_code)]
 fn set_fd_nocache(file: &File) -> DiskResult<()> {
     #[cfg(target_os = "macos")]
@@ -207,7 +232,18 @@ fn set_fd_nocache(file: &File) -> DiskResult<()> {
             return Err(DiskError::IoError);
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let fd = file.as_raw_fd();
+        // SAFETY: `file` is an open `std::fs::File` whose raw file descriptor `fd` remains valid
+        // for the duration of this call; `posix_fadvise` only advises the kernel page cache for
+        // `(offset=0, len=0)` and does not alias or mutate any Rust memory.
+        let rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+        if rc != 0 {
+            return Err(DiskError::IoError);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = file;
     }

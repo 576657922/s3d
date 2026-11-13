@@ -11,8 +11,9 @@ use s3d_types::{
     VerifiedBodyStream, VerifiedDigests,
 };
 
-/// Streaming request body wrapper implementing `VerifiedBodyStream` (`PR-12`, `PR-13`, `PR-27`).
-/// Never polls `Incoming` until `poll_next_chunk` is invoked by the engine!
+/// Streaming request body wrapper implementing `VerifiedBodyStream` (`PR-11`, `PR-12`, `PR-13`, `PR-14`, `PR-27`).
+/// Supports both `Content-Length` and HTTP/1.1 `Transfer-Encoding: chunked` (`PR-14`),
+/// and never polls `Incoming` until `poll_next_chunk` is invoked by the engine!
 pub struct HyperVerifiedBodyStream {
     incoming: Incoming,
     incoming_eof: bool,
@@ -137,17 +138,14 @@ impl HyperVerifiedBodyStream {
 }
 
 fn alg_from_trailer_hdr(name: &str) -> StoreResult<ChecksumAlgorithm> {
-    match name {
-        "x-amz-checksum-crc32" => Ok(ChecksumAlgorithm::Crc32),
-        "x-amz-checksum-crc32c" => Ok(ChecksumAlgorithm::Crc32c),
-        "x-amz-checksum-crc64nvme" => Ok(ChecksumAlgorithm::Crc64Nvme),
-        "x-amz-checksum-sha1" => Ok(ChecksumAlgorithm::Sha1),
-        "x-amz-checksum-sha256" => Ok(ChecksumAlgorithm::Sha256),
-        _ => Err(S3Error::new(
-            S3ErrorCode::InvalidRequest,
-            "Unsupported checksum trailer header",
-        )),
-    }
+    name.strip_prefix("x-amz-checksum-")
+        .and_then(ChecksumAlgorithm::from_aws_str)
+        .ok_or_else(|| {
+            S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "Unsupported checksum trailer header",
+            )
+        })
 }
 
 pub fn map_body_err(err: BodyStreamError) -> S3Error {

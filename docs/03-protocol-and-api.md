@@ -64,7 +64,7 @@ S3 在对象 key 解码与 SigV4 规范路径上与通用 Web 框架不同，严
         ├─ 无 TRAILER 模式：读末尾 `\r\n` → [Done]
         └─ 带 TRAILER 模式：进入 [ReadTrailers]
              ├─ 读取 `<lower-header-name>:<value>\r\n` 直至空行 `\r\n`（仅允许 1 个尾部块）
-             ├─ 核对尾部头名必须与请求头 `x-amz-trailer` 声明一致，且仅限 crc32/crc32c/crc64nvme/sha1/sha256（PR-27）
+             ├─ 核对尾部头名必须与请求头 `x-amz-trailer` 声明一致，支持全部 10 种算法 `crc32`/`crc32c`/`crc64nvme`/`sha1`/`sha256`/`md5`/`sha512`/`xxhash64`/`xxhash3`/`xxhash128`（PR-20, PR-27）
              ├─ P1 签名模式验证 `x-amz-trailer-signature`（种子为 0 长度末块的签名）
              └─ 比对流式累积出的摘要与尾部声明值（不符 → 400 BadDigest，PR-21）→ [Done]
 ```
@@ -287,3 +287,11 @@ $$\text{CRC}(A \Vert B) = T^{8 \cdot \text{len}_B}\!\left(\text{CRC}(A)\right) \
   1. `<TargetBucket>` 必须存在于当前实例（不存在 → `400 InvalidTargetBucketForLogging`），且拥有者必须与源桶拥有者属于同一账号（跨账号 → `400 InvalidTargetBucketForLogging`）。
   2. `<TargetObjectKeyFormat>` 缺省自动归一化为 `<SimplePrefix/>`；支持 `<SimplePrefix/>` 与 `<PartitionedPrefix><PartitionDateSource>DeliveryTime|EventTime</PartitionDateSource></PartitionedPrefix>`；完整持久化并按序回放 `<TargetGrants>`（校验被授权邮箱/ID 存在性，不存在 → `400 InvalidTargetBucketForLogging`）。
   3. 当目标桶启用桶策略授权而非传统日志组 ACL 时，以服务主体 `Principal = {"Service": "logging.s3.amazonaws.com"}`、`Action = "s3:PutObject"`、`Resource = "arn:aws:s3:::{target_bucket}/{target_prefix}*"` 及条件上下文 `aws:SourceArn = "arn:aws:s3:::{source_bucket}"`、`aws:SourceAccount = "{source_owner_id}"` 对目标桶策略求值；若未获 `Allow`（或命中 `Deny`）且无日志写 ACL，则返回 `403 CrossLocationLoggingProhibited` / `InvalidTargetBucketForLogging`。
+
+### 7.5 P2 扩展校验和（`PR-20` / `Q6`）与原生 HTTPS / TLS 监听（`Q5`）
+
+1. **五种 P2 校验和全链路支持（共 10 种 `ChecksumAlgorithm`）**：
+   - 在 P0 五种算法（`CRC32`、`CRC32C`、`CRC64NVME`、`SHA1`、`SHA256`）基础上，完整支持 P2 五种扩展算法：`MD5`（128-bit）、`SHA512`（512-bit）、`XXHASH64`（64-bit 大端，seed `0`）、`XXHASH3`（64-bit 大端）、`XXHASH128`（128-bit 大端）。
+   - 覆盖单流 `PutObject`、`aws-chunked` 尾部校验和头（`x-amz-checksum-<alg>`）、`GetObject` / `HeadObject`（`x-amz-checksum-mode: ENABLED`）、`GetObjectAttributes`（`<Checksum><ChecksumSHA512>...` 等）及分片上传 `COMPOSITE` 模式（对这 5 种非线性哈希算法请求 `FULL_OBJECT` 分片类型时统一返回 `400 InvalidRequest`）。
+2. **原生 HTTPS / TLS 监听（`tokio-rustls` + `ring`，`Q5`）**：
+   - `s3d.toml` 与命令行同时提供 `tls_cert_file` / `--tls-cert-file`（PEM 证书链）与 `tls_key_file` / `--tls-key-file`（PKCS#8 / PKCS#1 / SEC1 私钥）时，S3 数据面自动切换为 TLS 1.2 / TLS 1.3 加密监听（仅配置其中一项时在启动阶段报错退出，遵循 `NFR-15` 严格配置校验）；连接并发信号量、30s 握手/读头超时与 60s 空闲连接回收（`NFR-9`）在 TLS 层之上一致生效。

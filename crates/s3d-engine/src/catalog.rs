@@ -74,6 +74,7 @@ impl<D: Disk> Drop for InflightWriteGuard<D> {
 
 impl<D: Disk> SegmentSlot<D> {
     fn reclaim_now(&self) {
+        // [ST-9] Object keys never map to filesystem paths; on-disk filenames use numeric IDs only
         let path = format!("seg/{:08}.seg", self.seg_id);
         let _ = self.disk.remove_file(&path);
         let _ = self.disk.sync_dir("seg");
@@ -413,13 +414,12 @@ impl<D: Disk> AsyncByteReader for EngineByteReader<D> {
             )));
         }
 
+        let start = 12 + rs.rel_s;
+        let end = 12 + rs.rel_e;
         if let (Some((iv, ctr_off)), Some(cipher)) = (rs.ctr, &self.cipher) {
-            let mut dec = raw[(12 + rs.rel_s)..(12 + rs.rel_e)].to_vec();
-            aes256_ctr_xor_with_cipher(cipher, &iv, ctr_off, &mut dec);
-            Poll::Ready(Ok(Some(Bytes::from(dec))))
-        } else {
-            let out = Bytes::from(raw).slice((12 + rs.rel_s)..(12 + rs.rel_e));
-            Poll::Ready(Ok(Some(out)))
+            aes256_ctr_xor_with_cipher(cipher, &iv, ctr_off, &mut raw[start..end]);
         }
+        let out = Bytes::from(raw).slice(start..end);
+        Poll::Ready(Ok(Some(out)))
     }
 }

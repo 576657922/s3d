@@ -57,12 +57,24 @@ def run_aws(aws_bin: str, endpoint: str, args: list[str], env: dict[str, str]) -
 
 
 def main() -> int:
-    s3d_bin = ROOT / "target" / "release" / "s3d"
+    s3d_bin = Path(os.environ.get("S3D_BIN", str(ROOT / "target" / "release" / "s3d")))
     if not s3d_bin.exists():
         raise SystemExit(f"Missing release binary: {s3d_bin}")
 
-    aws_bin = str(ROOT / ".venv" / "bin" / "aws")
-    if not Path(aws_bin).exists():
+    aws_bin = os.environ.get("AWS_BIN")
+    if not aws_bin:
+        cand = ROOT / ".venv" / "bin" / "aws"
+        if cand.exists():
+            try:
+                if subprocess.run(
+                    [str(cand), "--version"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ).returncode == 0:
+                    aws_bin = str(cand)
+            except OSError:
+                aws_bin = None
+    if not aws_bin:
         found = shutil.which("aws")
         if not found:
             raise SystemExit("awscli v1 binary not found in .venv/bin/aws or PATH")

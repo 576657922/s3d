@@ -86,6 +86,9 @@ pub trait DiskFile: Send + Sync + 'static {
         Ok(self.len()? == 0)
     }
     fn sync_data(&self) -> DiskResult<()>;
+    /// Non-blocking hint to start background OS writeback of dirty pages written so far.
+    /// No-op on `FaultDisk` so `VR-3` / `Shuttle` / `Loom` remain 100% deterministic.
+    fn hint_async_writeback(&self) {}
 }
 
 pub trait Disk: Clone + Send + Sync + 'static {

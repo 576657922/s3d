@@ -242,6 +242,8 @@ impl SigV4Verifier {
             ));
         }
 
+        // [PR-8] Unknown AK -> 403 InvalidAccessKeyId; malformed header -> 400 AuthorizationHeaderMalformed;
+        // signature mismatch -> 403 SignatureDoesNotMatch
         let account = self.by_access_key.get(&ak).ok_or_else(|| {
             S3Error::new(
                 S3ErrorCode::InvalidAccessKeyId,
@@ -383,6 +385,8 @@ impl SigV4Verifier {
         }
 
         let (ak, date_yyyymmdd, scope) = self.parse_and_check_credential(cred)?;
+        // [PR-8] Unknown AK -> 403 InvalidAccessKeyId; malformed header -> 400 AuthorizationHeaderMalformed;
+        // signature mismatch -> 403 SignatureDoesNotMatch
         let account = self.by_access_key.get(&ak).ok_or_else(|| {
             S3Error::new(
                 S3ErrorCode::InvalidAccessKeyId,

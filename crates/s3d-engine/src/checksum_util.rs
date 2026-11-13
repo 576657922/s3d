@@ -1,8 +1,11 @@
 use base64::Engine as _;
 use crc32fast::Hasher as Crc32Hasher;
-use sha1::{Digest as _, Sha1};
-use sha2::Sha256;
+use md5::{Digest as _, Md5};
 use s3d_types::{ChecksumAlgorithm, S3Error, S3ErrorCode, StoreResult};
+use sha1::Sha1;
+use sha2::{Sha256, Sha512};
+use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh64::Xxh64;
 
 pub enum ActiveHasher {
     Crc32(Crc32Hasher),
@@ -10,6 +13,11 @@ pub enum ActiveHasher {
     Crc64Nvme(crc64fast_nvme::Digest),
     Sha1(Sha1),
     Sha256(Sha256),
+    Md5(Md5),
+    Sha512(Box<Sha512>),
+    XxHash64(Box<Xxh64>),
+    XxHash3(Box<Xxh3>),
+    XxHash128(Box<Xxh3>),
 }
 
 impl ActiveHasher {
@@ -20,6 +28,11 @@ impl ActiveHasher {
             ChecksumAlgorithm::Crc64Nvme => Self::Crc64Nvme(crc64fast_nvme::Digest::new()),
             ChecksumAlgorithm::Sha1 => Self::Sha1(Sha1::new()),
             ChecksumAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
+            ChecksumAlgorithm::Md5 => Self::Md5(Md5::new()),
+            ChecksumAlgorithm::Sha512 => Self::Sha512(Box::new(Sha512::new())),
+            ChecksumAlgorithm::XxHash64 => Self::XxHash64(Box::new(Xxh64::new(0))),
+            ChecksumAlgorithm::XxHash3 => Self::XxHash3(Box::new(Xxh3::new())),
+            ChecksumAlgorithm::XxHash128 => Self::XxHash128(Box::new(Xxh3::new())),
         }
     }
 
@@ -30,6 +43,10 @@ impl ActiveHasher {
             Self::Crc64Nvme(d) => d.write(data),
             Self::Sha1(h) => h.update(data),
             Self::Sha256(h) => h.update(data),
+            Self::Md5(h) => h.update(data),
+            Self::Sha512(h) => h.update(data),
+            Self::XxHash64(h) => h.update(data),
+            Self::XxHash3(h) | Self::XxHash128(h) => h.update(data),
         }
     }
 
@@ -41,6 +58,11 @@ impl ActiveHasher {
             Self::Crc64Nvme(d) => b64.encode(d.sum64().to_be_bytes()),
             Self::Sha1(h) => b64.encode(h.finalize()),
             Self::Sha256(h) => b64.encode(h.finalize()),
+            Self::Md5(h) => b64.encode(h.finalize()),
+            Self::Sha512(h) => b64.encode(h.finalize()),
+            Self::XxHash64(h) => b64.encode(h.digest().to_be_bytes()),
+            Self::XxHash3(h) => b64.encode(h.digest().to_be_bytes()),
+            Self::XxHash128(h) => b64.encode(h.digest128().to_be_bytes()),
         }
     }
 }

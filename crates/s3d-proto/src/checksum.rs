@@ -10,7 +10,9 @@ use s3d_types::{
     StoreResult, VerifiedDigests,
 };
 use sha1::Sha1;
-use sha2::Sha256;
+use sha2::{Sha256, Sha512};
+use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh64::Xxh64;
 
 pub enum ActiveHasher {
     Crc32(Crc32Hasher),
@@ -18,6 +20,11 @@ pub enum ActiveHasher {
     Crc64Nvme(crc64fast_nvme::Digest),
     Sha1(Sha1),
     Sha256(Sha256),
+    Md5(Md5),
+    Sha512(Box<Sha512>),
+    XxHash64(Box<Xxh64>),
+    XxHash3(Box<Xxh3>),
+    XxHash128(Box<Xxh3>),
 }
 
 impl ActiveHasher {
@@ -28,6 +35,11 @@ impl ActiveHasher {
             ChecksumAlgorithm::Crc64Nvme => Self::Crc64Nvme(crc64fast_nvme::Digest::new()),
             ChecksumAlgorithm::Sha1 => Self::Sha1(Sha1::new()),
             ChecksumAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
+            ChecksumAlgorithm::Md5 => Self::Md5(Md5::new()),
+            ChecksumAlgorithm::Sha512 => Self::Sha512(Box::new(Sha512::new())),
+            ChecksumAlgorithm::XxHash64 => Self::XxHash64(Box::new(Xxh64::new(0))),
+            ChecksumAlgorithm::XxHash3 => Self::XxHash3(Box::new(Xxh3::new())),
+            ChecksumAlgorithm::XxHash128 => Self::XxHash128(Box::new(Xxh3::new())),
         }
     }
 
@@ -38,6 +50,10 @@ impl ActiveHasher {
             Self::Crc64Nvme(d) => d.write(data),
             Self::Sha1(h) => h.update(data),
             Self::Sha256(h) => h.update(data),
+            Self::Md5(h) => h.update(data),
+            Self::Sha512(h) => h.update(data),
+            Self::XxHash64(h) => h.update(data),
+            Self::XxHash3(h) | Self::XxHash128(h) => h.update(data),
         }
     }
 
@@ -49,6 +65,11 @@ impl ActiveHasher {
             Self::Crc64Nvme(d) => b64.encode(d.sum64().to_be_bytes()),
             Self::Sha1(h) => b64.encode(h.finalize()),
             Self::Sha256(h) => b64.encode(h.finalize()),
+            Self::Md5(h) => b64.encode(h.finalize()),
+            Self::Sha512(h) => b64.encode(h.finalize()),
+            Self::XxHash64(h) => b64.encode(h.digest().to_be_bytes()),
+            Self::XxHash3(h) => b64.encode(h.digest().to_be_bytes()),
+            Self::XxHash128(h) => b64.encode(h.digest128().to_be_bytes()),
         }
     }
 }
@@ -65,12 +86,7 @@ pub fn parse_content_md5_header(raw: &str) -> StoreResult<[u8; 16]> {
 
 /// Validate base64 format & expected byte length of `x-amz-checksum-<alg>`.
 pub fn validate_checksum_b64_format(alg: ChecksumAlgorithm, b64_val: &str) -> StoreResult<()> {
-    let expected_len = match alg {
-        ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c => 4,
-        ChecksumAlgorithm::Crc64Nvme => 8,
-        ChecksumAlgorithm::Sha1 => 20,
-        ChecksumAlgorithm::Sha256 => 32,
-    };
+    let expected_len = alg.digest_byte_len();
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(b64_val.trim())
         .map_err(|_| {
@@ -206,6 +222,7 @@ impl StreamingDigestVerifier {
         expected_sha256: Option<[u8; 32]>,
         checksum_spec: Option<(ChecksumAlgorithm, Option<String>)>,
     ) -> Self {
+        // [PR-22] Default to full-object CRC64NVME integrity calculation when client omits checksum headers
         let (alg, expected_b64, client_req) = match checksum_spec {
             Some((a, exp)) => (a, exp, true),
             None => (ChecksumAlgorithm::Crc64Nvme, None, false),

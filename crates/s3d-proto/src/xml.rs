@@ -7,6 +7,7 @@ use s3d_types::*;
 use crate::sigv4::format_iso8601_millis;
 use crate::uri::{aws_uri_encode, percent_decode_query_component};
 
+/// Fixed S3 XML namespace (`PR-16`); timestamps inside XML use UTC ISO-8601 milliseconds (`format_iso8601_millis`).
 pub const S3_XML_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// Reject DTD / XXE constructs unconditionally (`NFR-8`).
@@ -72,6 +73,116 @@ pub fn render_error_xml(err: &S3Error, request_id: &str, host_id: &str) -> Strin
     xml
 }
 
+/// Normalized XML event token stream compatible with `quick-xml 0.42`, coalescing
+/// `Event::Text`, `Event::GeneralRef`, and `Event::CData` while rejecting DTD/XXE (`PR-24`).
+#[derive(Debug)]
+pub(crate) enum XmlTok {
+    Start {
+        local: String,
+        type_attr: Option<String>,
+    },
+    Empty {
+        local: String,
+    },
+    Text(String),
+    End {
+        local: String,
+    },
+}
+
+pub(crate) fn read_xml_tokens<E>(
+    body: &[u8],
+    trim_text: bool,
+    make_err: E,
+) -> StoreResult<Vec<XmlTok>>
+where
+    E: Fn() -> S3Error,
+{
+    check_no_dtd_or_entity(body)?;
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut tokens = Vec::new();
+    let mut pending_text = String::new();
+    let mut has_pending_text = false;
+
+    let flush_text = |pending: &mut String, has_pending: &mut bool, out: &mut Vec<XmlTok>| {
+        if *has_pending {
+            let taken = std::mem::take(pending);
+            *has_pending = false;
+            if trim_text {
+                let trimmed = taken.trim();
+                if !trimmed.is_empty() {
+                    out.push(XmlTok::Text(trimmed.to_string()));
+                }
+            } else if !taken.is_empty() {
+                out.push(XmlTok::Text(taken));
+            }
+        }
+    };
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                flush_text(&mut pending_text, &mut has_pending_text, &mut tokens);
+                let local = e.local_name().as_ref().to_string();
+                let mut type_attr = None;
+                for attr in e.attributes().flatten() {
+                    let key = attr.key.as_ref();
+                    if (key == "type" || key.ends_with(":type"))
+                        && let Ok(v) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    {
+                        type_attr = Some(v.into_owned());
+                    }
+                }
+                tokens.push(XmlTok::Start { local, type_attr });
+            }
+            Ok(Event::Empty(e)) => {
+                flush_text(&mut pending_text, &mut has_pending_text, &mut tokens);
+                let local = e.local_name().as_ref().to_string();
+                tokens.push(XmlTok::Empty { local });
+            }
+            Ok(Event::End(e)) => {
+                flush_text(&mut pending_text, &mut has_pending_text, &mut tokens);
+                let local = e.local_name().as_ref().to_string();
+                tokens.push(XmlTok::End { local });
+            }
+            Ok(Event::Text(t)) => {
+                pending_text.push_str(&t.xml10_content());
+                has_pending_text = true;
+            }
+            Ok(Event::CData(c)) => {
+                pending_text.push_str(&c);
+                has_pending_text = true;
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if let Some(ch) = r.resolve_char_ref().map_err(|_| make_err())? {
+                    pending_text.push(ch);
+                } else {
+                    match r.as_ref() {
+                        "lt" => pending_text.push('<'),
+                        "gt" => pending_text.push('>'),
+                        "amp" => pending_text.push('&'),
+                        "apos" => pending_text.push('\''),
+                        "quot" => pending_text.push('"'),
+                        _ => return Err(make_err()),
+                    }
+                }
+                has_pending_text = true;
+            }
+            Ok(Event::DocType(_)) => return Err(make_err()),
+            Ok(Event::Eof) => {
+                flush_text(&mut pending_text, &mut has_pending_text, &mut tokens);
+                break;
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_)) => {}
+            Err(_) => return Err(make_err()),
+        }
+        buf.clear();
+    }
+    Ok(tokens)
+}
+
 /// Parse optional `CreateBucketConfiguration` XML body; returns `Option<LocationConstraint>`.
 pub fn parse_create_bucket_xml(body: &[u8]) -> StoreResult<Option<String>> {
     if body.len() > 1024 * 1024 {
@@ -80,45 +191,33 @@ pub fn parse_create_bucket_xml(body: &[u8]) -> StoreResult<Option<String>> {
     if body.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(None);
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
     let mut saw_root = false;
     let mut in_location = false;
     let mut location = None;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local = e.local_name();
-                match local.as_ref() {
-                    b"CreateBucketConfiguration" => saw_root = true,
-                    b"LocationConstraint" if saw_root => in_location = true,
-                    _ => {}
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() == b"CreateBucketConfiguration" {
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "CreateBucketConfiguration" => saw_root = true,
+                "LocationConstraint" if saw_root => in_location = true,
+                _ => {}
+            },
+            XmlTok::Empty { local } => {
+                if local == "CreateBucketConfiguration" {
                     saw_root = true;
-                } else if e.local_name().as_ref() == b"LocationConstraint" && saw_root {
+                } else if local == "LocationConstraint" && saw_root {
                     location = Some(String::new());
                 }
             }
-            Ok(Event::Text(t)) if in_location => {
-                let s = t.unescape().map_err(|_| malformed_xml())?.to_string();
+            XmlTok::Text(s) if in_location => {
                 location = Some(s);
             }
-            Ok(Event::End(e)) => {
-                if e.local_name().as_ref() == b"LocationConstraint" {
-                    in_location = false;
-                }
+            XmlTok::End { local } if local == "LocationConstraint" => {
+                in_location = false;
             }
-            Ok(Event::Eof) => break,
-            Err(_) => return Err(malformed_xml()),
             _ => {}
         }
-        buf.clear();
     }
 
     if !saw_root {
@@ -132,10 +231,7 @@ pub fn parse_delete_objects_xml(body: &[u8]) -> StoreResult<(bool, Vec<DeleteObj
     if body.is_empty() || body.len() > 1024 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, false, malformed_xml)?;
 
     let mut saw_delete = false;
     let mut quiet = false;
@@ -147,29 +243,29 @@ pub fn parse_delete_objects_xml(body: &[u8]) -> StoreResult<(bool, Vec<DeleteObj
     let mut cur_vid: Option<String> = None;
     let mut cur_etag: Option<String> = None;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                match name.as_str() {
-                    "Delete" => saw_delete = true,
-                    "Object" if saw_delete => {
-                        in_object = true;
-                        cur_key = None;
-                        cur_vid = None;
-                        cur_etag = None;
-                    }
-                    _ => cur_tag = name,
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "Delete" => saw_delete = true,
+                "Object" if saw_delete => {
+                    in_object = true;
+                    cur_key = None;
+                    cur_vid = None;
+                    cur_etag = None;
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                if in_object && name == "Key" {
+                _ => {
+                    if in_object && local == "Key" {
+                        cur_key.get_or_insert_with(String::new);
+                    }
+                    cur_tag = local;
+                }
+            },
+            XmlTok::Empty { local } => {
+                if in_object && local == "Key" {
                     cur_key = Some(String::new());
                 }
             }
-            Ok(Event::Text(t)) => {
-                let txt = t.unescape().map_err(|_| malformed_xml())?.to_string();
+            XmlTok::Text(txt) => {
                 if in_object {
                     match cur_tag.as_str() {
                         "Key" => *cur_key.get_or_insert_with(String::new) += &txt,
@@ -181,9 +277,8 @@ pub fn parse_delete_objects_xml(body: &[u8]) -> StoreResult<(bool, Vec<DeleteObj
                     quiet = txt.trim().eq_ignore_ascii_case("true");
                 }
             }
-            Ok(Event::End(e)) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                if name == "Object" && in_object {
+            XmlTok::End { local } => {
+                if local == "Object" && in_object {
                     let key = cur_key.take().ok_or_else(malformed_xml)?;
                     items.push(DeleteObjectsItem {
                         key,
@@ -194,11 +289,7 @@ pub fn parse_delete_objects_xml(body: &[u8]) -> StoreResult<(bool, Vec<DeleteObj
                 }
                 cur_tag.clear();
             }
-            Ok(Event::Eof) => break,
-            Err(_) => return Err(malformed_xml()),
-            _ => {}
         }
-        buf.clear();
     }
 
     if !saw_delete || items.is_empty() {
@@ -540,47 +631,37 @@ pub fn parse_bucket_versioning_xml(body: &[u8]) -> StoreResult<VersioningStatus>
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut cur_tag = String::new();
     let mut status_str: Option<String> = None;
     let mut mfa_delete_str: Option<String> = None;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                if name == "VersioningConfiguration" {
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => {
+                if local == "VersioningConfiguration" {
                     saw_root = true;
                 } else if saw_root {
-                    cur_tag = name;
+                    cur_tag = local;
                 }
             }
-            Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() == b"VersioningConfiguration" {
+            XmlTok::Empty { local } => {
+                if local == "VersioningConfiguration" {
                     saw_root = true;
                 }
             }
-            Ok(Event::Text(t)) if saw_root => {
-                let txt = t.unescape().map_err(|_| malformed_xml())?.to_string();
-                match cur_tag.as_str() {
-                    "Status" => status_str = Some(txt),
-                    "MfaDelete" => mfa_delete_str = Some(txt),
-                    _ => {}
-                }
-            }
-            Ok(Event::End(_)) => {
+            XmlTok::Text(txt) if saw_root => match cur_tag.as_str() {
+                "Status" => status_str = Some(txt),
+                "MfaDelete" => mfa_delete_str = Some(txt),
+                _ => {}
+            },
+            XmlTok::End { .. } => {
                 cur_tag.clear();
             }
-            Ok(Event::Eof) => break,
-            Err(_) => return Err(malformed_xml()),
             _ => {}
         }
-        buf.clear();
     }
 
     if !saw_root {
@@ -637,10 +718,7 @@ pub fn parse_complete_multipart_xml(body: &[u8]) -> StoreResult<Vec<CompletePart
     if body.is_empty() || body.len() > 2 * 1024 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut in_part = false;
@@ -651,43 +729,41 @@ pub fn parse_complete_multipart_xml(body: &[u8]) -> StoreResult<Vec<CompletePart
     let mut cur_csum: Option<(ChecksumAlgorithm, String)> = None;
     let mut parts = Vec::new();
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                match name.as_str() {
-                    "CompleteMultipartUpload" => saw_root = true,
-                    "Part" if saw_root => {
-                        in_part = true;
-                        cur_part_num = None;
-                        cur_etag = None;
-                        cur_csum = None;
-                    }
-                    _ if in_part => cur_tag = name,
-                    _ => {}
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "CompleteMultipartUpload" => saw_root = true,
+                "Part" if saw_root => {
+                    in_part = true;
+                    cur_part_num = None;
+                    cur_etag = None;
+                    cur_csum = None;
                 }
-            }
-            Ok(Event::Text(t)) if in_part => {
-                let txt = t.unescape().map_err(|_| malformed_xml())?.to_string();
-                match cur_tag.as_str() {
-                    "PartNumber" => {
-                        let pn = txt.trim().parse::<u32>().map_err(|_| malformed_xml())?;
-                        cur_part_num = Some(pn);
-                    }
-                    "ETag" => {
-                        cur_etag = Some(txt.trim().to_string());
-                    }
-                    "ChecksumCRC32" => cur_csum = Some((ChecksumAlgorithm::Crc32, txt.trim().to_string())),
-                    "ChecksumCRC32C" => cur_csum = Some((ChecksumAlgorithm::Crc32c, txt.trim().to_string())),
-                    "ChecksumCRC64NVME" => cur_csum = Some((ChecksumAlgorithm::Crc64Nvme, txt.trim().to_string())),
-                    "ChecksumSHA1" => cur_csum = Some((ChecksumAlgorithm::Sha1, txt.trim().to_string())),
-                    "ChecksumSHA256" => cur_csum = Some((ChecksumAlgorithm::Sha256, txt.trim().to_string())),
-                    _ => {}
+                _ if in_part => cur_tag = local,
+                _ => {}
+            },
+            XmlTok::Text(txt) if in_part => match cur_tag.as_str() {
+                "PartNumber" => {
+                    let pn = txt.trim().parse::<u32>().map_err(|_| malformed_xml())?;
+                    cur_part_num = Some(pn);
                 }
-            }
-            Ok(Event::End(e)) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                if name == "Part" && in_part {
+                "ETag" => {
+                    cur_etag = Some(txt.trim().to_string());
+                }
+                "ChecksumCRC32" => cur_csum = Some((ChecksumAlgorithm::Crc32, txt.trim().to_string())),
+                "ChecksumCRC32C" => cur_csum = Some((ChecksumAlgorithm::Crc32c, txt.trim().to_string())),
+                "ChecksumCRC64NVME" => cur_csum = Some((ChecksumAlgorithm::Crc64Nvme, txt.trim().to_string())),
+                "ChecksumSHA1" => cur_csum = Some((ChecksumAlgorithm::Sha1, txt.trim().to_string())),
+                "ChecksumSHA256" => cur_csum = Some((ChecksumAlgorithm::Sha256, txt.trim().to_string())),
+                "ChecksumMD5" => cur_csum = Some((ChecksumAlgorithm::Md5, txt.trim().to_string())),
+                "ChecksumSHA512" => cur_csum = Some((ChecksumAlgorithm::Sha512, txt.trim().to_string())),
+                "ChecksumXXHASH64" => cur_csum = Some((ChecksumAlgorithm::XxHash64, txt.trim().to_string())),
+                "ChecksumXXHASH3" => cur_csum = Some((ChecksumAlgorithm::XxHash3, txt.trim().to_string())),
+                "ChecksumXXHASH128" => cur_csum = Some((ChecksumAlgorithm::XxHash128, txt.trim().to_string())),
+                _ => {}
+            },
+            XmlTok::End { local } => {
+                if local == "Part" && in_part {
                     let part_number = cur_part_num.take().ok_or_else(malformed_xml)?;
                     let etag = cur_etag.take().ok_or_else(malformed_xml)?;
                     parts.push(CompletePartSpec {
@@ -699,11 +775,8 @@ pub fn parse_complete_multipart_xml(body: &[u8]) -> StoreResult<Vec<CompletePart
                 }
                 cur_tag.clear();
             }
-            Ok(Event::Eof) => break,
-            Err(_) => return Err(malformed_xml()),
             _ => {}
         }
-        buf.clear();
     }
 
     if !saw_root || parts.is_empty() {
@@ -1043,9 +1116,6 @@ where
         return Err(malformed_xml());
     }
     check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
 
     let mut saw_root = false;
     let mut in_owner = false;
@@ -1078,90 +1148,66 @@ where
             "The XML you provided was not well-formed or did not validate against our published schema",
         )
     };
+    let tokens = read_xml_tokens(body, true, malformed_acl)?;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "AccessControlPolicy" if !saw_root => saw_root = true,
-                    "Owner" if saw_root && !in_acl_list => in_owner = true,
-                    "AccessControlList" if saw_root && !in_owner => in_acl_list = true,
-                    "Grant" if in_acl_list && !in_grant => {
-                        in_grant = true;
-                        grantee_type = None;
-                        grantee_id = None;
-                        grantee_email = None;
-                        grantee_uri = None;
-                        grant_perm = None;
-                    }
-                    "Grantee" if in_grant && !in_grantee => {
-                        in_grantee = true;
-                        for attr in e.attributes().flatten() {
-                            let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                            if (key == "type" || key.ends_with(":type"))
-                                && let Ok(v) = attr.unescape_value() {
-                                    grantee_type = Some(v.into_owned());
-                                }
-                        }
-                    }
-                    "ID" | "DisplayName" | "EmailAddress" | "URI" | "Permission" => {
-                        cur_tag = Some(local.to_string());
-                    }
-                    _ => return Err(malformed_acl()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, type_attr } => match local.as_str() {
+                "AccessControlPolicy" if !saw_root => saw_root = true,
+                "Owner" if saw_root && !in_acl_list => in_owner = true,
+                "AccessControlList" if saw_root && !in_owner => in_acl_list = true,
+                "Grant" if in_acl_list && !in_grant => {
+                    in_grant = true;
+                    grantee_type = None;
+                    grantee_id = None;
+                    grantee_email = None;
+                    grantee_uri = None;
+                    grant_perm = None;
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "AccessControlList" if saw_root && !in_owner => {}
-                    "DisplayName" => {}
-                    _ => return Err(malformed_acl()),
+                "Grantee" if in_grant && !in_grantee => {
+                    in_grantee = true;
+                    grantee_type = type_attr;
                 }
-            }
-            Ok(Event::Text(t)) => {
-                let val = t.unescape().map_err(|_| malformed_acl())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("ID") if in_owner => owner_id = Some(val),
-                    Some("DisplayName") if in_owner => owner_display = Some(val),
-                    Some("ID") if in_grantee => grantee_id = Some(val),
-                    Some("DisplayName") if in_grantee => {}
-                    Some("EmailAddress") if in_grantee => grantee_email = Some(val),
-                    Some("URI") if in_grantee => grantee_uri = Some(val),
-                    Some("Permission") if in_grant && !in_grantee => grant_perm = Some(val),
-                    _ => {}
+                "ID" | "DisplayName" | "EmailAddress" | "URI" | "Permission" => {
+                    cur_tag = Some(local);
                 }
-            }
-            Ok(Event::End(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "Owner" => in_owner = false,
-                    "AccessControlList" => in_acl_list = false,
-                    "Grantee" => in_grantee = false,
-                    "Grant" => {
-                        in_grant = false;
-                        raw_grants.push((
-                            grantee_type.take(),
-                            grantee_id.take(),
-                            grantee_email.take(),
-                            grantee_uri.take(),
-                            grant_perm.take(),
-                        ));
-                    }
-                    "ID" | "DisplayName" | "EmailAddress" | "URI" | "Permission" => {
-                        cur_tag = None;
-                    }
-                    _ => {}
+                _ => return Err(malformed_acl()),
+            },
+            XmlTok::Empty { local } => match local.as_str() {
+                "AccessControlList" if saw_root && !in_owner => {}
+                "DisplayName" => {}
+                _ => return Err(malformed_acl()),
+            },
+            XmlTok::Text(val) => match cur_tag.as_deref() {
+                Some("ID") if in_owner => owner_id = Some(val),
+                Some("DisplayName") if in_owner => owner_display = Some(val),
+                Some("ID") if in_grantee => grantee_id = Some(val),
+                Some("DisplayName") if in_grantee => {}
+                Some("EmailAddress") if in_grantee => grantee_email = Some(val),
+                Some("URI") if in_grantee => grantee_uri = Some(val),
+                Some("Permission") if in_grant && !in_grantee => grant_perm = Some(val),
+                _ => {}
+            },
+            XmlTok::End { local } => match local.as_str() {
+                "Owner" => in_owner = false,
+                "AccessControlList" => in_acl_list = false,
+                "Grantee" => in_grantee = false,
+                "Grant" => {
+                    in_grant = false;
+                    raw_grants.push((
+                        grantee_type.take(),
+                        grantee_id.take(),
+                        grantee_email.take(),
+                        grantee_uri.take(),
+                        grant_perm.take(),
+                    ));
                 }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_acl()),
+                "ID" | "DisplayName" | "EmailAddress" | "URI" | "Permission" => {
+                    cur_tag = None;
+                }
+                _ => {}
+            },
         }
-        buf.clear();
     }
 
     if !saw_root {
@@ -1310,10 +1356,7 @@ pub fn parse_ownership_controls_xml(body: &[u8]) -> StoreResult<ObjectOwnership>
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut in_rule = false;
@@ -1321,50 +1364,37 @@ pub fn parse_ownership_controls_xml(body: &[u8]) -> StoreResult<ObjectOwnership>
     let mut cur_ownership: Option<ObjectOwnership> = None;
     let mut rules: Vec<ObjectOwnership> = Vec::new();
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "OwnershipControls" if !saw_root => saw_root = true,
-                    "Rule" if saw_root && !in_rule => {
-                        in_rule = true;
-                        cur_ownership = None;
-                    }
-                    "ObjectOwnership" if in_rule && cur_tag.is_empty() => {
-                        cur_tag = local.to_string();
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "OwnershipControls" if !saw_root => saw_root = true,
+                "Rule" if saw_root && !in_rule => {
+                    in_rule = true;
+                    cur_ownership = None;
                 }
-            }
-            Ok(Event::Empty(_)) => return Err(malformed_xml()),
-            Ok(Event::Text(t)) => {
+                "ObjectOwnership" if in_rule && cur_tag.is_empty() => {
+                    cur_tag = local;
+                }
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { .. } => return Err(malformed_xml()),
+            XmlTok::Text(s) => {
                 if cur_tag == "ObjectOwnership" {
-                    let s = t.unescape().map_err(|_| malformed_xml())?;
                     let parsed = ObjectOwnership::from_aws_str(&s).ok_or_else(malformed_xml)?;
                     cur_ownership = Some(parsed);
                 }
             }
-            Ok(Event::End(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "ObjectOwnership" => cur_tag.clear(),
-                    "Rule" if in_rule => {
-                        let own = cur_ownership.take().ok_or_else(malformed_xml)?;
-                        rules.push(own);
-                        in_rule = false;
-                    }
-                    "OwnershipControls" => {}
-                    _ => return Err(malformed_xml()),
+            XmlTok::End { local } => match local.as_str() {
+                "ObjectOwnership" => cur_tag.clear(),
+                "Rule" if in_rule => {
+                    let own = cur_ownership.take().ok_or_else(malformed_xml)?;
+                    rules.push(own);
+                    in_rule = false;
                 }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+                "OwnershipControls" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root || rules.len() != 1 {
@@ -1386,10 +1416,7 @@ pub fn parse_tagging_xml(body: &[u8], max_tags: usize) -> StoreResult<BTreeMap<S
     if body.is_empty() || body.len() > 128 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, false, malformed_xml)?;
 
     let mut saw_root = false;
     let mut saw_tagset = false;
@@ -1400,87 +1427,68 @@ pub fn parse_tagging_xml(body: &[u8], max_tags: usize) -> StoreResult<BTreeMap<S
     let mut cur_val: Option<String> = None;
     let mut pairs: Vec<(String, String)> = Vec::new();
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "Tagging" if !saw_root => saw_root = true,
-                    "TagSet" if saw_root && !saw_tagset => {
-                        saw_tagset = true;
-                        in_tagset = true;
-                    }
-                    "Tag" if in_tagset && !in_tag => {
-                        in_tag = true;
-                        cur_key = None;
-                        cur_val = None;
-                    }
-                    "Key" if in_tag && cur_tag.is_none() && cur_key.is_none() => {
-                        cur_tag = Some("Key".to_string());
-                        cur_key = Some(String::new());
-                    }
-                    "Value" if in_tag && cur_tag.is_none() && cur_val.is_none() => {
-                        cur_tag = Some("Value".to_string());
-                        cur_val = Some(String::new());
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "Tagging" if !saw_root => saw_root = true,
+                "TagSet" if saw_root && !saw_tagset => {
+                    saw_tagset = true;
+                    in_tagset = true;
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "TagSet" if saw_root && !saw_tagset => {
-                        saw_tagset = true;
-                    }
-                    "Key" if in_tag && cur_tag.is_none() && cur_key.is_none() => {
-                        cur_key = Some(String::new());
-                    }
-                    "Value" if in_tag && cur_tag.is_none() && cur_val.is_none() => {
-                        cur_val = Some(String::new());
-                    }
-                    _ => return Err(malformed_xml()),
+                "Tag" if in_tagset && !in_tag => {
+                    in_tag = true;
+                    cur_key = None;
+                    cur_val = None;
                 }
-            }
-            Ok(Event::Text(t)) => {
-                let txt = t.unescape().map_err(|_| malformed_xml())?;
-                match cur_tag.as_deref() {
-                    Some("Key") => {
-                        if let Some(k) = &mut cur_key {
-                            k.push_str(&txt);
-                        }
-                    }
-                    Some("Value") => {
-                        if let Some(v) = &mut cur_val {
-                            v.push_str(&txt);
-                        }
-                    }
-                    _ if txt.chars().all(|c| c.is_ascii_whitespace()) => {}
-                    _ => return Err(malformed_xml()),
+                "Key" if in_tag && cur_tag.is_none() && cur_key.is_none() => {
+                    cur_tag = Some("Key".to_string());
+                    cur_key = Some(String::new());
                 }
-            }
-            Ok(Event::End(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "Key" | "Value" => cur_tag = None,
-                    "Tag" if in_tag => {
-                        let k = cur_key.take().ok_or_else(malformed_xml)?;
-                        let v = cur_val.take().ok_or_else(malformed_xml)?;
-                        pairs.push((k, v));
-                        in_tag = false;
-                    }
-                    "TagSet" if in_tagset => in_tagset = false,
-                    "Tagging" => {}
-                    _ => return Err(malformed_xml()),
+                "Value" if in_tag && cur_tag.is_none() && cur_val.is_none() => {
+                    cur_tag = Some("Value".to_string());
+                    cur_val = Some(String::new());
                 }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { local } => match local.as_str() {
+                "TagSet" if saw_root && !saw_tagset => {
+                    saw_tagset = true;
+                }
+                "Key" if in_tag && cur_tag.is_none() && cur_key.is_none() => {
+                    cur_key = Some(String::new());
+                }
+                "Value" if in_tag && cur_tag.is_none() && cur_val.is_none() => {
+                    cur_val = Some(String::new());
+                }
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Text(txt) => match cur_tag.as_deref() {
+                Some("Key") => {
+                    if let Some(k) = &mut cur_key {
+                        k.push_str(&txt);
+                    }
+                }
+                Some("Value") => {
+                    if let Some(v) = &mut cur_val {
+                        v.push_str(&txt);
+                    }
+                }
+                _ if txt.chars().all(|c| c.is_ascii_whitespace()) => {}
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::End { local } => match local.as_str() {
+                "Key" | "Value" => cur_tag = None,
+                "Tag" if in_tag => {
+                    let k = cur_key.take().ok_or_else(malformed_xml)?;
+                    let v = cur_val.take().ok_or_else(malformed_xml)?;
+                    pairs.push((k, v));
+                    in_tag = false;
+                }
+                "TagSet" if in_tagset => in_tagset = false,
+                "Tagging" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root || !saw_tagset {
@@ -1538,10 +1546,7 @@ pub fn parse_cors_xml(body: &[u8]) -> StoreResult<CorsConfiguration> {
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut in_rule = false;
@@ -1556,105 +1561,89 @@ pub fn parse_cors_xml(body: &[u8]) -> StoreResult<CorsConfiguration> {
     };
     let mut rules = Vec::new();
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "CORSConfiguration" if !saw_root => saw_root = true,
-                    "CORSRule" if saw_root && !in_rule => {
-                        in_rule = true;
-                        cur_rule = CorsRule {
-                            id: None,
-                            allowed_origins: Vec::new(),
-                            allowed_methods: Vec::new(),
-                            allowed_headers: Vec::new(),
-                            expose_headers: Vec::new(),
-                            max_age_seconds: None,
-                        };
-                    }
-                    "ID" | "AllowedOrigin" | "AllowedMethod" | "AllowedHeader" | "ExposeHeader"
-                    | "MaxAgeSeconds"
-                        if in_rule && cur_tag.is_none() =>
-                    {
-                        cur_tag = Some(local.to_string());
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "CORSConfiguration" if !saw_root => saw_root = true,
+                "CORSRule" if saw_root && !in_rule => {
+                    in_rule = true;
+                    cur_rule = CorsRule {
+                        id: None,
+                        allowed_origins: Vec::new(),
+                        allowed_methods: Vec::new(),
+                        allowed_headers: Vec::new(),
+                        expose_headers: Vec::new(),
+                        max_age_seconds: None,
+                    };
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                "ID" | "AllowedOrigin" | "AllowedMethod" | "AllowedHeader" | "ExposeHeader"
+                | "MaxAgeSeconds"
+                    if in_rule && cur_tag.is_none() =>
+                {
+                    cur_tag = Some(local);
+                }
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { local } => {
                 if local == "ID" && in_rule && cur_tag.is_none() {
                     cur_rule.id = Some(String::new());
                 } else {
                     return Err(malformed_xml());
                 }
             }
-            Ok(Event::Text(t)) => {
-                let val = t.unescape().map_err(|_| malformed_xml())?.into_owned();
-                match cur_tag.as_deref() {
-                    Some("ID") => {
-                        if val.len() > 255 {
-                            return Err(malformed_xml());
-                        }
-                        cur_rule.id = Some(val);
+            XmlTok::Text(val) => match cur_tag.as_deref() {
+                Some("ID") => {
+                    if val.len() > 255 {
+                        return Err(malformed_xml());
                     }
-                    Some("AllowedOrigin") => cur_rule.allowed_origins.push(val),
-                    Some("AllowedMethod") => {
-                        if !matches!(val.as_str(), "GET" | "PUT" | "POST" | "DELETE" | "HEAD") {
-                            return Err(S3Error::new(
-                                S3ErrorCode::InvalidRequest,
-                                format!("Found unsupported HTTP method in CORS config. Unsupported method is {val}"),
-                            ));
-                        }
-                        cur_rule.allowed_methods.push(val);
-                    }
-                    Some("AllowedHeader") => cur_rule.allowed_headers.push(val),
-                    Some("ExposeHeader") => cur_rule.expose_headers.push(val),
-                    Some("MaxAgeSeconds") => {
-                        let secs = val.parse::<u32>().map_err(|_| malformed_xml())?;
-                        cur_rule.max_age_seconds = Some(secs);
-                    }
-                    _ => {}
+                    cur_rule.id = Some(val);
                 }
-            }
-            Ok(Event::End(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "ID" | "AllowedOrigin" | "AllowedMethod" | "AllowedHeader" | "ExposeHeader"
-                    | "MaxAgeSeconds" => {
-                        cur_tag = None;
-                    }
-                    "CORSRule" if in_rule => {
-                        if cur_rule.allowed_origins.is_empty() || cur_rule.allowed_methods.is_empty()
-                        {
-                            return Err(malformed_xml());
-                        }
-                        rules.push(std::mem::replace(
-                            &mut cur_rule,
-                            CorsRule {
-                                id: None,
-                                allowed_origins: Vec::new(),
-                                allowed_methods: Vec::new(),
-                                allowed_headers: Vec::new(),
-                                expose_headers: Vec::new(),
-                                max_age_seconds: None,
-                            },
+                Some("AllowedOrigin") => cur_rule.allowed_origins.push(val),
+                Some("AllowedMethod") => {
+                    if !matches!(val.as_str(), "GET" | "PUT" | "POST" | "DELETE" | "HEAD") {
+                        return Err(S3Error::new(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Found unsupported HTTP method in CORS config. Unsupported method is {val}"
+                            ),
                         ));
-                        in_rule = false;
                     }
-                    "CORSConfiguration" => {}
-                    _ => return Err(malformed_xml()),
+                    cur_rule.allowed_methods.push(val);
                 }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+                Some("AllowedHeader") => cur_rule.allowed_headers.push(val),
+                Some("ExposeHeader") => cur_rule.expose_headers.push(val),
+                Some("MaxAgeSeconds") => {
+                    let secs = val.parse::<u32>().map_err(|_| malformed_xml())?;
+                    cur_rule.max_age_seconds = Some(secs);
+                }
+                _ => {}
+            },
+            XmlTok::End { local } => match local.as_str() {
+                "ID" | "AllowedOrigin" | "AllowedMethod" | "AllowedHeader" | "ExposeHeader"
+                | "MaxAgeSeconds" => {
+                    cur_tag = None;
+                }
+                "CORSRule" if in_rule => {
+                    if cur_rule.allowed_origins.is_empty() || cur_rule.allowed_methods.is_empty() {
+                        return Err(malformed_xml());
+                    }
+                    rules.push(std::mem::replace(
+                        &mut cur_rule,
+                        CorsRule {
+                            id: None,
+                            allowed_origins: Vec::new(),
+                            allowed_methods: Vec::new(),
+                            allowed_headers: Vec::new(),
+                            expose_headers: Vec::new(),
+                            max_age_seconds: None,
+                        },
+                    ));
+                    in_rule = false;
+                }
+                "CORSConfiguration" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root || rules.is_empty() || rules.len() > 100 {
@@ -1706,10 +1695,7 @@ pub fn parse_public_access_block_xml(body: &[u8]) -> StoreResult<PublicAccessBlo
     if body.is_empty() || body.len() > 64 * 1024 {
         return Err(malformed_xml());
     }
-    check_no_dtd_or_entity(body)?;
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let tokens = read_xml_tokens(body, true, malformed_xml)?;
 
     let mut saw_root = false;
     let mut cur_tag: Option<String> = None;
@@ -1725,64 +1711,45 @@ pub fn parse_public_access_block_xml(body: &[u8]) -> StoreResult<PublicAccessBlo
         }
     };
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "PublicAccessBlockConfiguration" if !saw_root => saw_root = true,
-                    "BlockPublicAcls"
-                    | "IgnorePublicAcls"
-                    | "BlockPublicPolicy"
-                    | "RestrictPublicBuckets"
-                        if saw_root && cur_tag.is_none() =>
-                    {
-                        cur_tag = Some(local.to_string());
-                    }
-                    _ => return Err(malformed_xml()),
+    for tok in tokens {
+        match tok {
+            XmlTok::Start { local, .. } => match local.as_str() {
+                "PublicAccessBlockConfiguration" if !saw_root => saw_root = true,
+                "BlockPublicAcls"
+                | "IgnorePublicAcls"
+                | "BlockPublicPolicy"
+                | "RestrictPublicBuckets"
+                    if saw_root && cur_tag.is_none() =>
+                {
+                    cur_tag = Some(local);
                 }
-            }
-            Ok(Event::Empty(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::Empty { local } => {
                 if local == "PublicAccessBlockConfiguration" && !saw_root {
                     saw_root = true;
                 } else {
                     return Err(malformed_xml());
                 }
             }
-            Ok(Event::Text(t)) => {
-                let val = t.unescape().map_err(|_| malformed_xml())?;
-                match cur_tag.as_deref() {
-                    Some("BlockPublicAcls") => cfg.block_public_acls = parse_bool(&val)?,
-                    Some("IgnorePublicAcls") => cfg.ignore_public_acls = parse_bool(&val)?,
-                    Some("BlockPublicPolicy") => cfg.block_public_policy = parse_bool(&val)?,
-                    Some("RestrictPublicBuckets") => {
-                        cfg.restrict_public_buckets = parse_bool(&val)?
-                    }
-                    _ => return Err(malformed_xml()),
+            XmlTok::Text(val) => match cur_tag.as_deref() {
+                Some("BlockPublicAcls") => cfg.block_public_acls = parse_bool(&val)?,
+                Some("IgnorePublicAcls") => cfg.ignore_public_acls = parse_bool(&val)?,
+                Some("BlockPublicPolicy") => cfg.block_public_policy = parse_bool(&val)?,
+                Some("RestrictPublicBuckets") => cfg.restrict_public_buckets = parse_bool(&val)?,
+                _ => return Err(malformed_xml()),
+            },
+            XmlTok::End { local } => match local.as_str() {
+                "BlockPublicAcls"
+                | "IgnorePublicAcls"
+                | "BlockPublicPolicy"
+                | "RestrictPublicBuckets" => {
+                    cur_tag = None;
                 }
-            }
-            Ok(Event::End(e)) => {
-                let local_bytes = e.local_name();
-                let local = std::str::from_utf8(local_bytes.as_ref()).unwrap_or("");
-                match local {
-                    "BlockPublicAcls"
-                    | "IgnorePublicAcls"
-                    | "BlockPublicPolicy"
-                    | "RestrictPublicBuckets" => {
-                        cur_tag = None;
-                    }
-                    "PublicAccessBlockConfiguration" => {}
-                    _ => return Err(malformed_xml()),
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(malformed_xml()),
+                "PublicAccessBlockConfiguration" => {}
+                _ => return Err(malformed_xml()),
+            },
         }
-        buf.clear();
     }
 
     if !saw_root {

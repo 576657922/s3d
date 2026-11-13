@@ -101,7 +101,54 @@ const CSUM_POOL: &[Option<ChecksumAlgorithm>] = &[
     Some(ChecksumAlgorithm::Crc64Nvme),
     Some(ChecksumAlgorithm::Sha1),
     Some(ChecksumAlgorithm::Sha256),
+    Some(ChecksumAlgorithm::Md5),
+    Some(ChecksumAlgorithm::Sha512),
+    Some(ChecksumAlgorithm::XxHash64),
+    Some(ChecksumAlgorithm::XxHash3),
+    Some(ChecksumAlgorithm::XxHash128),
 ];
+
+fn sample_upload_lock(lock_slot: u8) -> RawUploadObjectLockHeaders {
+    match lock_slot {
+        1 => RawUploadObjectLockHeaders {
+            mode: Some("GOVERNANCE".into()),
+            retain_until_date: Some("2030-01-01T00:00:00.000Z".into()),
+            legal_hold: None,
+        },
+        2 => RawUploadObjectLockHeaders {
+            mode: None,
+            retain_until_date: None,
+            legal_hold: Some("ON".into()),
+        },
+        3 => RawUploadObjectLockHeaders {
+            mode: Some("COMPLIANCE".into()),
+            retain_until_date: Some("2030-01-01T00:00:00.000Z".into()),
+            legal_hold: Some("ON".into()),
+        },
+        4 => RawUploadObjectLockHeaders {
+            // Past retain-until date -> tests 400 InvalidArgument differential branch
+            mode: Some("GOVERNANCE".into()),
+            retain_until_date: Some("2020-01-01T00:00:00.000Z".into()),
+            legal_hold: None,
+        },
+        _ => RawUploadObjectLockHeaders::default(),
+    }
+}
+
+fn make_patterned_payload(size: usize, seed: u8) -> Bytes {
+    if size == 0 {
+        return Bytes::new();
+    }
+    let mut buf = vec![seed; size];
+    let step = if size > 65_536 { 257 } else { 1 };
+    let mut i = 0usize;
+    while i < size {
+        buf[i] = seed.wrapping_add((i % 251) as u8);
+        i += step;
+    }
+    buf[size - 1] = seed ^ 0x5A;
+    Bytes::from(buf)
+}
 const CANNED_ACL_POOL: &[CannedAcl] = &[
     CannedAcl::Private,
     CannedAcl::PublicRead,
@@ -118,6 +165,7 @@ enum ModelOp {
         b: u8,
         ownership: Option<ObjectOwnership>,
         canned_acl: Option<u8>,
+        object_lock_enabled: bool,
     },
     DeleteBucket {
         u: u8,
@@ -143,6 +191,7 @@ enum ModelOp {
         if_none_match_star: bool,
         canned_acl: Option<u8>,
         tag_slot: Option<u8>,
+        lock_slot: u8,
     },
     Get {
         u: u8,
@@ -170,12 +219,14 @@ enum ModelOp {
         k: u8,
         ver_slot: Option<u8>,
         if_match_star: bool,
+        bypass_governance: bool,
     },
     DeleteMulti {
         u: u8,
         b: u8,
         keys: Vec<(u8, Option<u8>, bool)>,
         quiet: bool,
+        bypass_governance: bool,
     },
     Copy {
         u: u8,
@@ -217,6 +268,7 @@ enum ModelOp {
         csum_idx: u8,
         full_obj_csum: bool,
         tag_slot: Option<u8>,
+        lock_slot: u8,
     },
     MpuPart {
         u: u8,
@@ -391,13 +443,17 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                 Just(Some(ObjectOwnership::BucketOwnerEnforced)),
             ],
             opt_canned_strategy(),
+            prop::bool::weighted(0.35),
         )
-            .prop_map(|(u, b, ownership, canned_acl)| ModelOp::CreateBucket {
-                u,
-                b,
-                ownership,
-                canned_acl,
-            }),
+            .prop_map(
+                |(u, b, ownership, canned_acl, object_lock_enabled)| ModelOp::CreateBucket {
+                    u,
+                    b,
+                    ownership,
+                    canned_acl,
+                    object_lock_enabled,
+                },
+            ),
         1 => (user_strategy(), 0u8..3).prop_map(|(u, b)| ModelOp::DeleteBucket { u, b }),
         2 => (user_strategy(), 0u8..2, any::<bool>())
             .prop_map(|(u, b, enabled)| ModelOp::SetVersioning { u, b, enabled }),
@@ -406,13 +462,23 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
             user_strategy(),
             0u8..3,
             0u8..6,
-            prop_oneof![Just(0usize), Just(1), Just(4095), Just(4096), Just(8192), Just(17_000)],
+            prop_oneof![
+                5 => Just(0usize),
+                5 => Just(1),
+                4 => Just(4095),
+                4 => Just(4096),
+                4 => Just(8192),
+                4 => Just(17_000),
+                1 => Just(5 * 1024 * 1024 - 1),
+                1 => Just(5 * 1024 * 1024),
+            ],
             any::<u8>(),
-            0u8..6,
+            0u8..11,
             prop::bool::weighted(0.1),
             prop::bool::weighted(0.2),
             opt_canned_strategy(),
             opt_tag_slot(),
+            prop_oneof![6 => Just(0u8), 1 => Just(1u8), 1 => Just(2u8), 1 => Just(3u8), 1 => Just(4u8)],
         )
             .prop_map(
                 |(
@@ -426,6 +492,7 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                     if_none_match_star,
                     canned_acl,
                     tag_slot,
+                    lock_slot,
                 )| {
                     ModelOp::Put {
                         u,
@@ -438,6 +505,7 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
                         if_none_match_star,
                         canned_acl,
                         tag_slot,
+                        lock_slot,
                     }
                 },
             ),
@@ -472,21 +540,32 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
             0u8..6,
             opt_ver_slot(),
             prop::bool::weighted(0.25),
+            any::<bool>(),
         )
-            .prop_map(|(u, b, k, ver_slot, if_match_star)| ModelOp::Delete {
-                u,
-                b,
-                k,
-                ver_slot,
-                if_match_star,
-            }),
+            .prop_map(
+                |(u, b, k, ver_slot, if_match_star, bypass_governance)| ModelOp::Delete {
+                    u,
+                    b,
+                    k,
+                    ver_slot,
+                    if_match_star,
+                    bypass_governance,
+                },
+            ),
         2 => (
             user_strategy(),
             0u8..2,
             prop::collection::vec((0u8..6, opt_ver_slot(), prop::bool::weighted(0.2)), 1..=4),
             any::<bool>(),
+            any::<bool>(),
         )
-            .prop_map(|(u, b, keys, quiet)| ModelOp::DeleteMulti { u, b, keys, quiet }),
+            .prop_map(|(u, b, keys, quiet, bypass_governance)| ModelOp::DeleteMulti {
+                u,
+                b,
+                keys,
+                quiet,
+                bypass_governance,
+            }),
         2 => (
             user_strategy(),
             0u8..2,
@@ -552,25 +631,34 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
             user_strategy(),
             0u8..2,
             0u8..4,
-            0u8..6,
+            0u8..11,
             any::<bool>(),
             opt_tag_slot(),
+            prop_oneof![6 => Just(0u8), 1 => Just(1u8), 1 => Just(2u8), 1 => Just(3u8), 1 => Just(4u8)],
         )
             .prop_map(
-                |(u, b, k, csum_idx, full_obj_csum, tag_slot)| ModelOp::MpuCreate {
+                |(u, b, k, csum_idx, full_obj_csum, tag_slot, lock_slot)| ModelOp::MpuCreate {
                     u,
                     b,
                     k,
                     csum_idx,
                     full_obj_csum,
                     tag_slot,
+                    lock_slot,
                 },
             ),
         4 => (
             user_strategy(),
             0u8..4,
             prop_oneof![Just(1u32), Just(2u32), Just(3u32), Just(0u32)],
-            prop_oneof![Just(0usize), Just(64), Just(4096), Just(9000)],
+            prop_oneof![
+                6 => Just(0usize),
+                6 => Just(64),
+                6 => Just(4096),
+                6 => Just(9000),
+                1 => Just(5 * 1024 * 1024 - 1),
+                1 => Just(5 * 1024 * 1024),
+            ],
             any::<u8>(),
         )
             .prop_map(|(u, up_slot, part_num, size, seed)| ModelOp::MpuPart {
@@ -808,13 +896,27 @@ impl IdBijection {
 }
 
 async fn run_differential_sequence(ops: Vec<ModelOp>) {
+    let has_large_op = ops.iter().any(|op| match op {
+        ModelOp::Put { size, .. } | ModelOp::MpuPart { size, .. } => *size >= 65_536,
+        _ => false,
+    });
     let disk = FaultDisk::new();
-    let eng_cfg = EngineConfig {
-        segment_size: 32 * 1024,
-        wal_file_size: 16 * 1024,
-        max_block_payload: 8 * 1024,
-        default_object_ownership: ObjectOwnership::ObjectWriter,
-        ..EngineConfig::default()
+    let eng_cfg = if has_large_op {
+        EngineConfig {
+            segment_size: 2 * 1024 * 1024,
+            wal_file_size: 64 * 1024,
+            max_block_payload: 256 * 1024,
+            default_object_ownership: ObjectOwnership::ObjectWriter,
+            ..EngineConfig::default()
+        }
+    } else {
+        EngineConfig {
+            segment_size: 32 * 1024,
+            wal_file_size: 16 * 1024,
+            max_block_payload: 8 * 1024,
+            default_object_ownership: ObjectOwnership::ObjectWriter,
+            ..EngineConfig::default()
+        }
     };
     let engine = Engine::open(disk.clone(), eng_cfg).unwrap();
     let model = ModelStore::new(ModelConfig {
@@ -833,6 +935,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 b,
                 ownership,
                 canned_acl,
+                object_lock_enabled,
             } => {
                 let req = CreateBucketReq {
                     ctx: test_caller(u, clock_ms),
@@ -840,7 +943,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     location_constraint: None,
                     object_ownership: ownership,
                     acl: canned_acl.map(|i| AclSpec::Canned(CANNED_ACL_POOL[i as usize])),
-                    object_lock_enabled: false,
+                    object_lock_enabled,
                 };
                 let re = engine.create_bucket(req.clone()).await.map(|r| (r.name, r.ownership));
                 let rm = model.create_bucket(req).await.map(|r| (r.name, r.ownership));
@@ -889,8 +992,9 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 if_none_match_star,
                 canned_acl,
                 tag_slot,
+                lock_slot,
             } => {
-                let payload: Vec<u8> = (0..size).map(|i| seed.wrapping_add(i as u8)).collect();
+                let payload = make_patterned_payload(size, seed);
                 let cond = if if_none_match_star {
                     Preconditions {
                         if_none_match: Some(vec!["*".into()]),
@@ -911,10 +1015,10 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     preconditions: cond,
                     max_bytes_limit: MAX_SINGLE_PUT_BYTES,
                     raw_sse: RawSseHeaders::default(),
-                    raw_lock: RawUploadObjectLockHeaders::default(),
+                    raw_lock: sample_upload_lock(lock_slot),
                 };
                 let make_stream = || {
-                    let s = InMemoryVerifiedStream::from_bytes(Bytes::from(payload.clone()), alg);
+                    let s = InMemoryVerifiedStream::from_bytes(payload.clone(), alg);
                     if bad_digest {
                         s.with_injected_error(BodyStreamError::BadDigest)
                     } else {
@@ -1089,6 +1193,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 k,
                 ver_slot,
                 if_match_star,
+                bypass_governance,
             } => {
                 let (ev, mv) = ids.pick_ver(ver_slot);
                 let ctx = test_caller(u, clock_ms);
@@ -1100,7 +1205,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         key: KEY_POOL[k as usize].to_string(),
                         version_id: ev.clone(),
                         if_match: if_match.clone(),
-                        bypass_governance: false,
+                        bypass_governance,
                     })
                     .await;
                 let rm = model
@@ -1110,7 +1215,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         key: KEY_POOL[k as usize].to_string(),
                         version_id: mv,
                         if_match,
-                        bypass_governance: false,
+                        bypass_governance,
                     })
                     .await;
                 match (re, rm) {
@@ -1124,7 +1229,13 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     (l, r) => panic!("Delete mismatch: {l:?} vs {r:?}"),
                 }
             }
-            ModelOp::DeleteMulti { u, b, keys, quiet } => {
+            ModelOp::DeleteMulti {
+                u,
+                b,
+                keys,
+                quiet,
+                bypass_governance,
+            } => {
                 let ctx = test_caller(u, clock_ms);
                 let mut e_items = Vec::with_capacity(keys.len());
                 let mut m_items = Vec::with_capacity(keys.len());
@@ -1148,7 +1259,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         bucket: BUCKET_POOL[b as usize].to_string(),
                         quiet,
                         items: e_items,
-                        bypass_governance: false,
+                        bypass_governance,
                     })
                     .await;
                 let rm = model
@@ -1157,7 +1268,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                         bucket: BUCKET_POOL[b as usize].to_string(),
                         quiet,
                         items: m_items,
-                        bypass_governance: false,
+                        bypass_governance,
                     })
                     .await;
                 match (re, rm) {
@@ -1382,6 +1493,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 csum_idx,
                 full_obj_csum,
                 tag_slot,
+                lock_slot,
             } => {
                 let alg = CSUM_POOL[csum_idx as usize];
                 let ctype = if full_obj_csum {
@@ -1400,7 +1512,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                     checksum_algorithm: alg,
                     checksum_type: ctype,
                     raw_sse: RawSseHeaders::default(),
-                    raw_lock: RawUploadObjectLockHeaders::default(),
+                    raw_lock: sample_upload_lock(lock_slot),
                 };
                 let re = engine.create_multipart_upload(req.clone()).await;
                 let rm = model.create_multipart_upload(req).await;
@@ -1422,7 +1534,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                 seed,
             } => {
                 let (bkt, key, e_uid, m_uid, _) = ids.pick_upload(up_slot);
-                let payload: Vec<u8> = (0..size).map(|i| seed.wrapping_add(i as u8)).collect();
+                let payload = make_patterned_payload(size, seed);
                 let ctx = test_caller(u, clock_ms);
                 let re = engine
                     .upload_part(
@@ -1435,7 +1547,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                             max_bytes_limit: MAX_PART_SIZE_BYTES,
                             raw_sse: RawSseHeaders::default(),
                         },
-                        InMemoryVerifiedStream::from_bytes(Bytes::from(payload.clone()), None),
+                        InMemoryVerifiedStream::from_bytes(payload.clone(), None),
                     )
                     .await;
                 let rm = model
@@ -1449,7 +1561,7 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
                             max_bytes_limit: MAX_PART_SIZE_BYTES,
                             raw_sse: RawSseHeaders::default(),
                         },
-                        InMemoryVerifiedStream::from_bytes(Bytes::from(payload), None),
+                        InMemoryVerifiedStream::from_bytes(payload, None),
                     )
                     .await;
                 match (re, rm) {
@@ -2468,16 +2580,57 @@ async fn run_differential_sequence(ops: Vec<ModelOp>) {
     assert_eq!(report.status, "ok", "fsck errors: {:?}", report.errors);
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(250))]
-    #[test]
-    fn vr2_differential_engine_vs_model(ops in prop::collection::vec(op_strategy(), 1..40)) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(run_differential_sequence(ops));
+fn run_vr2_parallel(total_cases: usize, seed_base: u64, max_seq_len: usize) {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .max(4);
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::with_capacity(workers);
+    for tid in 0..workers {
+        let cases_for_worker = total_cases / workers + usize::from(tid < total_cases % workers);
+        if cases_for_worker == 0 {
+            continue;
+        }
+        let completed = Arc::clone(&completed);
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut seed = [0u8; 32];
+            seed[0..8].copy_from_slice(&(seed_base + tid as u64).to_le_bytes());
+            let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &seed);
+            let cfg = ProptestConfig {
+                cases: cases_for_worker as u32,
+                max_shrink_iters: 256,
+                ..ProptestConfig::default()
+            };
+            let mut runner = TestRunner::new_with_rng(cfg, rng);
+            let strategy = prop::collection::vec(op_strategy(), 1..max_seq_len);
+            runner
+                .run(&strategy, |ops| {
+                    rt.block_on(run_differential_sequence(ops));
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+                .unwrap_or_else(|e| panic!("worker {tid} differential failure: {e}"));
+        }));
     }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+    let total = completed.load(Ordering::SeqCst);
+    assert_eq!(total, total_cases);
+}
+
+/// Default CI `VR-2`: 10,000 proptest differential sequences in `--release` (`1,000` in debug).
+#[test]
+fn vr2_differential_engine_vs_model() {
+    let cases = if cfg!(debug_assertions) { 1_000 } else { 10_000 };
+    run_vr2_parallel(cases, 0x5333_2026_C100, 30);
 }
 
 /// Multi-part `>= 5 MiB` assembly differential test covering composite & full-object checksums,
@@ -2674,47 +2827,25 @@ async fn vr2_multipart_5mib_boundary_differential() {
 #[ignore]
 fn vr2_100k_sequences_m1_gate() {
     const TOTAL_CASES: usize = 100_000;
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .max(4);
-    let completed = Arc::new(AtomicUsize::new(0));
+    let t0 = std::time::Instant::now();
+    run_vr2_parallel(TOTAL_CASES, 0x5333_2026_0000, 25);
+    eprintln!(
+        "VR-2 M1 gate passed: {TOTAL_CASES} proptest sequences executed in {:.2}s, 0 diffs.",
+        t0.elapsed().as_secs_f64()
+    );
+}
 
-    let mut handles = Vec::with_capacity(workers);
-    for tid in 0..workers {
-        let cases_for_worker = TOTAL_CASES / workers + usize::from(tid < TOTAL_CASES % workers);
-        let completed = Arc::clone(&completed);
-        handles.push(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let mut seed = [0u8; 32];
-            seed[0..8].copy_from_slice(&(0x5333_2026_0000u64 + tid as u64).to_le_bytes());
-            let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &seed);
-            let cfg = ProptestConfig {
-                cases: cases_for_worker as u32,
-                max_shrink_iters: 256,
-                ..ProptestConfig::default()
-            };
-            let mut runner = TestRunner::new_with_rng(cfg, rng);
-            let strategy = prop::collection::vec(op_strategy(), 1..25);
-            runner
-                .run(&strategy, |ops| {
-                    rt.block_on(run_differential_sequence(ops));
-                    completed.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                })
-                .unwrap_or_else(|e| panic!("worker {tid} differential failure: {e}"));
-        }));
-    }
-
-    for h in handles {
-        h.join().unwrap();
-    }
-    let total = completed.load(Ordering::SeqCst);
-    assert_eq!(total, TOTAL_CASES);
-    eprintln!("VR-2 M1 gate passed: {total} proptest sequences executed, 0 diffs.");
+/// Nightly Gate (`VR-2`): 1,000,000 proptest differential sequences against `ModelStore` (`0` diffs).
+#[test]
+#[ignore]
+fn vr2_1m_sequences_nightly_gate() {
+    const TOTAL_CASES: usize = 1_000_000;
+    let t0 = std::time::Instant::now();
+    run_vr2_parallel(TOTAL_CASES, 0x5333_2026_9900, 25);
+    eprintln!(
+        "VR-2 Nightly gate passed: {TOTAL_CASES} proptest sequences executed in {:.2}s, 0 diffs.",
+        t0.elapsed().as_secs_f64()
+    );
 }
 
 async fn run_power_cut_chain(seed: u64, rounds: usize) {
@@ -2728,8 +2859,17 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
         ..EngineConfig::default()
     };
 
+    struct PendingAtomicKey {
+        key: String,
+        before: Option<Vec<u8>>,
+        after: Option<Vec<u8>>,
+    }
+
     // Unversioned ground truth: key -> Option<Vec<u8>>
     let mut confirmed_unver: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+    // Atomic candidate from an interrupted mid-syscall operation in the prior round:
+    // recovery must yield EITHER `before` OR `after` (`ST-3`).
+    let mut pending_atomic_unver: Option<PendingAtomicKey> = None;
     // Versioned ground truth: (key, version_id) -> Vec<u8>, plus current head Option<Vec<u8>>
     let mut confirmed_ver_by_id: BTreeMap<(String, String), Vec<u8>> = BTreeMap::new();
     let mut confirmed_ver_head: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
@@ -2772,6 +2912,38 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
                 .await
                 .unwrap();
             buckets_ready = true;
+        }
+
+        // Resolve & verify ST-3 crash atomicity on any key that suffered a mid-syscall power cut
+        if let Some(PendingAtomicKey {
+            key: akey,
+            before: before_val,
+            after: after_val,
+        }) = pending_atomic_unver.take()
+        {
+            let res = engine
+                .get_object(GetObjectReq {
+                    ctx: ctx.clone(),
+                    bucket: "crash-bkt".into(),
+                    key: akey.clone(),
+                    version_id: None,
+                    range: None,
+                    part_number: None,
+                    preconditions: Preconditions::default(),
+                    checksum_mode_enabled: true,
+                    raw_sse: RawSseHeaders::default(),
+                })
+                .await;
+            let resolved: Option<Vec<u8>> = match res {
+                Ok(got) => Some(read_all(got.reader).await.unwrap().to_vec()),
+                Err(e) if e.code == S3ErrorCode::NoSuchKey => None,
+                Err(e) => panic!("round {round}: unexpected error reading atomic key {akey}: {e}"),
+            };
+            assert!(
+                resolved == before_val || resolved == after_val,
+                "round {round}: mid-syscall torn/corrupt state on {akey} (ST-3 violation)!"
+            );
+            confirmed_unver.insert(akey, resolved);
         }
 
         // Verify ST-1, ST-2, ST-4 on unversioned bucket
@@ -3012,33 +3184,159 @@ async fn run_power_cut_chain(seed: u64, rounds: usize) {
             engine.write_checkpoint().await.unwrap();
         }
 
-        // Simulate a crashed in-flight checkpoint write in `tmp/` (`ST-8`)
-        if rng.gen_bool(0.3)
-            && let Ok(tf) = disk.open("tmp/ckpt-inflight.tmp", OpenOpts::create_truncate_rw()) {
-                let _ = tf.write_all_at(0, b"S3DCKP01-partial-uncommitted");
+        // True in-flight mid-syscall power-cut injection (`VR-3`):
+        // Arm a sector-granular I/O countdown on `FaultDisk` and drive a real `Engine` operation
+        // right into the power cut (tearing multi-block/SSE writes, deletes, MPUs, GC compaction,
+        // or checkpoints mid-syscall!).
+        match rng.gen_range(0..5u8) {
+            0 | 1 => {
+                // Multi-block / multi-segment PutObject (up to 64 KiB across 24 KiB segments, +/- SSE-S3)
+                let key = format!("k{}", rng.gen_range(0..6));
+                let prev = confirmed_unver.get(&key).cloned().unwrap_or(None);
+                let len = *[1usize, 4096, 12_288, 28_000, 65_536]
+                    .choose(&mut rng)
+                    .unwrap();
+                let mut data = vec![0u8; len];
+                rng.fill(&mut data[..]);
+                let raw_sse = if rng.gen_bool(0.4) {
+                    RawSseHeaders {
+                        sse_algorithm: Some("AES256".into()),
+                        ..Default::default()
+                    }
+                } else {
+                    RawSseHeaders::default()
+                };
+                disk.arm_mid_io_power_cut(rng.gen_range(0..26));
+                let put_res = engine
+                    .put_object(
+                        PutObjectReq {
+                            ctx: ctx.clone(),
+                            bucket: "crash-bkt".into(),
+                            key: key.clone(),
+                            sys_meta: SystemMeta::default(),
+                            user_meta: Vec::new(),
+                            acl: None,
+                            tags: None,
+                            preconditions: Preconditions::default(),
+                            max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                            raw_sse,
+                            raw_lock: RawUploadObjectLockHeaders::default(),
+                        },
+                        InMemoryVerifiedStream::from_bytes(Bytes::from(data.clone()), None),
+                    )
+                    .await;
+                if put_res.is_ok() {
+                    confirmed_unver.insert(key, Some(data));
+                } else {
+                    pending_atomic_unver = Some(PendingAtomicKey {
+                        key,
+                        before: prev,
+                        after: Some(data),
+                    });
+                }
             }
-
-        // Inject un-fsynced dirty tail writes onto active WAL and active segment right before power cut
-        // to simulate an in-flight crashed write tearing across 4 KiB sectors! (ST-3, ST-6)
-        if rng.gen_bool(0.6) {
-            if let Ok(wal_files) = disk.read_dir("wal")
-                && let Some(last_wal) = wal_files.last()
-                    && let Ok(wf) = disk.open(&format!("wal/{last_wal}"), OpenOpts::open_rw()) {
-                        let pos = wf.len().unwrap();
-                        let mut junk = vec![0u8; rng.gen_range(5..6000)];
-                        rng.fill(&mut junk[..]);
-                        junk[0..4]
-                            .copy_from_slice(&s3d_engine::format::WAL_RECORD_MAGIC.to_le_bytes());
-                        let _ = wf.write_all_at(pos, &junk);
+            2 => {
+                // Mid-syscall DeleteObject
+                let key = format!("k{}", rng.gen_range(0..6));
+                let prev = confirmed_unver.get(&key).cloned().unwrap_or(None);
+                disk.arm_mid_io_power_cut(rng.gen_range(0..6));
+                let del_res = engine
+                    .delete_object(DeleteObjectReq {
+                        ctx: ctx.clone(),
+                        bucket: "crash-bkt".into(),
+                        key: key.clone(),
+                        version_id: None,
+                        if_match: None,
+                        bypass_governance: false,
+                    })
+                    .await;
+                if del_res.is_ok() {
+                    confirmed_unver.insert(key, None);
+                } else {
+                    pending_atomic_unver = Some(PendingAtomicKey {
+                        key,
+                        before: prev,
+                        after: None,
+                    });
+                }
+            }
+            3 => {
+                // Mid-syscall MultipartUpload (Create -> 16 KiB multi-block UploadPart -> Complete)
+                let key = format!("mpu{}", rng.gen_range(0..3));
+                let prev = confirmed_unver.get(&key).cloned().unwrap_or(None);
+                let mut pdata = vec![0u8; 16_384];
+                rng.fill(&mut pdata[..]);
+                disk.arm_mid_io_power_cut(rng.gen_range(0..20));
+                if let Ok(init) = engine
+                    .create_multipart_upload(CreateMultipartUploadReq {
+                        ctx: ctx.clone(),
+                        bucket: "crash-bkt".into(),
+                        key: key.clone(),
+                        sys_meta: SystemMeta::default(),
+                        user_meta: Vec::new(),
+                        acl: None,
+                        tags: None,
+                        checksum_algorithm: Some(ChecksumAlgorithm::Crc64Nvme),
+                        checksum_type: Some(ChecksumType::FullObject),
+                        raw_sse: RawSseHeaders::default(),
+                        raw_lock: RawUploadObjectLockHeaders::default(),
+                    })
+                    .await
+                    && let Ok(pr) = engine
+                        .upload_part(
+                            UploadPartReq {
+                                ctx: ctx.clone(),
+                                bucket: "crash-bkt".into(),
+                                key: key.clone(),
+                                upload_id: init.upload_id.clone(),
+                                part_number: 1,
+                                max_bytes_limit: MAX_PART_SIZE_BYTES,
+                                raw_sse: RawSseHeaders::default(),
+                            },
+                            InMemoryVerifiedStream::from_bytes(
+                                Bytes::from(pdata.clone()),
+                                Some(ChecksumAlgorithm::Crc64Nvme),
+                            ),
+                        )
+                        .await
+                {
+                    let comp_res = engine
+                        .complete_multipart_upload(CompleteMultipartUploadReq {
+                            ctx: ctx.clone(),
+                            bucket: "crash-bkt".into(),
+                            key: key.clone(),
+                            upload_id: init.upload_id,
+                            parts: vec![CompletePartSpec {
+                                part_number: 1,
+                                etag: pr.etag,
+                                checksum: pr.checksum.map(|c| (c.algorithm, c.value_b64)),
+                            }],
+                            expected_checksum: None,
+                            expected_object_size: None,
+                            preconditions: Preconditions::default(),
+                            raw_sse: RawSseHeaders::default(),
+                        })
+                        .await;
+                    if comp_res.is_ok() {
+                        confirmed_unver.insert(key, Some(pdata));
+                    } else {
+                        pending_atomic_unver = Some(PendingAtomicKey {
+                            key,
+                            before: prev,
+                            after: Some(pdata),
+                        });
                     }
-            if let Ok(seg_files) = disk.read_dir("seg")
-                && let Some(last_seg) = seg_files.last()
-                    && let Ok(sf) = disk.open(&format!("seg/{last_seg}"), OpenOpts::open_rw()) {
-                        let pos = sf.len().unwrap();
-                        let mut junk = vec![0u8; rng.gen_range(16..5000)];
-                        rng.fill(&mut junk[..]);
-                        let _ = sf.write_all_at(pos, &junk);
-                    }
+                }
+            }
+            _ => {
+                // Mid-syscall GC compaction or checkpoint write (`ST-8` & Spec §5 VR-3)
+                disk.arm_mid_io_power_cut(rng.gen_range(0..14));
+                if rng.gen_bool(0.5) {
+                    let _ = engine.compact().await;
+                } else {
+                    let _ = engine.write_checkpoint().await;
+                }
+            }
         }
 
         drop(engine);
@@ -3774,4 +4072,504 @@ async fn vr2_vr3_p2_encryption_lock_lifecycle_logging_checkpoint_crash() {
     drop(recovered);
     let final_fsck = run_fsck(disk);
     assert_eq!(final_fsck.status, "ok", "final fsck errors: {:?}", final_fsck.errors);
+}
+
+/// `VR-3`: True mid-syscall sector-granular power cuts on multi-block & multi-MiB objects
+/// (`128 KiB`, `1 MiB + 37 B`, `5 MiB + 19 B`), SSE-C streams, 2-part `5 MiB + 321 B`
+/// `MultipartUpload`, `compact()`, and `write_checkpoint()`, differentially checked against
+/// `ModelStore` (`model_before` / `model_after`) and `run_fsck`.
+#[tokio::test]
+async fn vr3_mid_syscall_multi_mib_power_cuts() {
+    use base64::Engine as _;
+    use md5::{Digest as _, Md5};
+
+    let mut rng = StdRng::seed_from_u64(0x5333_D15C_2026);
+    let mut disk = FaultDisk::new();
+    let cfg = EngineConfig {
+        segment_size: 512 * 1024, // 512 KiB -> 5 MiB object spans 11 segments!
+        wal_file_size: 64 * 1024,
+        checkpoint_wal_bytes: 64 * 1024,
+        max_block_payload: 64 * 1024, // 64 KiB -> 16 x 4 KiB sectors per block
+        ..EngineConfig::default()
+    };
+
+    let mut model = ModelStore::new(ModelConfig::default());
+    let ctx = test_caller(0, 1_762_950_000_000);
+
+    let raw_customer_key = [0x5Cu8; 32];
+    let ssec_hdrs = RawSseHeaders {
+        sse_customer_algorithm: Some("AES256".into()),
+        sse_customer_key_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(raw_customer_key),
+        ),
+        sse_customer_key_md5_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(Md5::digest(raw_customer_key)),
+        ),
+        ..Default::default()
+    };
+
+    // Initialize bucket & baseline 1 MiB + 37 B object in both Engine and ModelStore
+    {
+        let engine = Engine::open(disk.clone(), cfg.clone()).unwrap();
+        let req_b = CreateBucketReq {
+            ctx: ctx.clone(),
+            bucket: "mib-crash".into(),
+            location_constraint: None,
+            object_ownership: None,
+            acl: None,
+            object_lock_enabled: false,
+        };
+        engine.create_bucket(req_b.clone()).await.unwrap();
+        model.create_bucket(req_b).await.unwrap();
+
+        let base_1m = make_patterned_payload(1024 * 1024 + 37, 0x11);
+        let put_base = PutObjectReq {
+            ctx: ctx.clone(),
+            bucket: "mib-crash".into(),
+            key: "obj-1m".into(),
+            sys_meta: SystemMeta::default(),
+            user_meta: vec![("gen".into(), "0".into())],
+            acl: None,
+            tags: None,
+            preconditions: Preconditions::default(),
+            max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+            raw_sse: RawSseHeaders::default(),
+            raw_lock: RawUploadObjectLockHeaders::default(),
+        };
+        engine
+            .put_object(
+                put_base.clone(),
+                InMemoryVerifiedStream::from_bytes(
+                    base_1m.clone(),
+                    Some(ChecksumAlgorithm::XxHash128),
+                ),
+            )
+            .await
+            .unwrap();
+        model
+            .put_object(
+                put_base,
+                InMemoryVerifiedStream::from_bytes(base_1m, Some(ChecksumAlgorithm::XxHash128)),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn read_model_obj(
+        store: &ModelStore,
+        ctx: &CallerContext,
+        key: &str,
+        raw_sse: &RawSseHeaders,
+    ) -> Option<(String, Bytes)> {
+        match store
+            .get_object(GetObjectReq {
+                ctx: ctx.clone(),
+                bucket: "mib-crash".into(),
+                key: key.into(),
+                version_id: None,
+                range: None,
+                part_number: None,
+                preconditions: Preconditions::default(),
+                checksum_mode_enabled: true,
+                raw_sse: raw_sse.clone(),
+            })
+            .await
+        {
+            Ok(resp) => Some((resp.meta.etag, read_all(resp.reader).await.unwrap())),
+            Err(e) if e.code == S3ErrorCode::NoSuchKey => None,
+            Err(e) => panic!("unexpected model read error on {key}: {e}"),
+        }
+    }
+
+    // 1. Sweep mid-syscall cuts across 128 KiB, 1 MiB + 37 B, and 5 MiB + 19 B (SSE-C + SHA512),
+    // ending each trial with a large countdown that allows full completion (`ST-1` durability).
+    let put_trials: &[(usize, &str, bool, &[usize])] = &[
+        (128 * 1024, "obj-128k", false, &[0, 3, 19, 33, 36, 120]),
+        (1024 * 1024 + 37, "obj-1m", false, &[1, 17, 140, 275, 450]),
+        (
+            5 * 1024 * 1024 + 19,
+            "obj-5m-ssec",
+            true,
+            &[0, 7, 135, 650, 1320, 1800],
+        ),
+    ];
+
+    for (t_idx, &(size, key, use_ssec, countdowns)) in put_trials.iter().enumerate() {
+        let last_cd = *countdowns.last().unwrap();
+        for &cd in countdowns {
+            let payload = make_patterned_payload(size, (t_idx as u8).wrapping_add(cd as u8));
+            let sse = if use_ssec {
+                ssec_hdrs.clone()
+            } else {
+                RawSseHeaders::default()
+            };
+            let put_req = PutObjectReq {
+                ctx: ctx.clone(),
+                bucket: "mib-crash".into(),
+                key: key.into(),
+                sys_meta: SystemMeta::default(),
+                user_meta: vec![("cd".into(), cd.to_string())],
+                acl: None,
+                tags: None,
+                preconditions: Preconditions::default(),
+                max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+                raw_sse: sse.clone(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
+            };
+
+            let model_before = model.clone();
+            let model_after = model.clone();
+            model_after
+                .put_object(
+                    put_req.clone(),
+                    InMemoryVerifiedStream::from_bytes(
+                        payload.clone(),
+                        Some(ChecksumAlgorithm::Sha512),
+                    ),
+                )
+                .await
+                .unwrap();
+
+            let engine = Engine::open(disk.clone(), cfg.clone()).unwrap();
+            disk.arm_mid_io_power_cut(cd);
+            let eng_res = engine
+                .put_object(
+                    put_req,
+                    InMemoryVerifiedStream::from_bytes(
+                        payload.clone(),
+                        Some(ChecksumAlgorithm::Sha512),
+                    ),
+                )
+                .await;
+            if cd == last_cd {
+                assert!(
+                    eng_res.is_ok(),
+                    "expected final completion round on {key} cd={cd} to succeed, got {eng_res:?}"
+                );
+            } else {
+                assert!(
+                    disk.did_trip_power_cut(),
+                    "expected mid-syscall cut to trip on {key} cd={cd}"
+                );
+            }
+            drop(engine);
+            disk = disk.power_cut(&mut rng);
+
+            let report = run_fsck(disk.clone());
+            assert_eq!(
+                report.status, "ok",
+                "fsck failed after mid-syscall cut key={key} cd={cd}: {:?}",
+                report.errors
+            );
+
+            let recovered = Engine::open(disk.clone(), cfg.clone()).unwrap();
+            let got_eng = match recovered
+                .get_object(GetObjectReq {
+                    ctx: ctx.clone(),
+                    bucket: "mib-crash".into(),
+                    key: key.into(),
+                    version_id: None,
+                    range: None,
+                    part_number: None,
+                    preconditions: Preconditions::default(),
+                    checksum_mode_enabled: true,
+                    raw_sse: sse.clone(),
+                })
+                .await
+            {
+                Ok(r) => Some((r.meta.etag, read_all(r.reader).await.unwrap())),
+                Err(e) if e.code == S3ErrorCode::NoSuchKey => None,
+                Err(e) => panic!("unexpected recovered read error on {key} cd={cd}: {e}"),
+            };
+
+            let exp_after = read_model_obj(&model_after, &ctx, key, &sse).await;
+            let exp_before = read_model_obj(&model_before, &ctx, key, &sse).await;
+
+            if eng_res.is_ok() {
+                // ST-1: 200 OK write MUST equal model_after
+                assert_eq!(got_eng, exp_after, "ST-1 violation on {key} cd={cd}");
+                model = model_after;
+            } else if got_eng == exp_after {
+                model = model_after;
+            } else {
+                assert_eq!(
+                    got_eng, exp_before,
+                    "ST-3 atomicity violation (torn multi-MiB object!) on {key} cd={cd}"
+                );
+                model = model_before;
+            }
+            drop(recovered);
+        }
+    }
+
+    // 2. Mid-syscall power cut during 2-part 5 MiB + 321 B MultipartUpload
+    let p1 = make_patterned_payload(MIN_PART_SIZE_BYTES as usize, 0x71);
+    let p2 = make_patterned_payload(321, 0x72);
+    for cd in [12usize, 680, 1345, 1800] {
+        let model_before = model.clone();
+        let model_after = model.clone();
+        {
+            let m_init = model_after
+                .create_multipart_upload(CreateMultipartUploadReq {
+                    ctx: ctx.clone(),
+                    bucket: "mib-crash".into(),
+                    key: "mpu-5m".into(),
+                    sys_meta: SystemMeta::default(),
+                    user_meta: Vec::new(),
+                    acl: None,
+                    tags: None,
+                    checksum_algorithm: Some(ChecksumAlgorithm::XxHash64),
+                    checksum_type: Some(ChecksumType::Composite),
+                    raw_sse: RawSseHeaders::default(),
+                    raw_lock: RawUploadObjectLockHeaders::default(),
+                })
+                .await
+                .unwrap();
+            let mp1 = model_after
+                .upload_part(
+                    UploadPartReq {
+                        ctx: ctx.clone(),
+                        bucket: "mib-crash".into(),
+                        key: "mpu-5m".into(),
+                        upload_id: m_init.upload_id.clone(),
+                        part_number: 1,
+                        max_bytes_limit: MAX_PART_SIZE_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                    },
+                    InMemoryVerifiedStream::from_bytes(p1.clone(), Some(ChecksumAlgorithm::XxHash64)),
+                )
+                .await
+                .unwrap();
+            let mp2 = model_after
+                .upload_part(
+                    UploadPartReq {
+                        ctx: ctx.clone(),
+                        bucket: "mib-crash".into(),
+                        key: "mpu-5m".into(),
+                        upload_id: m_init.upload_id.clone(),
+                        part_number: 2,
+                        max_bytes_limit: MAX_PART_SIZE_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                    },
+                    InMemoryVerifiedStream::from_bytes(p2.clone(), Some(ChecksumAlgorithm::XxHash64)),
+                )
+                .await
+                .unwrap();
+            model_after
+                .complete_multipart_upload(CompleteMultipartUploadReq {
+                    ctx: ctx.clone(),
+                    bucket: "mib-crash".into(),
+                    key: "mpu-5m".into(),
+                    upload_id: m_init.upload_id,
+                    parts: vec![
+                        CompletePartSpec {
+                            part_number: 1,
+                            etag: mp1.etag,
+                            checksum: mp1.checksum.map(|c| (c.algorithm, c.value_b64)),
+                        },
+                        CompletePartSpec {
+                            part_number: 2,
+                            etag: mp2.etag,
+                            checksum: mp2.checksum.map(|c| (c.algorithm, c.value_b64)),
+                        },
+                    ],
+                    expected_checksum: None,
+                    expected_object_size: None,
+                    preconditions: Preconditions::default(),
+                    raw_sse: RawSseHeaders::default(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let engine = Engine::open(disk.clone(), cfg.clone()).unwrap();
+        disk.arm_mid_io_power_cut(cd);
+        let mut completed_ok = false;
+        if let Ok(e_init) = engine
+            .create_multipart_upload(CreateMultipartUploadReq {
+                ctx: ctx.clone(),
+                bucket: "mib-crash".into(),
+                key: "mpu-5m".into(),
+                sys_meta: SystemMeta::default(),
+                user_meta: Vec::new(),
+                acl: None,
+                tags: None,
+                checksum_algorithm: Some(ChecksumAlgorithm::XxHash64),
+                checksum_type: Some(ChecksumType::Composite),
+                raw_sse: RawSseHeaders::default(),
+                raw_lock: RawUploadObjectLockHeaders::default(),
+            })
+            .await
+            && let Ok(ep1) = engine
+                .upload_part(
+                    UploadPartReq {
+                        ctx: ctx.clone(),
+                        bucket: "mib-crash".into(),
+                        key: "mpu-5m".into(),
+                        upload_id: e_init.upload_id.clone(),
+                        part_number: 1,
+                        max_bytes_limit: MAX_PART_SIZE_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                    },
+                    InMemoryVerifiedStream::from_bytes(p1.clone(), Some(ChecksumAlgorithm::XxHash64)),
+                )
+                .await
+            && let Ok(ep2) = engine
+                .upload_part(
+                    UploadPartReq {
+                        ctx: ctx.clone(),
+                        bucket: "mib-crash".into(),
+                        key: "mpu-5m".into(),
+                        upload_id: e_init.upload_id.clone(),
+                        part_number: 2,
+                        max_bytes_limit: MAX_PART_SIZE_BYTES,
+                        raw_sse: RawSseHeaders::default(),
+                    },
+                    InMemoryVerifiedStream::from_bytes(p2.clone(), Some(ChecksumAlgorithm::XxHash64)),
+                )
+                .await
+        {
+            completed_ok = engine
+                .complete_multipart_upload(CompleteMultipartUploadReq {
+                    ctx: ctx.clone(),
+                    bucket: "mib-crash".into(),
+                    key: "mpu-5m".into(),
+                    upload_id: e_init.upload_id,
+                    parts: vec![
+                        CompletePartSpec {
+                            part_number: 1,
+                            etag: ep1.etag,
+                            checksum: ep1.checksum.map(|c| (c.algorithm, c.value_b64)),
+                        },
+                        CompletePartSpec {
+                            part_number: 2,
+                            etag: ep2.etag,
+                            checksum: ep2.checksum.map(|c| (c.algorithm, c.value_b64)),
+                        },
+                    ],
+                    expected_checksum: None,
+                    expected_object_size: None,
+                    preconditions: Preconditions::default(),
+                    raw_sse: RawSseHeaders::default(),
+                })
+                .await
+                .is_ok();
+        }
+        if cd == 1800 {
+            assert!(completed_ok, "expected final mpu-5m round cd={cd} to complete");
+        } else {
+            assert!(disk.did_trip_power_cut(), "expected mid-syscall cut to trip on mpu-5m cd={cd}");
+        }
+        drop(engine);
+        disk = disk.power_cut(&mut rng);
+
+        let report = run_fsck(disk.clone());
+        assert_eq!(report.status, "ok", "fsck errors on mpu-5m cd={cd}: {:?}", report.errors);
+
+        let recovered = Engine::open(disk.clone(), cfg.clone()).unwrap();
+        let got_eng = match recovered
+            .get_object(GetObjectReq {
+                ctx: ctx.clone(),
+                bucket: "mib-crash".into(),
+                key: "mpu-5m".into(),
+                version_id: None,
+                range: None,
+                part_number: None,
+                preconditions: Preconditions::default(),
+                checksum_mode_enabled: true,
+                raw_sse: RawSseHeaders::default(),
+            })
+            .await
+        {
+            Ok(r) => Some((r.meta.etag, read_all(r.reader).await.unwrap())),
+            Err(e) if e.code == S3ErrorCode::NoSuchKey => None,
+            Err(e) => panic!("unexpected mpu-5m read error cd={cd}: {e}"),
+        };
+        let exp_after = read_model_obj(&model_after, &ctx, "mpu-5m", &RawSseHeaders::default()).await;
+        let exp_before = read_model_obj(&model_before, &ctx, "mpu-5m", &RawSseHeaders::default()).await;
+        if completed_ok {
+            assert_eq!(got_eng, exp_after);
+            model = model_after;
+        } else if got_eng == exp_after {
+            model = model_after;
+        } else {
+            assert_eq!(got_eng, exp_before);
+            model = model_before;
+        }
+        drop(recovered);
+    }
+
+    // 3. Overwrite obj-1m to create dead extents, then cut power mid-`compact()` and mid-`write_checkpoint()`!
+    {
+        let engine = Engine::open(disk.clone(), cfg.clone()).unwrap();
+        let new_1m = make_patterned_payload(1024 * 1024 + 37, 0x99);
+        let req_ow = PutObjectReq {
+            ctx: ctx.clone(),
+            bucket: "mib-crash".into(),
+            key: "obj-1m".into(),
+            sys_meta: SystemMeta::default(),
+            user_meta: Vec::new(),
+            acl: None,
+            tags: None,
+            preconditions: Preconditions::default(),
+            max_bytes_limit: MAX_SINGLE_PUT_BYTES,
+            raw_sse: RawSseHeaders::default(),
+            raw_lock: RawUploadObjectLockHeaders::default(),
+        };
+        engine
+            .put_object(req_ow.clone(), InMemoryVerifiedStream::from_bytes(new_1m.clone(), None))
+            .await
+            .unwrap();
+        model
+            .put_object(req_ow, InMemoryVerifiedStream::from_bytes(new_1m, None))
+            .await
+            .unwrap();
+    }
+
+    for (is_ckpt, cd) in [(false, 1usize), (false, 45), (true, 0), (true, 2), (true, 6)] {
+        let engine = Engine::open(disk.clone(), cfg.clone()).unwrap();
+        disk.arm_mid_io_power_cut(cd);
+        if is_ckpt {
+            let _ = engine.write_checkpoint().await;
+        } else {
+            let _ = engine.compact().await;
+        }
+        drop(engine);
+        disk = disk.power_cut(&mut rng);
+
+        let report = run_fsck(disk.clone());
+        assert_eq!(
+            report.status, "ok",
+            "fsck failed after mid-{} cd={cd}: {:?}",
+            if is_ckpt { "checkpoint" } else { "compact" },
+            report.errors
+        );
+
+        let recovered = Engine::open(disk.clone(), cfg.clone()).unwrap();
+        for (key, sse) in [
+            ("obj-128k", RawSseHeaders::default()),
+            ("obj-1m", RawSseHeaders::default()),
+            ("obj-5m-ssec", ssec_hdrs.clone()),
+            ("mpu-5m", RawSseHeaders::default()),
+        ] {
+            let exp = read_model_obj(&model, &ctx, key, &sse).await.unwrap();
+            let got = recovered
+                .get_object(GetObjectReq {
+                    ctx: ctx.clone(),
+                    bucket: "mib-crash".into(),
+                    key: key.into(),
+                    version_id: None,
+                    range: None,
+                    part_number: None,
+                    preconditions: Preconditions::default(),
+                    checksum_mode_enabled: true,
+                    raw_sse: sse,
+                })
+                .await
+                .unwrap();
+            assert_eq!(got.meta.etag, exp.0, "etag mismatch on {key}");
+            assert_eq!(read_all(got.reader).await.unwrap(), exp.1, "data mismatch on {key}");
+        }
+        drop(recovered);
+    }
 }

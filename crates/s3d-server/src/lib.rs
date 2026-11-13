@@ -6,7 +6,11 @@ pub mod metrics;
 pub mod router;
 
 use std::convert::Infallible;
+use std::fs::File as StdFile;
 use std::future::Future;
+use std::io::BufReader;
+use std::net::IpAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -29,6 +33,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
+use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
 use crate::body::S3ResponseBody;
@@ -284,6 +290,15 @@ where
     let max_conns = cfg.max_connections;
     let header_timeout = cfg.header_read_timeout;
     let idle_timeout = cfg.idle_timeout;
+    let tls_acceptor = match (&cfg.tls_cert_file, &cfg.tls_key_file) {
+        (Some(cert), Some(key)) => Some(load_tls_acceptor(cert, key)?),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "tls_cert_file and tls_key_file must both be set or both be omitted".into(),
+            );
+        }
+    };
     let conn_sem = Arc::new(Semaphore::new(max_conns));
     let state = Arc::new(AppState {
         store,
@@ -367,38 +382,36 @@ where
                 match Arc::clone(&conn_sem).try_acquire_owned() {
                     Ok(permit) => {
                         let st = Arc::clone(&state);
-                        let mut conn_stop_rx = stop_rx.clone();
+                        let conn_stop_rx = stop_rx.clone();
+                        let tls = tls_acceptor.clone();
                         st.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
                         conn_tasks.spawn(async move {
                             let _permit = permit;
-                            let io = TokioIo::new(IdleTimeoutIo::new(stream, idle_timeout));
-                            let st_svc = Arc::clone(&st);
-                            let svc = service_fn(move |req: Request<Incoming>| {
-                                let st_req = Arc::clone(&st_svc);
-                                async move {
-                                    Ok::<_, Infallible>(handle_s3_request(st_req, req, peer_ip).await)
+                            if let Some(acceptor) = tls {
+                                if let Ok(Ok(tls_stream)) =
+                                    tokio::time::timeout(header_timeout, acceptor.accept(stream))
+                                        .await
+                                {
+                                    serve_s3_conn(
+                                        tls_stream,
+                                        &st,
+                                        peer_ip,
+                                        header_timeout,
+                                        idle_timeout,
+                                        conn_stop_rx,
+                                    )
+                                    .await;
                                 }
-                            });
-                            let conn = http1::Builder::new()
-                                .timer(TokioTimer::new())
-                                .header_read_timeout(header_timeout)
-                                .max_buf_size(512 * 1024)
-                                .keep_alive(true)
-                                .serve_connection(io, svc);
-                            tokio::pin!(conn);
-                            if *conn_stop_rx.borrow() {
-                                conn.as_mut().graceful_shutdown();
-                                let _ = conn.as_mut().await;
                             } else {
-                                tokio::select! {
-                                    res = conn.as_mut() => {
-                                        let _ = res;
-                                    }
-                                    _ = conn_stop_rx.changed() => {
-                                        conn.as_mut().graceful_shutdown();
-                                        let _ = conn.as_mut().await;
-                                    }
-                                }
+                                serve_s3_conn(
+                                    stream,
+                                    &st,
+                                    peer_ip,
+                                    header_timeout,
+                                    idle_timeout,
+                                    conn_stop_rx,
+                                )
+                                .await;
                             }
                             st.metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -406,28 +419,17 @@ where
                     Err(_) => {
                         // Over `max_connections` -> return 503 SlowDown (`NFR-9`, `Appendix C`)
                         metrics.errors_5xx_total.fetch_add(1, Ordering::Relaxed);
+                        let tls = tls_acceptor.clone();
                         conn_tasks.spawn(async move {
-                            let io = TokioIo::new(IdleTimeoutIo::new(stream, header_timeout));
-                            let svc = service_fn(|_req: Request<Incoming>| async move {
-                                let err = S3Error::new(
-                                    S3ErrorCode::SlowDown,
-                                    "Please reduce your request rate.",
-                                );
-                                let xml = render_error_xml(&err, "0000000000000000", "s3d");
-                                let resp = Response::builder()
-                                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                                    .header("Content-Type", "application/xml")
-                                    .header("Connection", "close")
-                                    .body(S3ResponseBody::<s3d_types::MemoryByteReader>::from_bytes(xml))
-                                    .unwrap();
-                                Ok::<_, Infallible>(resp)
-                            });
-                            let _ = http1::Builder::new()
-                                .timer(TokioTimer::new())
-                                .header_read_timeout(header_timeout)
-                                .keep_alive(false)
-                                .serve_connection(io, svc)
-                                .await;
+                            if let Some(acceptor) = tls {
+                                if let Ok(Ok(tls_stream)) =
+                                    tokio::time::timeout(header_timeout, acceptor.accept(stream)).await
+                                {
+                                    serve_s3_overload(tls_stream, header_timeout).await;
+                                }
+                            } else {
+                                serve_s3_overload(stream, header_timeout).await;
+                            }
                         });
                     }
                 }
@@ -509,4 +511,111 @@ fn handle_admin_request(
             .body(Full::new(Bytes::from_static(b"not found\n")))
             .unwrap(),
     }
+}
+
+/// Load a PEM certificate chain and private key into a `tokio-rustls` `TlsAcceptor` (`Q5`).
+pub fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor, String> {
+    let cert_file = StdFile::open(cert_path)
+        .map_err(|e| format!("failed to open tls_cert_file {}: {e}", cert_path.display()))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to parse tls_cert_file {}: {e}", cert_path.display()))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "tls_cert_file {} contains no PEM certificates",
+            cert_path.display()
+        ));
+    }
+
+    let key_file = StdFile::open(key_path)
+        .map_err(|e| format!("failed to open tls_key_file {}: {e}", key_path.display()))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| format!("failed to parse tls_key_file {}: {e}", key_path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "tls_key_file {} contains no PEM private key",
+                key_path.display()
+            )
+        })?;
+
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let mut tls_cfg = RustlsServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("failed to configure TLS protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("invalid TLS certificate/key pair: {e}"))?;
+    tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(tls_cfg)))
+}
+
+async fn serve_s3_conn<S, I>(
+    stream: I,
+    st: &Arc<AppState<S>>,
+    peer_ip: Option<IpAddr>,
+    header_timeout: Duration,
+    idle_timeout: Duration,
+    mut conn_stop_rx: watch::Receiver<bool>,
+) where
+    S: ObjectStore,
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(IdleTimeoutIo::new(stream, idle_timeout));
+    let st_svc = Arc::clone(st);
+    let svc = service_fn(move |req: Request<Incoming>| {
+        let st_req = Arc::clone(&st_svc);
+        async move { Ok::<_, Infallible>(handle_s3_request(st_req, req, peer_ip).await) }
+    });
+    let conn = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_timeout)
+        .max_buf_size(512 * 1024)
+        .keep_alive(true)
+        .serve_connection(io, svc);
+    tokio::pin!(conn);
+    if *conn_stop_rx.borrow() {
+        conn.as_mut().graceful_shutdown();
+        let _ = conn.as_mut().await;
+    } else {
+        tokio::select! {
+            res = conn.as_mut() => {
+                let _ = res;
+            }
+            _ = conn_stop_rx.changed() => {
+                conn.as_mut().graceful_shutdown();
+                let _ = conn.as_mut().await;
+            }
+        }
+    }
+}
+
+async fn serve_s3_overload<I>(stream: I, header_timeout: Duration)
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(IdleTimeoutIo::new(stream, header_timeout));
+    let svc = service_fn(|_req: Request<Incoming>| async move {
+        let err = S3Error::new(
+            S3ErrorCode::SlowDown,
+            "Please reduce your request rate.",
+        );
+        let xml = render_error_xml(&err, "0000000000000000", "s3d");
+        let resp = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("Content-Type", "application/xml")
+            .header("Connection", "close")
+            .body(S3ResponseBody::<s3d_types::MemoryByteReader>::from_bytes(
+                xml,
+            ))
+            .unwrap();
+        Ok::<_, Infallible>(resp)
+    });
+    let _ = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_timeout)
+        .keep_alive(false)
+        .serve_connection(io, svc)
+        .await;
 }

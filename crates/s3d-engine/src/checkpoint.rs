@@ -1117,6 +1117,11 @@ fn encode_csum_alg(a: ChecksumAlgorithm) -> u8 {
         ChecksumAlgorithm::Crc64Nvme => 2,
         ChecksumAlgorithm::Sha1 => 3,
         ChecksumAlgorithm::Sha256 => 4,
+        ChecksumAlgorithm::Md5 => 5,
+        ChecksumAlgorithm::Sha512 => 6,
+        ChecksumAlgorithm::XxHash64 => 7,
+        ChecksumAlgorithm::XxHash3 => 8,
+        ChecksumAlgorithm::XxHash128 => 9,
     }
 }
 
@@ -1127,6 +1132,11 @@ fn decode_csum_alg(b: u8) -> Result<ChecksumAlgorithm, String> {
         2 => Ok(ChecksumAlgorithm::Crc64Nvme),
         3 => Ok(ChecksumAlgorithm::Sha1),
         4 => Ok(ChecksumAlgorithm::Sha256),
+        5 => Ok(ChecksumAlgorithm::Md5),
+        6 => Ok(ChecksumAlgorithm::Sha512),
+        7 => Ok(ChecksumAlgorithm::XxHash64),
+        8 => Ok(ChecksumAlgorithm::XxHash3),
+        9 => Ok(ChecksumAlgorithm::XxHash128),
         other => Err(format!("invalid checksum algorithm {other}")),
     }
 }

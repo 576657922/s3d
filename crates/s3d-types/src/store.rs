@@ -75,9 +75,27 @@ pub enum ChecksumAlgorithm {
     Crc64Nvme,
     Sha1,
     Sha256,
+    Md5,
+    Sha512,
+    XxHash64,
+    XxHash3,
+    XxHash128,
 }
 
 impl ChecksumAlgorithm {
+    pub const ALL: [Self; 10] = [
+        Self::Crc32,
+        Self::Crc32c,
+        Self::Crc64Nvme,
+        Self::Sha1,
+        Self::Sha256,
+        Self::Md5,
+        Self::Sha512,
+        Self::XxHash64,
+        Self::XxHash3,
+        Self::XxHash128,
+    ];
+
     pub const fn header_name(self) -> &'static str {
         match self {
             Self::Crc32 => "x-amz-checksum-crc32",
@@ -85,6 +103,11 @@ impl ChecksumAlgorithm {
             Self::Crc64Nvme => "x-amz-checksum-crc64nvme",
             Self::Sha1 => "x-amz-checksum-sha1",
             Self::Sha256 => "x-amz-checksum-sha256",
+            Self::Md5 => "x-amz-checksum-md5",
+            Self::Sha512 => "x-amz-checksum-sha512",
+            Self::XxHash64 => "x-amz-checksum-xxhash64",
+            Self::XxHash3 => "x-amz-checksum-xxhash3",
+            Self::XxHash128 => "x-amz-checksum-xxhash128",
         }
     }
 
@@ -95,6 +118,11 @@ impl ChecksumAlgorithm {
             Self::Crc64Nvme => "CRC64NVME",
             Self::Sha1 => "SHA1",
             Self::Sha256 => "SHA256",
+            Self::Md5 => "MD5",
+            Self::Sha512 => "SHA512",
+            Self::XxHash64 => "XXHASH64",
+            Self::XxHash3 => "XXHASH3",
+            Self::XxHash128 => "XXHASH128",
         }
     }
 
@@ -105,6 +133,22 @@ impl ChecksumAlgorithm {
             Self::Crc64Nvme => "ChecksumCRC64NVME",
             Self::Sha1 => "ChecksumSHA1",
             Self::Sha256 => "ChecksumSHA256",
+            Self::Md5 => "ChecksumMD5",
+            Self::Sha512 => "ChecksumSHA512",
+            Self::XxHash64 => "ChecksumXXHASH64",
+            Self::XxHash3 => "ChecksumXXHASH3",
+            Self::XxHash128 => "ChecksumXXHASH128",
+        }
+    }
+
+    pub const fn digest_byte_len(self) -> usize {
+        match self {
+            Self::Crc32 | Self::Crc32c => 4,
+            Self::Crc64Nvme | Self::XxHash64 | Self::XxHash3 => 8,
+            Self::Md5 | Self::XxHash128 => 16,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+            Self::Sha512 => 64,
         }
     }
 
@@ -115,6 +159,11 @@ impl ChecksumAlgorithm {
             "CRC64NVME" => Some(Self::Crc64Nvme),
             "SHA1" => Some(Self::Sha1),
             "SHA256" => Some(Self::Sha256),
+            "MD5" => Some(Self::Md5),
+            "SHA512" => Some(Self::Sha512),
+            "XXHASH64" => Some(Self::XxHash64),
+            "XXHASH3" => Some(Self::XxHash3),
+            "XXHASH128" => Some(Self::XxHash128),
             _ => None,
         }
     }
@@ -130,12 +179,31 @@ impl ChecksumAlgorithm {
             )),
             (Self::Crc32 | Self::Crc32c, Some(t)) => Ok(t),
             (Self::Crc32 | Self::Crc32c, None) => Ok(ChecksumType::Composite),
-            (Self::Sha1 | Self::Sha256, None | Some(ChecksumType::Composite)) => {
-                Ok(ChecksumType::Composite)
-            }
-            (Self::Sha1 | Self::Sha256, Some(ChecksumType::FullObject)) => Err(S3Error::new(
+            (
+                Self::Sha1
+                | Self::Sha256
+                | Self::Md5
+                | Self::Sha512
+                | Self::XxHash64
+                | Self::XxHash3
+                | Self::XxHash128,
+                None | Some(ChecksumType::Composite),
+            ) => Ok(ChecksumType::Composite),
+            (
+                Self::Sha1
+                | Self::Sha256
+                | Self::Md5
+                | Self::Sha512
+                | Self::XxHash64
+                | Self::XxHash3
+                | Self::XxHash128,
+                Some(ChecksumType::FullObject),
+            ) => Err(S3Error::new(
                 S3ErrorCode::InvalidRequest,
-                "The FULL_OBJECT checksum type cannot be used with SHA1 or SHA256.",
+                format!(
+                    "The FULL_OBJECT checksum type cannot be used with {}.",
+                    self.as_aws_str()
+                ),
             )),
         }
     }
