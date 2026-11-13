@@ -27,7 +27,6 @@ rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 s3d-disk.workspace = true
 s3d-engine.workspace = true
-s3d-model.workspace = true
 s3d-proto.workspace = true
 s3d-types.workspace = true
 serde.workspace = true

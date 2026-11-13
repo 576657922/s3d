@@ -1422,7 +1422,6 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.9",
- "thiserror",
  "xxhash-rust",
 ]
 
@@ -1447,7 +1446,6 @@ dependencies = [
  "rustls-pki-types",
  "s3d-disk",
  "s3d-engine",
- "s3d-model",
  "s3d-proto",
  "s3d-types",
  "serde",
