@@ -37,8 +37,10 @@ pub struct SegmentSlot<D: Disk> {
     /// in `write_data_block`, preventing GC from selecting a newly sealed segment prematurely.
     pub inflight_writers: AtomicUsize,
     /// Packed single-word `(PIN_PENDING_DELETE_BIT | active_readers)`.
-    /// Using a single atomic guarantees a total modification order under C++11/Rust `AcqRel`
-    /// (verified exhaustively by `VR-4` `loom_segment_pin_vs_delete`).
+    /// Using a single atomic guarantees a total modification order under C++11/Rust `AcqRel`.
+    /// The pin/delete protocol is model-checked by `VR-4` `loom_segment_pin_vs_delete`, which
+    /// exhaustively explores a simplified copy of this protocol in `tests/vr4_loom.rs`
+    /// (not this type itself).
     pub pin_state: AtomicUsize,
     pub state: AtomicU8,
 }
