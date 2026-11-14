@@ -101,7 +101,7 @@ jobs:
 
       - name: VR-4 Shuttle 10k + Loom + 10k WGL Linearizability
         run: |
-          cargo test --release -p s3d-engine --test vr4_loom --nocapture
+          cargo test --release -p s3d-engine --test vr4_loom -- --nocapture
           cargo test --release -p s3d-engine --test vr4_shuttle -- --ignored --nocapture
           cargo test --release -p s3d-check --test vr4_wgl_http -- --ignored --nocapture
 
