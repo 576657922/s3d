@@ -1,5 +1,7 @@
 # s3d — 单机崩溃安全 S3 兼容对象存储
 
+**简体中文** | [English](README.en.md) | [日本語](README.ja.md)
+
 `s3d` 是一个用纯安全 Rust（Edition 2024，`unsafe_code = "forbid"`）从零实现的单机崩溃安全 S3 兼容对象存储服务，配套自研日志结构存储引擎（Append-Only 段文件 + WAL Group Commit + 原子检查点 + 无锁快照读 + 后台压缩 GC）与十层形式化/自动化验证体系（`VR-1`～`VR-10`）。
 
 - **兼容性基线**：基于 [`ceph/s3-tests`](https://github.com/ceph/s3-tests)（提交 `5b39871`）全部 **545** 个单节点目标用例实测通过 **526 / 545（96.5%）**，其中 P0 `240/249`、P1 `182/190`、P2 `104/106`（`object_lock` 39/39、`lifecycle` 20/20、`encryption` 41/41、`logging` 4/6），`0` 项未实现延后，其余 19 项均为已逐条抓包/源码证明的上游客户端或规格分歧（见 [`docs/deviations.md`](docs/deviations.md) 与 [`reports/p0-ceiling-proof.json`](reports/p0-ceiling-proof.json)）。
