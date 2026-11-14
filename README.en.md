@@ -1,6 +1,6 @@
 # s3d — Crash-Safe Single-Node S3-Compatible Object Storage
 
-[简体中文](README.md) | **English** | [日本語](README.ja.md)
+[简体中文](README.zh-CN.md) | **English** | [日本語](README.md)
 
 `s3d` is a crash-safe, single-node, S3-compatible object storage server written from scratch in safe Rust (Edition 2024, `unsafe_code = "forbid"`). It ships with its own log-structured storage engine (append-only segment files + WAL group commit + atomic checkpoints + lock-free snapshot reads + background compaction GC) and a ten-layer formal/automated verification suite (`VR-1` to `VR-10`).
 
