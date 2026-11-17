@@ -472,57 +472,24 @@ async fn nfr16_http_low_disk_space_returns_503_slowdown_while_get_and_delete_suc
     srv.await.unwrap();
 }
 
+/// Polls the admin `/health` endpoint until it answers 200. Returns an error if the child exits
+/// first or the timeout passes; on timeout the child is killed.
 #[cfg(unix)]
-#[tokio::test]
-async fn nfr10_nfr13_nfr14_cli_json_logs_sigterm_checkpoint_compact_and_fsck() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().join("data");
-    let cred_path = dir.path().join("credentials.toml");
-    fs::write(
-        &cred_path,
-        format!(
-            "[[accounts]]\nuser_id = \"0123456789abcdef\"\ndisplay_name = \"main\"\nemail = \"main@example.com\"\naccess_key = \"{AK}\"\nsecret_key = \"{SK}\"\n"
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&cred_path, fs::Permissions::from_mode(0o600)).unwrap();
-
-    // Reserve two free loopback ports
-    let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let s3_addr = l1.local_addr().unwrap();
-    let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let admin_addr = l2.local_addr().unwrap();
-    drop(l1);
-    drop(l2);
-
-    let bin = env!("CARGO_BIN_EXE_s3d");
-    let mut child = Command::new(bin)
-        .args([
-            "serve",
-            "--listen",
-            &s3_addr.to_string(),
-            "--admin-listen",
-            &admin_addr.to_string(),
-            "--data-dir",
-            data_dir.to_str().unwrap(),
-            "--credentials-file",
-            cred_path.to_str().unwrap(),
-            "--log-format",
-            "json",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn s3d serve");
-
-    // Wait until `/health` responds 200 OK
-    let deadline = Instant::now() + Duration::from_secs(10);
+async fn wait_until_healthy(
+    child: &mut std::process::Child,
+    admin_addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
     loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Err(format!("exited early with {status}")),
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait failed: {e}")),
+        }
         if Instant::now() > deadline {
             let _ = child.kill();
-            panic!("s3d serve did not become healthy within 10s");
+            return Err(format!("not healthy within {}s", timeout.as_secs()));
         }
         if let Ok(stream) = TcpStream::connect(admin_addr).await {
             let io = TokioIo::new(stream);
@@ -540,13 +507,79 @@ async fn nfr10_nfr13_nfr14_cli_json_logs_sigterm_checkpoint_compact_and_fsck() {
                             .unwrap(),
                     )
                     .await
-                    && resp.status().as_u16() == 200 {
-                        break;
-                    }
+                    && resp.status().as_u16() == 200
+                {
+                    return Ok(());
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nfr10_nfr13_nfr14_cli_json_logs_sigterm_checkpoint_compact_and_fsck() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cred_path = dir.path().join("credentials.toml");
+    fs::write(
+        &cred_path,
+        format!(
+            "[[accounts]]\nuser_id = \"0123456789abcdef\"\ndisplay_name = \"main\"\nemail = \"main@example.com\"\naccess_key = \"{AK}\"\nsecret_key = \"{SK}\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cred_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // The two ports are reserved and released before `s3d serve` binds them, so another socket
+    // can take one in between. If the server exits because a bind failed, retry with new ports.
+    let bin = env!("CARGO_BIN_EXE_s3d");
+    let mut attempt = 1;
+    let (child, s3_addr) = loop {
+        let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s3_addr = l1.local_addr().unwrap();
+        let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let admin_addr = l2.local_addr().unwrap();
+        drop(l1);
+        drop(l2);
+
+        let mut child = Command::new(bin)
+            .args([
+                "serve",
+                "--listen",
+                &s3_addr.to_string(),
+                "--admin-listen",
+                &admin_addr.to_string(),
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--credentials-file",
+                cred_path.to_str().unwrap(),
+                "--log-format",
+                "json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn s3d serve");
+
+        match wait_until_healthy(&mut child, admin_addr, Duration::from_secs(30)).await {
+            Ok(()) => break (child, s3_addr),
+            Err(reason) => {
+                let output = child.wait_with_output().expect("collect s3d serve output");
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                if attempt < 3 && stderr.contains("failed to bind") {
+                    eprintln!("s3d serve attempt {attempt} could not bind, retrying: {stderr}");
+                    attempt += 1;
+                    let _ = fs::remove_dir_all(&data_dir);
+                    continue;
+                }
+                panic!("s3d serve did not become healthy ({reason}): stderr={stderr}");
+            }
+        }
+    };
 
     let host = s3_addr.to_string();
     assert_eq!(
